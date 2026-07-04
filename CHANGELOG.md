@@ -23,8 +23,74 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing yet. Phase 7 will introduce `news/news_engine.py` (economic
-calendar feed, News-API-down fail-safe, macro-event trade lockout).
+Nothing yet. Phase 8 will introduce `optimizer/self_learning.py`
+(APScheduler-gated weekend self-learning optimizer, 1000-iteration Monte
+Carlo bootstrap validator).
+
+## [0.8.0] - 2026-07-05
+
+### Added — Phase 7: News API Calendar Engine & Defensive Circuit Breakers
+
+- `news/news_engine.py`:
+  - `fetch_calendar_events()` — GETs an economic calendar feed with
+    independent connect/read timeouts (defaults 5s/10s), parsing the
+    response into `EconomicEvent` objects. Raises
+    `NewsFeedConnectionError` on any connection failure, timeout, non-2xx
+    response, or invalid JSON.
+  - `EconomicEvent.is_core_macro_event` — keyword classification for
+    NFP/CPI/FOMC releases.
+  - `is_trade_entry_locked()` — ±30-minute (inclusive) trade-entry
+    blackout window around any core macro event.
+  - `apply_news_feed_fail_safe()` — the News-API-down defensive circuit
+    breaker: halves risk size and doubles the spread tolerance limit when
+    the feed is unreachable, otherwise passes both through unchanged.
+  - Added `types-requests==2.33.0.20260518` to `pyproject.toml`'s dev
+    dependencies (proper stub package for `mypy --strict`, unlike
+    `MetaTrader5`'s `ignore_missing_imports` override — `requests` has an
+    actively maintained stub package, so no override was needed here).
+- `news/README.md` updated to describe the landed implementation.
+
+### Flagged — two design choices without a prior spec to follow
+
+- **No calendar provider was ever named** anywhere in this project
+  (`docs/DEPLOYMENT.md` and `config/.env.template` only declare a generic
+  `ECONOMIC_CALENDAR_API_KEY`). `fetch_calendar_events()` assumes a
+  generic REST/JSON shape (`GET {base_url}?from=...&to=...` returning
+  `{title, country, impact, date}` objects); `_parse_event()` is the only
+  function that would need to change for a concrete vendor.
+- **"Double spread limits" was implemented literally.** Taken literally,
+  doubling a "maximum spread tolerated" threshold makes the filter *more*
+  permissive, which reads as counterintuitive for a "defensive circuit
+  breaker" (the alternative — halving it, becoming stricter — arguably
+  fits "defensive" framing better but contradicts the literal word
+  "double"). Implemented as literally specified and documented explicitly
+  in `news/README.md`'s "Flagged" section, since silently inverting an
+  explicit instruction based on my own risk-management judgment would be
+  a bigger overreach than following it and flagging the ambiguity.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (21 files).
+- `mypy --strict .` — no issues found in 21 source files (mypy 2.1.0
+  locally, per the Phase 4 toolchain note; `requests==2.32.3` itself
+  installs cleanly even in this sandbox's Python 3.14, unlike
+  `MetaTrader5`/`numpy`).
+- `pytest` — 0 tests collected against the still-empty `tests/` layout, as
+  expected (automated `tests/news/` coverage deferred to the project's
+  dedicated testing phase).
+- `fetch_calendar_events()` (against a faked `requests.get`, no live
+  calendar provider credentials in this environment): successful parse
+  with the correct `(connect, read)` timeout tuple passed through;
+  `NewsFeedConnectionError` on connection error, timeout, HTTP 503, and
+  invalid JSON; `ValueError` on naive `from_utc`/`to_utc`.
+- `EconomicEvent.is_core_macro_event`: correctly classifies NFP/CPI/FOMC
+  title variants vs. unrelated events.
+- `is_trade_entry_locked()`: locked exactly at the event, exactly 30
+  minutes before, and exactly 30 minutes after (inclusive boundary on both
+  sides); not locked at 31 minutes before/after; a non-macro event at the
+  same timestamp never locks; `ValueError` on naive `now_utc`.
+- `apply_news_feed_fail_safe()`: unchanged output for a healthy feed;
+  correct 0.5× risk / 2.0× spread-limit adjustment for an unhealthy one.
 
 ## [0.7.0] - 2026-07-05
 

@@ -41,12 +41,12 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | RQ-014 | The optimizer shall refuse to emit a `ParameterUpdateEvent` if Deflated Sharpe Ratio or IS/OOS efficiency ratio gates fail. | `optimizer/` | ADR-0004, `docs/RESEARCH.md` §Promotion Gates | `tests/optimizer/test_promotion_gate_enforcement.py` (pending Phase 9) | SPECIFIED (pending Phase 8 implementation) |
 | RQ-015 | The backtester shall support both a fast vectorized mode (research iteration) and an event-driven mode sharing live `strategy/`/`execution/` code (validation/parity). | `backtester/` | ADR-0001, ADR-0002 | `tests/backtester/test_vectorized_vs_event_parity.py` | **UNSCHEDULED** — `backtester/` does not appear in the current 10-phase roadmap; Phase 8's Monte Carlo bootstrap validates the optimizer's ledger metrics but is not the full vectorized/event-driven backtester ADR-0004 assumes. Flagging for a roadmap decision. |
 | RQ-016 | Performance analytics shall compute Sharpe, Sortino, MAR, and maximum drawdown from the persisted equity curve, not from in-memory ad hoc state. | `analytics/` | `docs/API_SPEC.md` §5 | `tests/analytics/test_metrics_from_ledger.py` | **UNSCHEDULED** — `analytics/` does not appear in the current 10-phase roadmap; Phase 8's self-learning optimizer reads "SQLite ledger metrics" directly, which may end up substituting for a dedicated `analytics/` module. Flagging for a roadmap decision. |
-| RQ-017 | High-impact economic calendar events shall trigger a pre-trade blackout window enforced by the risk gate. | `news/`, `execution/` | `docs/API_SPEC.md` §2 (`NewsWindow`), `docs/RISK_REGISTER.md` (RR-009) | `tests/news/test_blackout_enforcement.py` (pending Phase 9) | SPECIFIED (pending Phase 7 implementation) |
+| RQ-017 | High-impact economic calendar events shall trigger a pre-trade blackout window enforced by the risk gate. | `news/`, `execution/` | `docs/API_SPEC.md` §2 (`NewsWindow`), `docs/RISK_REGISTER.md` (RR-009) | `news/news_engine.py`'s `is_trade_entry_locked()` (±30 min NFP/CPI/FOMC blackout) and `apply_news_feed_fail_safe()` implemented Phase 7 and ad hoc verified against a faked `requests.get` (see `CHANGELOG.md` §0.8.0); not yet wired into `execution/`'s actual pre-trade risk gate (that gate itself doesn't exist yet); formal `tests/news/test_blackout_enforcement.py` pending Phase 9 | IMPLEMENTED (partial — logic only, not yet wired to a risk gate) |
 | RQ-018 | Secrets (broker credentials, API keys) shall never be committed to source control and shall be sourced from environment/`.env` only, and the system shall refuse to boot if any required configuration key is missing. | `config/` | `docs/RISK_REGISTER.md` (RR-001, RR-012), `docs/DEPLOYMENT.md` | `config/config_manager.py`'s `ConfigManager.load()` implemented and manually verified Phase 1 (see `CHANGELOG.md` §0.2.0); `tests/config/test_config_manager.py` formal suite pending a future phase | IMPLEMENTED |
 | RQ-019 | CI shall block merge on any Ruff lint failure, Mypy strict-mode failure, or Pytest failure, and shall report coverage. | `.github/workflows/` | this document | CI pipeline itself is the verification | SPECIFIED |
 | RQ-020 | Every ADR, API contract change, and risk register update shall be reflected in `CHANGELOG.md` with a correct SemVer bump. | project-wide | `CHANGELOG.md` policy | manual release-checklist review (`docs/RUNBOOK.md`) | IMPLEMENTED (process, Phase 0) |
 
-## Coverage Summary (as of Phase 6)
+## Coverage Summary (as of Phase 7)
 
 | Category | Requirements Specified | Implemented | Verified |
 |---|---|---|---|
@@ -54,7 +54,7 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | Strategy / Indicators | RQ-007–RQ-008 | 2 (RQ-007; RQ-008 partial — no `ParameterUpdate` yet) | 0 |
 | Execution / Risk | RQ-009–RQ-011 | 1 (RQ-011; RQ-009/RQ-010 not started — see Non-Goals in `execution/README.md`) | 0 |
 | Optimizer / Backtest | RQ-012–RQ-015 | 0 | 0 |
-| Analytics / News | RQ-016–RQ-017 | 0 | 0 |
+| Analytics / News | RQ-016–RQ-017 | 1 (RQ-017, partial — logic only, not wired to a risk gate) | 0 |
 | Platform / Process | RQ-018–RQ-020 | 2 (RQ-018 code + manual verification; RQ-020 process) | 0 |
 
 Phase 0 was documentation-only by directive, so its 0/0 implemented/verified
@@ -69,7 +69,8 @@ Phase 5 landed `strategy/execution_triggers.py` (breakout/pullback/wick-fill
 signals, RQ-008) and `indicators/math_engine.sma()`. Phase 6 landed the new
 `risk/risk_manager.py` (equity-based compounding), `execution/position_manager.py`
 (partial close, breakeven, ATR trailing — RQ-011), and
-`broker/mt5_gateway.py`'s `submit_position_action()`. No row is yet
-`VERIFIED`, since that status requires a formal automated test suite
-(Phase 9) and observed paper-trading behavior (post Phase 10), neither of
-which exist yet.
+`broker/mt5_gateway.py`'s `submit_position_action()`. Phase 7 landed
+`news/news_engine.py` (calendar feed client, macro-event blackout window,
+News-API-down fail-safe — RQ-017 partial). No row is yet `VERIFIED`, since
+that status requires a formal automated test suite (Phase 9) and observed
+paper-trading behavior (post Phase 10), neither of which exist yet.
