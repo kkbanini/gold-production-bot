@@ -13,8 +13,10 @@ opens a `sqlite3.Connection` directly.
   Defines two tables:
   - `trade_ledger` — one row per trade, keyed by a unique `client_order_id`
     (idempotent upsert target, RR-007). Tracks symbol, side, volume, open/close
-    price, stop-loss/take-profit, profit, status, strategy id, and magic
-    number.
+    price, stop-loss/take-profit, profit, status, strategy id, magic number,
+    and (added Phase 3) `broker_ticket` — the MT5 position ticket, used by
+    `broker/mt5_gateway.py`'s `audit_open_positions()` to reconcile the
+    ledger against the broker's actual open positions on reconnect.
   - `system_state` — a pinned singleton row (`id = 1`) holding the current
     FSM state as a JSON blob plus the last-processed event `sequence_id`,
     updated via UPSERT so a crash mid-write can never leave two conflicting

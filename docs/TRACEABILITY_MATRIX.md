@@ -25,8 +25,8 @@ silently carried forward, since neither module appears in the approved 10-phase 
 
 | Req ID | Requirement | Owning Module | Governing ADR / Spec | Test Reference | Status |
 |---|---|---|---|---|---|
-| RQ-001 | System shall interface exclusively with MetaTrader 5 via an internal `BrokerGateway` abstraction; no other module may import the MT5 package. | `broker/` | ADR-0002 | `tests/broker/test_import_boundary.py` (pending Phase 3) | SPECIFIED |
-| RQ-002 | All timestamps crossing the broker boundary shall be normalized to UTC, correcting for broker server time vs. host local time and broker-side DST. | `broker/` | ADR-0002, `docs/RESEARCH.md` §Time & Session Normalization | `tests/broker/test_time_normalization.py` (pending Phase 3) | SPECIFIED |
+| RQ-001 | System shall interface exclusively with MetaTrader 5 via an internal `BrokerGateway` abstraction; no other module may import the MT5 package. | `broker/` | ADR-0002 | `broker/mt5_gateway.py` implemented Phase 3 as the sole importer of `MetaTrader5`; formal `tests/broker/test_import_boundary.py` pending Phase 9 | IMPLEMENTED |
+| RQ-002 | All timestamps crossing the broker boundary shall be normalized to UTC, correcting for broker server time vs. host local time and broker-side DST. | `broker/` | ADR-0002, `docs/RESEARCH.md` §Time & Session Normalization | `MT5Gateway.broker_utc_offset`/`is_within_execution_window()` implemented and ad hoc verified Phase 3 (see `CHANGELOG.md` §0.4.0) against a fake `MetaTrader5` substitute, since no live terminal exists in this environment; periodic re-validation/DST-drift alerting (RR-003) not yet implemented; formal `tests/broker/test_time_normalization.py` pending Phase 9 | IMPLEMENTED (partial) |
 | RQ-003 | All cross-module communication shall occur through immutable, typed events on a single `EventBus`; no module shall mutate another module's state directly. | core / all | ADR-0001 | `tests/core/test_single_writer_invariant.py` (pending Phase 10) | SPECIFIED |
 | RQ-004 | Trading state mutations shall occur on exactly one logical thread of control (single-writer core loop). | core | ADR-0001 | `tests/core/test_concurrency_model.py` (pending Phase 10) | SPECIFIED |
 | RQ-005 | Every event and derived state transition shall be persisted transactionally (ACID) such that a crash mid-write cannot desynchronize the event log from derived state. | `storage/` | ADR-0003 | `storage/state_manager.py` implemented and ad hoc verified Phase 2 (see `CHANGELOG.md` §0.3.0) for the FSM-state-snapshot case; full event-log/derived-table divergence guarantee remains narrower than originally specified (see `storage/README.md` "Simplification" note); formal `tests/storage/test_crash_recovery.py` pending Phase 9 | IMPLEMENTED (partial) |
@@ -46,11 +46,11 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | RQ-019 | CI shall block merge on any Ruff lint failure, Mypy strict-mode failure, or Pytest failure, and shall report coverage. | `.github/workflows/` | this document | CI pipeline itself is the verification | SPECIFIED |
 | RQ-020 | Every ADR, API contract change, and risk register update shall be reflected in `CHANGELOG.md` with a correct SemVer bump. | project-wide | `CHANGELOG.md` policy | manual release-checklist review (`docs/RUNBOOK.md`) | IMPLEMENTED (process, Phase 0) |
 
-## Coverage Summary (as of Phase 2)
+## Coverage Summary (as of Phase 3)
 
 | Category | Requirements Specified | Implemented | Verified |
 |---|---|---|---|
-| Architecture / Core | RQ-001–RQ-006 | 1 (RQ-005, partial) | 0 |
+| Architecture / Core | RQ-001–RQ-006 | 3 (RQ-001, RQ-002 partial, RQ-005 partial) | 0 |
 | Strategy / Indicators | RQ-007–RQ-008 | 0 | 0 |
 | Execution / Risk | RQ-009–RQ-011 | 0 | 0 |
 | Optimizer / Backtest | RQ-012–RQ-015 | 0 | 0 |
@@ -59,8 +59,10 @@ silently carried forward, since neither module appears in the approved 10-phase 
 
 Phase 0 was documentation-only by directive, so its 0/0 implemented/verified
 counts were expected, not a gap. Phase 1 landed `config/config_manager.py`
-(RQ-018). Phase 2 lands `storage/db_engine.py` + `storage/state_manager.py`
+(RQ-018). Phase 2 landed `storage/db_engine.py` + `storage/state_manager.py`
 (RQ-005, partial — see that row's notes on the narrowed crash-recovery
-guarantee). No row is yet `VERIFIED`, since that status requires a formal
+guarantee). Phase 3 lands `broker/mt5_gateway.py` (RQ-001; RQ-002 partial —
+offset resolution and the GMT window exist, periodic DST-drift re-validation
+from RR-003 does not yet). No row is yet `VERIFIED`, since that status requires a formal
 automated test suite (Phase 9) and observed paper-trading behavior (post
 Phase 10), neither of which exist yet.

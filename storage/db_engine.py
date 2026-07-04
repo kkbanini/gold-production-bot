@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS trade_ledger (
     status              TEXT NOT NULL,
     strategy_id         TEXT,
     magic_number        INTEGER,
+    broker_ticket       INTEGER,
     opened_at_utc       TEXT NOT NULL,
     closed_at_utc       TEXT,
     created_at_utc      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS trade_ledger (
 CREATE INDEX IF NOT EXISTS idx_trade_ledger_status ON trade_ledger (status);
 CREATE INDEX IF NOT EXISTS idx_trade_ledger_symbol ON trade_ledger (symbol);
 CREATE INDEX IF NOT EXISTS idx_trade_ledger_magic_number ON trade_ledger (magic_number);
+CREATE INDEX IF NOT EXISTS idx_trade_ledger_broker_ticket ON trade_ledger (broker_ticket);
 
 CREATE TABLE IF NOT EXISTS system_state (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),

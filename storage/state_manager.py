@@ -43,6 +43,7 @@ class TradeLedgerEntry:
     profit: float | None = None
     strategy_id: str | None = None
     magic_number: int | None = None
+    broker_ticket: int | None = None
     closed_at_utc: str | None = None
 
 
@@ -117,14 +118,16 @@ class StateManager:
                 INSERT INTO trade_ledger (
                     client_order_id, symbol, side, volume_lots, open_price,
                     close_price, stop_loss_price, take_profit_price, profit,
-                    status, strategy_id, magic_number, opened_at_utc, closed_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, strategy_id, magic_number, broker_ticket,
+                    opened_at_utc, closed_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (client_order_id) DO UPDATE SET
                     close_price = excluded.close_price,
                     stop_loss_price = excluded.stop_loss_price,
                     take_profit_price = excluded.take_profit_price,
                     profit = excluded.profit,
                     status = excluded.status,
+                    broker_ticket = excluded.broker_ticket,
                     closed_at_utc = excluded.closed_at_utc
                 """,
                 (
@@ -140,6 +143,7 @@ class StateManager:
                     entry.status,
                     entry.strategy_id,
                     entry.magic_number,
+                    entry.broker_ticket,
                     entry.opened_at_utc,
                     entry.closed_at_utc,
                 ),
@@ -168,5 +172,6 @@ def _row_to_entry(row: sqlite3.Row) -> TradeLedgerEntry:
         profit=row["profit"],
         strategy_id=row["strategy_id"],
         magic_number=row["magic_number"],
+        broker_ticket=row["broker_ticket"],
         closed_at_utc=row["closed_at_utc"],
     )

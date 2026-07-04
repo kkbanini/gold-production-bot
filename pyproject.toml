@@ -1,6 +1,6 @@
 [project]
 name = "gold-production-bot"
-version = "0.3.0"
+version = "0.4.0"
 description = "Event-driven algorithmic trading system for XAUUSD on MetaTrader 5."
 requires-python = ">=3.12"
 dependencies = [
@@ -43,6 +43,14 @@ python_version = "3.12"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# MetaTrader5 ships no inline type hints or stub package (ADR-0002: the only
+# module importing it is broker/mt5_gateway.py). Its call sites are
+# immediately converted into our own typed dataclasses (SymbolSpec,
+# BrokerPosition), so this does not weaken typing anywhere else.
+module = "MetaTrader5"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
