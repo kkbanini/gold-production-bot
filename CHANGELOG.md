@@ -23,9 +23,82 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing yet. Phase 8 will introduce `optimizer/self_learning.py`
-(APScheduler-gated weekend self-learning optimizer, 1000-iteration Monte
-Carlo bootstrap validator).
+Nothing yet. Phase 9 will introduce `tests/test_unit.py` and
+`tests/test_integration.py` (the project's first formal automated test
+suite, targeting >90% coverage).
+
+## [0.9.0] - 2026-07-05
+
+### Added — Phase 8: Isolated Weekend Learning Optimization & Monte Carlo Validator
+
+- `storage/db_engine.py` / `storage/state_manager.py` — new append-only
+  `parameter_history` table plus `StateManager.get_closed_trades()` and
+  `StateManager.record_parameter_change()`. This table is the *only*
+  write target `optimizer/self_learning.py` is permitted to touch.
+- `optimizer/self_learning.py`:
+  - `is_market_closed_for_optimization()` / `create_weekend_optimizer_scheduler()`
+    — a `BackgroundScheduler` job locked to Saturdays via
+    `CronTrigger(day_of_week="sat", hour=3, timezone="UTC")`, plus a second,
+    independent runtime check re-evaluated inside
+    `run_weekly_optimization_cycle()` itself, so a direct/manual call
+    outside the scheduler still cannot run on a non-Saturday.
+  - `compute_ledger_metrics()` — trade count, win rate, profit factor,
+    total profit from closed-trade history.
+  - `decide_parameter_shift()` — rule-based, at most one parameter change
+    per call: win rate below 40% tightens `ADX_TREND_THRESHOLD`;
+    otherwise profit factor below 1.0 widens `TRAILING_ATR_MULTIPLIER`;
+    otherwise no change. Below 10 trades, no change regardless.
+  - `run_monte_carlo_bootstrap()` — 1000-iteration (default) resampling
+    of the closed-trade P&L sequence with replacement, reporting the
+    5th/95th percentile of resampled final P&L and the fraction of
+    resamples that were profitable.
+  - `run_weekly_optimization_cycle()` — the single entry point tying the
+    above together: reads closed trades, computes metrics, decides and
+    persists at most one shift, runs the bootstrap.
+- Added a `[[tool.mypy.overrides]]` entry for `apscheduler.*`
+  (`ignore_missing_imports = true`) — like `MetaTrader5`, it ships no
+  type stubs and none exist on PyPI (`types-apscheduler` does not exist).
+- `optimizer/README.md`, `storage/README.md` updated to describe the
+  landed implementation.
+
+### Flagged — this is deliberately simpler than ADR-0004's original design
+
+`docs/RESEARCH.md`/ADR-0004 describe anchored walk-forward optimization
+against historical OHLC data via a `backtester/` module, a
+Deflated-Sharpe-weighted objective function, and multi-gate promotion
+criteria. None of that exists — `backtester/` was flagged **unscheduled**
+in the roadmap back in Phase 2. This phase's directive describes something
+categorically simpler (a single rule-based shift against live/paper ledger
+metrics, plus a standalone bootstrap validator), and that's what's
+implemented. See `optimizer/README.md`'s "Simplification" section. Also
+flagged: the specific rule thresholds (10 trades, 40% win rate, 1.0 profit
+factor) and which parameter each rule adjusts were not specified in the
+phase directive — this implementation's choice, fully overridable.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (22 files).
+- `mypy --strict .` — no issues found in 22 source files (mypy 2.1.0
+  locally, per the Phase 4 toolchain note).
+- `pytest` — 0 tests collected against the still-empty `tests/` layout, as
+  expected (this project's first formal automated suite lands next phase).
+- Pure-logic checks: Saturday-only gating (with naive-datetime rejection),
+  `compute_ledger_metrics()` across empty/mixed/all-win/all-loss trade
+  sets, `decide_parameter_shift()` across all five branches (insufficient
+  trades, low win rate, low profit factor, healthy metrics, parameter
+  already at its bound, missing parameter), and
+  `run_monte_carlo_bootstrap()`'s reproducibility under a seeded RNG plus
+  its all-positive/all-negative sanity bounds.
+- **Isolation guarantee, verified against a real SQLite database** (not
+  just asserted): seeded an FSM-state snapshot and an open position,
+  seeded closed trades engineered to trigger a parameter shift, ran a
+  full weekly optimization cycle on a Saturday timestamp, and confirmed
+  byte-for-byte that the FSM snapshot and the open trade were completely
+  unchanged afterward, with exactly one new `parameter_history` row
+  written. A parallel run on a Tuesday timestamp confirmed the cycle is
+  skipped with zero side effects (no `parameter_history` row at all).
+- `create_weekend_optimizer_scheduler()`: confirmed the registered job's
+  `CronTrigger` carries `day_of_week='sat', hour='3'`.
 
 ## [0.8.0] - 2026-07-05
 

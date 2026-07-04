@@ -36,9 +36,9 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | RQ-009 | Every `Signal` shall pass through a pre-trade risk gate (`RiskGateDecision`) before becoming an `Order`; no direct `Signal → Order` path shall exist. | `execution/`, `risk/` | `docs/API_SPEC.md` §1, `docs/RISK_REGISTER.md` | `tests/execution/test_risk_gate_mandatory.py` (pending Phase 9) | SPECIFIED (pending Phase 6 implementation) |
 | RQ-010 | Order submission shall guard against excess slippage and reject/re-route fills outside a configured tolerance band. | `execution/` | `docs/RISK_REGISTER.md` (RR-006) | `tests/execution/test_slippage_guard.py` (pending Phase 9) | SPECIFIED (pending Phase 6 implementation) |
 | RQ-011 | The system shall support partial position closures as a first-class execution operation. | `execution/`, `broker/` | `docs/API_SPEC.md` §3 (`close_position`) | `execution/position_manager.py`'s `evaluate_partial_close_and_breakeven()` + `broker/mt5_gateway.py`'s `submit_position_action()` (`TRADE_ACTION_DEAL` path) implemented Phase 6 and ad hoc verified against a fake `MetaTrader5` substitute (see `CHANGELOG.md` §0.7.0); formal `tests/execution/test_partial_closure.py` pending Phase 9 | IMPLEMENTED |
-| RQ-012 | Strategy parameter re-optimization shall run offline (weekend cadence) and shall never mutate live strategy parameters mid-week or mid-signal-evaluation. | `optimizer/` | ADR-0001 §5, ADR-0004 | `tests/optimizer/test_apply_boundary.py` (pending Phase 9) | SPECIFIED (pending Phase 8 implementation) |
-| RQ-013 | Parameter re-optimization shall use anchored walk-forward validation exclusively; non-anchored or shuffled time-series validation is architecturally forbidden. | `optimizer/`, `backtester/` | ADR-0004 | `tests/optimizer/test_anchored_fold_construction.py` (pending Phase 9) | SPECIFIED (pending Phase 8 implementation) |
-| RQ-014 | The optimizer shall refuse to emit a `ParameterUpdateEvent` if Deflated Sharpe Ratio or IS/OOS efficiency ratio gates fail. | `optimizer/` | ADR-0004, `docs/RESEARCH.md` §Promotion Gates | `tests/optimizer/test_promotion_gate_enforcement.py` (pending Phase 9) | SPECIFIED (pending Phase 8 implementation) |
+| RQ-012 | Strategy parameter re-optimization shall run offline (weekend cadence) and shall never mutate live strategy parameters mid-week or mid-signal-evaluation. | `optimizer/` | ADR-0001 §5, ADR-0004 | `optimizer/self_learning.py`'s Saturday-only `CronTrigger` + independent runtime re-check, and the isolation guarantee (only ever writes `parameter_history`, never `system_state`/open `trade_ledger` rows) implemented Phase 8 and verified against a real SQLite database (see `CHANGELOG.md` §0.9.0); no wiring to `strategy/`'s actual live parameters exists yet, so "never mutate live parameters" currently holds trivially (nothing is wired to mutate); formal `tests/optimizer/test_apply_boundary.py` pending Phase 9 | IMPLEMENTED (partial — cadence/isolation only, no live-parameter wiring) |
+| RQ-013 | Parameter re-optimization shall use anchored walk-forward validation exclusively; non-anchored or shuffled time-series validation is architecturally forbidden. | `optimizer/`, `backtester/` | ADR-0004 | **Not implemented** — Phase 8 built a deliberately simpler rule-based single-parameter shift against live/paper ledger metrics instead (see `optimizer/README.md` "Simplification vs. the original ADR-0004 design"); anchored WFO remains unimplemented pending a `backtester/` module, which is unscheduled in the current roadmap (Phase 2 note); `tests/optimizer/test_anchored_fold_construction.py` has no phase assigned | SPECIFIED |
+| RQ-014 | The optimizer shall refuse to emit a `ParameterUpdateEvent` if Deflated Sharpe Ratio or IS/OOS efficiency ratio gates fail. | `optimizer/` | ADR-0004, `docs/RESEARCH.md` §Promotion Gates | **Not implemented** — same Simplification note as RQ-013; Phase 8's `decide_parameter_shift()` uses simple win-rate/profit-factor thresholds, not DSR/IS-OOS gates, and there is no `ParameterUpdateEvent`/`core` to emit one to; `tests/optimizer/test_promotion_gate_enforcement.py` has no phase assigned | SPECIFIED |
 | RQ-015 | The backtester shall support both a fast vectorized mode (research iteration) and an event-driven mode sharing live `strategy/`/`execution/` code (validation/parity). | `backtester/` | ADR-0001, ADR-0002 | `tests/backtester/test_vectorized_vs_event_parity.py` | **UNSCHEDULED** — `backtester/` does not appear in the current 10-phase roadmap; Phase 8's Monte Carlo bootstrap validates the optimizer's ledger metrics but is not the full vectorized/event-driven backtester ADR-0004 assumes. Flagging for a roadmap decision. |
 | RQ-016 | Performance analytics shall compute Sharpe, Sortino, MAR, and maximum drawdown from the persisted equity curve, not from in-memory ad hoc state. | `analytics/` | `docs/API_SPEC.md` §5 | `tests/analytics/test_metrics_from_ledger.py` | **UNSCHEDULED** — `analytics/` does not appear in the current 10-phase roadmap; Phase 8's self-learning optimizer reads "SQLite ledger metrics" directly, which may end up substituting for a dedicated `analytics/` module. Flagging for a roadmap decision. |
 | RQ-017 | High-impact economic calendar events shall trigger a pre-trade blackout window enforced by the risk gate. | `news/`, `execution/` | `docs/API_SPEC.md` §2 (`NewsWindow`), `docs/RISK_REGISTER.md` (RR-009) | `news/news_engine.py`'s `is_trade_entry_locked()` (±30 min NFP/CPI/FOMC blackout) and `apply_news_feed_fail_safe()` implemented Phase 7 and ad hoc verified against a faked `requests.get` (see `CHANGELOG.md` §0.8.0); not yet wired into `execution/`'s actual pre-trade risk gate (that gate itself doesn't exist yet); formal `tests/news/test_blackout_enforcement.py` pending Phase 9 | IMPLEMENTED (partial — logic only, not yet wired to a risk gate) |
@@ -46,14 +46,14 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | RQ-019 | CI shall block merge on any Ruff lint failure, Mypy strict-mode failure, or Pytest failure, and shall report coverage. | `.github/workflows/` | this document | CI pipeline itself is the verification | SPECIFIED |
 | RQ-020 | Every ADR, API contract change, and risk register update shall be reflected in `CHANGELOG.md` with a correct SemVer bump. | project-wide | `CHANGELOG.md` policy | manual release-checklist review (`docs/RUNBOOK.md`) | IMPLEMENTED (process, Phase 0) |
 
-## Coverage Summary (as of Phase 7)
+## Coverage Summary (as of Phase 8)
 
 | Category | Requirements Specified | Implemented | Verified |
 |---|---|---|---|
 | Architecture / Core | RQ-001–RQ-006 | 3 (RQ-001, RQ-002 partial, RQ-005 partial) | 0 |
 | Strategy / Indicators | RQ-007–RQ-008 | 2 (RQ-007; RQ-008 partial — no `ParameterUpdate` yet) | 0 |
 | Execution / Risk | RQ-009–RQ-011 | 1 (RQ-011; RQ-009/RQ-010 not started — see Non-Goals in `execution/README.md`) | 0 |
-| Optimizer / Backtest | RQ-012–RQ-015 | 0 | 0 |
+| Optimizer / Backtest | RQ-012–RQ-015 | 1 (RQ-012, partial — cadence/isolation only; RQ-013/RQ-014 deliberately not built, see `optimizer/README.md`) | 0 |
 | Analytics / News | RQ-016–RQ-017 | 1 (RQ-017, partial — logic only, not wired to a risk gate) | 0 |
 | Platform / Process | RQ-018–RQ-020 | 2 (RQ-018 code + manual verification; RQ-020 process) | 0 |
 
@@ -71,6 +71,10 @@ signals, RQ-008) and `indicators/math_engine.sma()`. Phase 6 landed the new
 (partial close, breakeven, ATR trailing — RQ-011), and
 `broker/mt5_gateway.py`'s `submit_position_action()`. Phase 7 landed
 `news/news_engine.py` (calendar feed client, macro-event blackout window,
-News-API-down fail-safe — RQ-017 partial). No row is yet `VERIFIED`, since
-that status requires a formal automated test suite (Phase 9) and observed
-paper-trading behavior (post Phase 10), neither of which exist yet.
+News-API-down fail-safe — RQ-017 partial). Phase 8 landed
+`optimizer/self_learning.py` (Saturday-gated rule-based parameter shift +
+Monte Carlo bootstrap — RQ-012 partial; a new `parameter_history` storage
+table) — deliberately simpler than ADR-0004's anchored-WFO design, per that
+module's README. No row is yet `VERIFIED`, since that status requires a
+formal automated test suite (Phase 9) and observed paper-trading behavior
+(post Phase 10), neither of which exist yet.

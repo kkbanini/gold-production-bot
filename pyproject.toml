@@ -1,6 +1,6 @@
 [project]
 name = "gold-production-bot"
-version = "0.8.0"
+version = "0.9.0"
 description = "Event-driven algorithmic trading system for XAUUSD on MetaTrader 5."
 requires-python = ">=3.12"
 dependencies = [
@@ -51,6 +51,15 @@ warn_unused_ignores = true
 # immediately converted into our own typed dataclasses (SymbolSpec,
 # BrokerPosition), so this does not weaken typing anywhere else.
 module = "MetaTrader5"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# APScheduler ships no py.typed marker and no types-apscheduler stub
+# package exists on PyPI. The only module importing it is
+# optimizer/self_learning.py, and its use is confined to
+# create_weekend_optimizer_scheduler(), which returns the scheduler object
+# as-is rather than threading its internals through other typed code.
+module = "apscheduler.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -156,6 +156,40 @@ class StateManager:
         )
         return [_row_to_entry(row) for row in cursor.fetchall()]
 
+    def get_closed_trades(self) -> list[TradeLedgerEntry]:
+        """Return all trade_ledger rows that have already been closed.
+
+        Read-only against historical performance data — the only
+        trade_ledger read `optimizer/self_learning.py` is permitted to
+        perform (isolation guarantee: it never reads or writes an open
+        position).
+        """
+        cursor = self._connection.execute(
+            "SELECT * FROM trade_ledger WHERE closed_at_utc IS NOT NULL ORDER BY opened_at_utc"
+        )
+        return [_row_to_entry(row) for row in cursor.fetchall()]
+
+    # --- Parameter history (optimizer/) ---
+
+    def record_parameter_change(
+        self, parameter_name: str, old_value: float, new_value: float, reason: str
+    ) -> None:
+        """Append a row to the isolated parameter_history table.
+
+        This is the only write `optimizer/self_learning.py` is permitted
+        to perform — it never touches `system_state` or an open
+        `trade_ledger` row (isolation guarantee).
+        """
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO parameter_history
+                    (parameter_name, old_value, new_value, reason, applied_at_utc)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (parameter_name, old_value, new_value, reason, _utc_now_iso()),
+            )
+
 
 def _row_to_entry(row: sqlite3.Row) -> TradeLedgerEntry:
     return TradeLedgerEntry(

@@ -45,6 +45,20 @@ CREATE TABLE IF NOT EXISTS system_state (
     last_sequence_id    INTEGER NOT NULL DEFAULT 0,
     updated_at_utc      TEXT NOT NULL
 );
+
+-- Append-only. The sole write target for optimizer/self_learning.py
+-- (isolation guarantee: that module never writes system_state or an open
+-- trade_ledger row).
+CREATE TABLE IF NOT EXISTS parameter_history (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    parameter_name      TEXT NOT NULL,
+    old_value           REAL NOT NULL,
+    new_value           REAL NOT NULL,
+    reason              TEXT NOT NULL,
+    applied_at_utc      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_parameter_history_name ON parameter_history (parameter_name);
 """
 
 
