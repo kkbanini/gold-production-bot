@@ -40,11 +40,12 @@ Three environments, strictly ordered, no environment may be skipped:
 | Environment | Purpose | Broker Connection | Promotion Gate In |
 |---|---|---|---|
 | `dev` | Local development, unit/integration tests, backtesting. | None (`backtester/` test double `BrokerGateway` only, ADR-0002) or MT5 demo account for manual smoke tests. | CI green (Ruff + Mypy + Pytest + coverage threshold). |
-| `paper` | Continuous run against a live MT5 **demo** account, real-time market data, simulated fills. | MT5 demo account, `TRADING_MODE=paper` (RR-012 guard). | Minimum observation window (see §4) with no `HIGH`+ severity incidents unresolved, plus a passing anchored-WFO report for any active parameter set (ADR-0004). |
-| `live` | Real capital, MT5 **live** account. | MT5 live account, `TRADING_MODE=live`, explicit human-confirmed account allowlist (RR-012). | Explicit human sign-off referencing the paper-stage `PerformanceReport`, plus phase-approval gate per `docs/RUNBOOK.md` §7. |
+| `paper` | Continuous run against a live MT5 **demo** account, real-time market data, simulated fills. | MT5 demo account, `ENVIRONMENT_MODE=DEMO` (RR-012 guard). | Minimum observation window (see §4) with no `HIGH`+ severity incidents unresolved, plus a passing anchored-WFO report for any active parameter set (ADR-0004). |
+| `live` | Real capital, MT5 **live** account. | MT5 live account, `ENVIRONMENT_MODE=LIVE`, explicit human-confirmed account allowlist (RR-012). | Explicit human sign-off referencing the paper-stage `PerformanceReport`, plus phase-approval gate per `docs/RUNBOOK.md` §7. |
 
-`config/`'s `TRADING_MODE` and account-allowlist check (RR-012) is the hard
-technical enforcement that prevents an environment-promotion mistake (e.g.
+`config/`'s `ENVIRONMENT_MODE` check (implemented Phase 1, `config/config_manager.py`)
+and the broker-side account-allowlist cross-check (RR-012, pending Phase 2) are the
+hard technical enforcement that prevents an environment-promotion mistake (e.g.
 accidentally starting the bot against the live account while intending paper);
 this is a startup-time FATAL-on-mismatch check, not a soft warning.
 
@@ -53,11 +54,12 @@ this is a startup-time FATAL-on-mismatch check, not a soft warning.
 - All broker credentials, account IDs, and any third-party API keys (news
   calendar provider) are supplied via environment variables loaded from a
   local `.env` file, read exclusively by `config/` (RR-001, RQ-018).
-- `.env` is never committed; `.env.example` (introduced in Phase 1) documents
+- `.env` is never committed; `.env.template` (introduced in Phase 1) documents
   required keys with placeholder values only.
-- Environment-specific values (`TRADING_MODE`, account allowlist, risk limits)
-  are environment-scoped — `dev`, `paper`, and `live` each have their own `.env`,
-  never a shared file toggled by a flag.
+- Environment-specific values (`ENVIRONMENT_MODE`, account allowlist, risk
+  limits) are environment-scoped — `dev`, `paper`, and `live` each have their
+  own `.env`, never a shared file toggled by a flag. `.env.template` (Phase 1)
+  documents the full set of required keys with empty placeholder values.
 
 ## 4. Rollback Procedure
 

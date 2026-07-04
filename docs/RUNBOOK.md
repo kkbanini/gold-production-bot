@@ -18,14 +18,15 @@ failure halts startup (fail-closed, never fail-open into a partially-initialized
 trading state).
 
 1. **Load configuration** (`config/`). Validate presence of all required
-   environment variables (broker credentials, `TRADING_MODE`, account allowlist).
-   Missing/malformed config halts here — see RR-012.
+   environment variables (broker credentials, `ENVIRONMENT_MODE`, account
+   allowlist) via `ConfigManager.load()`. Missing/malformed config halts here
+   — see RR-012.
 2. **Open storage layer** (`storage/`). Run `PRAGMA integrity_check`. Verify
    `schema_version` matches the running code's expected migration head. Load the
    last persisted core-state snapshot and its `sequence_id`.
 3. **Connect BrokerGateway** (`broker/`). Resolve `broker_utc_offset`. Assert the
    connected account ID/type matches the `config/`-declared allowlist and
-   `TRADING_MODE` (RR-012) — mismatch is FATAL, halt immediately.
+   `ENVIRONMENT_MODE` (RR-012) — mismatch is FATAL, halt immediately.
 4. **Replay unacknowledged events** since the last snapshot's `sequence_id`
    (`storage/`) to reconstruct in-memory core state exactly (ADR-0001, ADR-0003).
 5. **Reconcile replayed state against broker truth**: compare replayed open

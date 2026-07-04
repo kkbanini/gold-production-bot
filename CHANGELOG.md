@@ -5,8 +5,8 @@ documented in this file. The format follows [Keep a Changelog 1.1.0](https://kee
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/).
 
 Version tokens are stored canonically in `VERSION` and must match the latest header
-below at all times. CI enforces this invariant (see `.github/workflows/ci.yml`,
-introduced in a later phase).
+below at all times. CI enforces this invariant (see `.github/workflows/ci.yml`'s
+`docs-consistency` job).
 
 ## Versioning Policy
 
@@ -23,7 +23,50 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing yet. Phase 1 will introduce `config/` (secret and environment management).
+Nothing yet. Phase 2 will introduce `broker/` (MT5 gateway and server-time
+alignment).
+
+## [0.2.0] - 2026-07-04
+
+### Added — Phase 1: Environment Scaffolding, Secrets Architecture & Linter Rule Enforcement
+
+- `requirements.txt` — exact, pinned production dependency versions
+  (`MetaTrader5==5.0.4500`, `pandas==2.2.2`, `numpy==1.26.4`, `scipy==1.13.1`,
+  `requests==2.32.3`, `python-dotenv==1.0.1`, `apscheduler==3.10.4`).
+- `.env.template` — declares the full set of required runtime environment
+  variables (`MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`,
+  `ECONOMIC_CALENDAR_API_KEY`, `STRATEGY_MAGIC_NUMBER`, `ENVIRONMENT_MODE`)
+  with empty placeholder values; never populated with real credentials.
+- `pyproject.toml` — project metadata/dependencies (PEP 621) plus static
+  quality tool configuration: Ruff (`target-version = "py312"`,
+  `line-length = 100`, `select = ["E", "F", "B", "I", "C90"]`), Mypy
+  (`disallow_untyped_defs`, `disallow_incomplete_defs`,
+  `warn_unused_ignores`, all `true`), and Pytest (`testpaths = ["tests"]`).
+- `config/config_manager.py` — `ConfigManager`, a frozen dataclass loaded via
+  `ConfigManager.load()`. Reads `.env` through `python-dotenv`, validates that
+  every required key is present, validates `ENVIRONMENT_MODE` is one of
+  `DEMO`/`LIVE`, and type-coerces `MT5_LOGIN`/`STRATEGY_MAGIC_NUMBER` to
+  `int`. Raises `ConfigurationError` (never returns a partial config) on any
+  validation failure, enforcing RQ-018 and RR-012 at boot time.
+- `config/README.md` updated to describe the landed implementation.
+- `docs/RISK_REGISTER.md` (RR-012) and `docs/DEPLOYMENT.md`/`docs/RUNBOOK.md`
+  updated to reference the concrete `ENVIRONMENT_MODE` (`DEMO`/`LIVE`)
+  environment variable implemented this phase, in place of the earlier
+  placeholder `TRADING_MODE` naming from the Phase 0 baseline.
+
+### Verified
+
+- `ruff check .` — all checks passed.
+- `ruff format --check .` — all files already formatted.
+- `mypy --strict config/config_manager.py` — no issues found.
+- `pytest` — 0 tests collected against the (still-empty) `tests/` layout,
+  confirming `testpaths` wiring is correct; no test files were part of this
+  phase's deliverables.
+- `ConfigManager.load()` manually exercised against three scenarios: all
+  required keys missing (raises `ConfigurationError` naming every missing
+  key), an invalid `ENVIRONMENT_MODE` value (raises with the invalid value
+  and the valid set), and a fully valid environment (returns a correctly
+  typed `ConfigManager` instance).
 
 ## [0.1.0] - 2026-07-04
 

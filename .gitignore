@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.template
 
 # --- Claude Code artifacts ---
 .claude/

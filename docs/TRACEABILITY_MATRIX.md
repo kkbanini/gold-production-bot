@@ -33,11 +33,11 @@ test exists until that phase lands.
 | RQ-015 | The backtester shall support both a fast vectorized mode (research iteration) and an event-driven mode sharing live `strategy/`/`execution/` code (validation/parity). | `backtester/` | ADR-0001, ADR-0002 | `tests/backtester/test_vectorized_vs_event_parity.py` (pending Phase 7) | SPECIFIED |
 | RQ-016 | Performance analytics shall compute Sharpe, Sortino, MAR, and maximum drawdown from the persisted equity curve, not from in-memory ad hoc state. | `analytics/` | `docs/API_SPEC.md` §5 | `tests/analytics/test_metrics_from_ledger.py` (pending Phase 8) | SPECIFIED |
 | RQ-017 | High-impact economic calendar events shall trigger a pre-trade blackout window enforced by the risk gate. | `news/`, `execution/` | `docs/API_SPEC.md` §2 (`NewsWindow`), `docs/RISK_REGISTER.md` (RR-009) | `tests/news/test_blackout_enforcement.py` (pending Phase 9) | SPECIFIED |
-| RQ-018 | Secrets (broker credentials, API keys) shall never be committed to source control and shall be sourced from environment/`.env` only. | `config/` | `docs/RISK_REGISTER.md` (RR-001), `docs/DEPLOYMENT.md` | `tests/config/test_no_secrets_in_repo.py` (pending Phase 1) | SPECIFIED |
+| RQ-018 | Secrets (broker credentials, API keys) shall never be committed to source control and shall be sourced from environment/`.env` only, and the system shall refuse to boot if any required configuration key is missing. | `config/` | `docs/RISK_REGISTER.md` (RR-001, RR-012), `docs/DEPLOYMENT.md` | `config/config_manager.py`'s `ConfigManager.load()` implemented and manually verified Phase 1 (see `CHANGELOG.md` §0.2.0); `tests/config/test_config_manager.py` formal suite pending a future phase | IMPLEMENTED |
 | RQ-019 | CI shall block merge on any Ruff lint failure, Mypy strict-mode failure, or Pytest failure, and shall report coverage. | `.github/workflows/` | this document | CI pipeline itself is the verification | SPECIFIED |
 | RQ-020 | Every ADR, API contract change, and risk register update shall be reflected in `CHANGELOG.md` with a correct SemVer bump. | project-wide | `CHANGELOG.md` policy | manual release-checklist review (`docs/RUNBOOK.md`) | IMPLEMENTED (process, Phase 0) |
 
-## Coverage Summary (Phase 0)
+## Coverage Summary (as of Phase 1)
 
 | Category | Requirements Specified | Implemented | Verified |
 |---|---|---|---|
@@ -46,7 +46,11 @@ test exists until that phase lands.
 | Execution / Risk | RQ-009–RQ-011 | 0 | 0 |
 | Optimizer / Backtest | RQ-012–RQ-015 | 0 | 0 |
 | Analytics / News | RQ-016–RQ-017 | 0 | 0 |
-| Platform / Process | RQ-018–RQ-020 | 1 (process only) | 0 |
+| Platform / Process | RQ-018–RQ-020 | 2 (RQ-018 code + manual verification; RQ-020 process) | 0 |
 
-Phase 0 is documentation-only by directive; the 0/0 implemented/verified counts
-above are expected and correct for this phase, not a gap.
+Phase 0 was documentation-only by directive, so its 0/0 implemented/verified
+counts were expected, not a gap. Phase 1 lands the first real implementation
+(`config/config_manager.py`, RQ-018), moving it to `IMPLEMENTED`; it is not yet
+`VERIFIED` because that status requires a formal automated test suite and
+observed paper-trading behavior, neither of which apply to a config-loading
+module in isolation.
