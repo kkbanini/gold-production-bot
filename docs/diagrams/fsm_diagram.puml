@@ -1,0 +1,63 @@
+@startuml fsm_diagram
+title Order & Position Lifecycle — Finite State Machine
+
+state "Order Lifecycle" as OrderFSM {
+  [*] --> PENDING : Signal approved by\nRisk Gate (RiskGateDecision.approved)
+  PENDING --> SUBMITTED : BrokerGateway.submit_order()\naccepted by MT5
+  PENDING --> REJECTED : BrokerOrderRejectedError\n(pre-submission validation failure)
+
+  SUBMITTED --> PARTIALLY_FILLED : partial Fill received
+  SUBMITTED --> FILLED : full Fill received
+  SUBMITTED --> CANCELLED : cancel_order() before any fill\n(e.g. timeout, manual)
+  SUBMITTED --> REJECTED : broker-side rejection\n(margin, symbol unavailable, etc.)
+
+  PARTIALLY_FILLED --> FILLED : remaining volume filled
+  PARTIALLY_FILLED --> CANCELLED : cancel_order() on\nunfilled remainder
+
+  FILLED --> [*]
+  CANCELLED --> [*]
+  REJECTED --> [*]
+
+  note right of SUBMITTED
+    client_order_id is the idempotency key
+    (RR-007). A retry after BrokerTimeoutError
+    MUST check OrderRepository.get_by_client_order_id
+    before resubmitting — never assume the
+    original submission failed to reach the broker.
+  end note
+}
+
+state "Position Lifecycle" as PositionFSM {
+  [*] --> OPEN : first FILLED Order\nfor a flat symbol
+  OPEN --> PARTIALLY_CLOSED : close_position(volume_lots=partial)\n(RQ-011)
+  OPEN --> CLOSED : close_position(volume_lots=None)\nor stop-loss/take-profit hit
+  PARTIALLY_CLOSED --> PARTIALLY_CLOSED : additional partial closure
+  PARTIALLY_CLOSED --> CLOSED : remaining volume closed
+  OPEN --> OPEN : additional FILLED Order\nsame direction (position add)
+  CLOSED --> [*]
+
+  note right of OPEN
+    Every OPEN position must carry a
+    broker-side stop_loss_price at all times
+    (RR-017) — software-only ("mental") stops
+    are not a permitted state.
+  end note
+}
+
+state "Optimizer Parameter Lifecycle" as ParamFSM {
+  [*] --> CANDIDATE : Anchored WFO run completes\n(ADR-0004)
+  CANDIDATE --> REJECTED_BY_GATE : any promotion gate\nfails (docs/RESEARCH.md §5)
+  CANDIDATE --> PROMOTED : all promotion gates pass
+  REJECTED_BY_GATE --> [*] : current live parameter\nset remains ACTIVE (no-op)
+  PROMOTED --> ACTIVE : ParameterUpdateEvent applied\nat next bar-close boundary (RR-014)
+  ACTIVE --> ACTIVE : superseded by next\nweekly optimizer cycle
+  ACTIVE --> [*]
+
+  note right of PROMOTED
+    Applied atomically between bar closes
+    only — never mid-signal-evaluation
+    (ADR-0001 §5, RR-014).
+  end note
+}
+
+@enduml

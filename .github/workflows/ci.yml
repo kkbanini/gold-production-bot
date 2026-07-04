@@ -1,0 +1,109 @@
+name: CI
+
+# Enforces the Execution Cycle gate defined in the project's development
+# lifecycle: Ruff -> Mypy -> Pytest -> Coverage. Every push/PR must pass all
+# four stages before merge. This workflow is intentionally tolerant of an
+# empty src tree in Phase 0 (no trading code exists yet) but will start
+# enforcing real thresholds the moment `pyproject.toml` and source packages
+# land in Phase 1+.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: Ruff (lint + format check)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Ruff
+        run: pip install ruff
+      - name: Ruff check
+        run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .
+
+  typecheck:
+    name: Mypy (strict mode)
+    runs-on: windows-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install project (once pyproject.toml exists)
+        run: |
+          if (Test-Path pyproject.toml) {
+            pip install -e ".[dev]"
+          } else {
+            pip install mypy
+          }
+      - name: Mypy strict
+        run: |
+          if (Test-Path pyproject.toml) {
+            mypy --strict .
+          } else {
+            Write-Host "No pyproject.toml yet (Phase 0) — skipping strict mypy run."
+          }
+
+  test:
+    name: Pytest + Coverage
+    runs-on: windows-latest
+    needs: typecheck
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install project (once pyproject.toml exists)
+        run: |
+          if (Test-Path pyproject.toml) {
+            pip install -e ".[dev]"
+          } else {
+            pip install pytest pytest-cov
+          }
+      - name: Run tests with coverage
+        run: |
+          if (Test-Path tests) {
+            $testFiles = Get-ChildItem -Path tests -Recurse -Filter "test_*.py" -ErrorAction SilentlyContinue
+            if ($testFiles) {
+              pytest --cov=. --cov-report=term-missing --cov-fail-under=90
+            } else {
+              Write-Host "No tests collected yet (Phase 0) — nothing to run."
+            }
+          }
+
+  docs-consistency:
+    name: Docs & Versioning Consistency
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify VERSION matches latest CHANGELOG.md entry
+        shell: powershell
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $changelogHead = Select-String -Path CHANGELOG.md -Pattern '^\#\# \[(\d+\.\d+\.\d+)\]' | Select-Object -First 1
+          if (-not $changelogHead) {
+            Write-Error "CHANGELOG.md has no versioned entry matching '## [x.y.z]'."
+            exit 1
+          }
+          $changelogVersion = $changelogHead.Matches[0].Groups[1].Value
+          if ($version -ne $changelogVersion) {
+            Write-Error "VERSION ($version) does not match latest CHANGELOG.md entry ($changelogVersion)."
+            exit 1
+          }
+          Write-Host "VERSION and CHANGELOG.md agree: $version"

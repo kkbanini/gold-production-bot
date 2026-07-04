@@ -1,0 +1,38 @@
+# --- Environment / Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Claude Code artifacts ---
+.claude/
+
+# --- Python cache & build artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+
+# --- Databases (storage/ SQLite ledger, ADR-0003) ---
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+desktop.ini

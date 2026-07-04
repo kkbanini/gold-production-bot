@@ -1,0 +1,124 @@
+@startuml component_diagram
+title Gold Production Bot — Component Diagram (Phase 0 architecture baseline)
+
+skinparam componentStyle rectangle
+
+package "config/" {
+  [ConfigLoader] as Config
+}
+
+package "storage/" {
+  [EventLogRepository] as EventLogRepo
+  [OrderRepository] as OrderRepo
+  [PositionRepository] as PositionRepo
+  [EquityCurveRepository] as EquityRepo
+  [ParameterHistoryRepository] as ParamRepo
+  database "SQLite (WAL)" as SQLite
+  EventLogRepo --> SQLite
+  OrderRepo --> SQLite
+  PositionRepo --> SQLite
+  EquityRepo --> SQLite
+  ParamRepo --> SQLite
+}
+
+package "broker/" {
+  [BrokerGateway (MT5 adapter)] as BrokerMT5
+  BrokerMT5 --> [MetaTrader5 Terminal] : ctypes IPC
+}
+
+package "core (event bus + single-writer loop)" {
+  [EventBus] as Bus
+  [CoreLoop] as Core
+  Core --> Bus
+}
+
+package "indicators/" {
+  [Pure numpy indicator functions] as Indicators
+}
+
+package "strategy/" {
+  [Signal Generator] as Strategy
+  Strategy --> Indicators
+}
+
+package "execution/" {
+  [Pre-trade Risk Gate] as RiskGate
+  [Order Router] as OrderRouter
+  [Slippage Guard] as SlippageGuard
+  RiskGate --> OrderRouter
+  OrderRouter --> SlippageGuard
+}
+
+package "news/" {
+  [Economic Calendar Poller] as News
+}
+
+package "optimizer/" {
+  [Anchored WFO Engine] as Optimizer
+  [Promotion Gate Check] as PromotionGate
+  Optimizer --> PromotionGate
+}
+
+package "backtester/" {
+  [Vectorized Backtester] as VectorBT
+  [Event-Driven Backtester] as EventBT
+  [BrokerGateway (historical test double)] as BrokerTestDouble
+  EventBT --> BrokerTestDouble
+}
+
+package "analytics/" {
+  [Performance Metrics Engine] as Analytics
+}
+
+' --- Cross-module event flow (all via EventBus, per ADR-0001) ---
+BrokerMT5 ..> Bus : TickEvent / BarClosedEvent
+News ..> Bus : NewsWindowEvent
+Optimizer ..> Bus : ParameterUpdateEvent
+
+Bus ..> Strategy : dispatch TickEvent/BarClosedEvent
+Strategy ..> Bus : SignalEvent
+Bus ..> RiskGate : dispatch SignalEvent
+RiskGate ..> Bus : OrderRequestEvent / RiskBreachEvent
+Bus ..> OrderRouter : dispatch OrderRequestEvent
+OrderRouter --> BrokerMT5 : submit_order()
+BrokerMT5 ..> Bus : FillEvent
+Bus ..> Core : all events (applies state transitions)
+
+Core --> EventLogRepo : append (ADR-0003)
+Core --> OrderRepo : upsert
+Core --> PositionRepo : upsert
+Core --> EquityRepo : record_mark
+Core --> ParamRepo : record
+
+Optimizer --> EventBT : OOS fold evaluation (ADR-0004)
+Optimizer --> EquityRepo : read historical equity/parameters
+Analytics --> EquityRepo : read
+Analytics --> OrderRepo : read
+PromotionGate --> Analytics : PerformanceReport (DSR, MAR, IS/OOS ratio)
+
+note right of Bus
+  ADR-0001: single EventBus, single-writer
+  CoreLoop. No module mutates another
+  module's state directly.
+end note
+
+note right of BrokerMT5
+  ADR-0002: only broker/ (and backtester/'s
+  test double) may touch MetaTrader5 /
+  historical replay directly. All timestamps
+  normalized to UTC at this boundary.
+end note
+
+note right of SQLite
+  ADR-0003: WAL mode, single writer
+  connection, append-only event log +
+  transactional derived-table updates.
+end note
+
+note right of PromotionGate
+  ADR-0004: anchored WFO is the only
+  path to a ParameterUpdateEvent.
+  Gate failure = no-op, not an error.
+end note
+
+@enduml

@@ -1,0 +1,88 @@
+@startuml sequence_diagram
+title Tick-to-Fill Event Pipeline (nominal path, ADR-0001 / ADR-0002)
+
+autonumber
+
+participant "MT5 Terminal" as MT5
+participant "broker/\nBrokerGateway" as Broker
+participant "core/\nEventBus" as Bus
+participant "core/\nCoreLoop" as Core
+participant "strategy/\nSignal Generator" as Strategy
+participant "execution/\nRisk Gate" as RiskGate
+participant "execution/\nOrder Router" as Router
+participant "storage/\nRepositories" as Storage
+participant "analytics/" as Analytics
+
+MT5 -> Broker : raw tick (broker-local time)
+activate Broker
+Broker -> Broker : normalize to UTC\n(broker_utc_offset, ADR-0002)
+Broker -> Bus : publish(TickEvent)
+deactivate Broker
+
+Bus -> Core : dispatch(TickEvent)
+activate Core
+Core -> Storage : EventLogRepository.append(envelope)
+Core -> Strategy : dispatch(TickEvent, state_snapshot)
+deactivate Core
+
+activate Strategy
+alt bar close boundary reached
+  Strategy -> Strategy : evaluate indicators/\n(pure numpy functions)
+  Strategy -> Bus : publish(SignalEvent)
+else no signal this tick
+  Strategy --> Core : no follow-on event
+end
+deactivate Strategy
+
+Bus -> Core : dispatch(SignalEvent)
+activate Core
+Core -> Storage : EventLogRepository.append(envelope)
+Core -> RiskGate : dispatch(SignalEvent, state_snapshot)
+deactivate Core
+
+activate RiskGate
+RiskGate -> RiskGate : check NewsWindow blackout (RR-009)
+RiskGate -> RiskGate : check margin / position sizing (RR-011)
+RiskGate -> RiskGate : check duplicate client_order_id (RR-007)
+alt approved
+  RiskGate -> Bus : publish(OrderRequestEvent)
+else rejected
+  RiskGate -> Bus : publish(RiskBreachEvent, severity=LOW/MEDIUM)
+end
+deactivate RiskGate
+
+Bus -> Core : dispatch(OrderRequestEvent)
+activate Core
+Core -> Storage : EventLogRepository.append(envelope)
+Core -> Router : dispatch(OrderRequestEvent)
+deactivate Core
+
+activate Router
+Router -> Broker : submit_order(order)
+activate Broker
+Broker -> MT5 : place order (ctypes call)
+MT5 --> Broker : fill confirmation / rejection
+alt filled within slippage tolerance
+  Broker --> Router : Order(status=FILLED)
+else rejected or excess slippage
+  Broker --> Router : BrokerOrderRejectedError
+end
+deactivate Broker
+Router -> Bus : publish(FillEvent) or publish(RiskBreachEvent)
+deactivate Router
+
+Bus -> Core : dispatch(FillEvent)
+activate Core
+Core -> Storage : BEGIN IMMEDIATE\n  EventLogRepository.append(envelope)\n  OrderRepository.upsert(order)\n  PositionRepository.upsert(position)\nCOMMIT
+Core -> Analytics : notify (equity mark available)
+deactivate Core
+
+Analytics -> Storage : EquityCurveRepository.record_mark(account_state)
+
+note over Core, Storage
+  Every event dispatch that mutates trading
+  state persists atomically (ADR-0003) before
+  the next event is dequeued (ADR-0001).
+end note
+
+@enduml
