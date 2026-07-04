@@ -1,4 +1,4 @@
-"""Pure numpy technical indicator functions: EMA, Wilder ATR, Wilder ADX.
+"""Pure numpy technical indicator functions: SMA, EMA, Wilder ATR, Wilder ADX.
 
 Standalone vector math over OHLC price arrays — no I/O, no broker
 dependency, no MetaTrader5 import. Direct MT5-computed indicator values are
@@ -9,8 +9,8 @@ EMA/ATR/ADX are IIR (recursive) filters by definition: each smoothed value
 depends on the previous smoothed value, which cannot be expressed as a
 single element-wise vectorized numpy operation. The recursive step below
 uses one explicit Python loop writing into a preallocated numpy array;
-every other computation (true range, directional movement) is fully
-vectorized.
+every other computation (true range, directional movement, SMA's
+cumulative-sum window) is fully vectorized.
 """
 
 from __future__ import annotations
@@ -21,6 +21,28 @@ import numpy as np
 import numpy.typing as npt
 
 FloatArray: TypeAlias = npt.NDArray[np.float64]
+
+
+def sma(values: FloatArray, period: int) -> FloatArray:
+    """Simple moving average via a vectorized cumulative-sum window (SMA is
+    a plain windowed average, not an IIR filter, so no recursive loop is
+    needed here unlike ema()/_wilder_smooth()).
+
+    Returns an array the same length as `values`; the first `period - 1`
+    entries are NaN (undefined — insufficient warm-up data).
+    """
+    if period < 1:
+        raise ValueError(f"period must be >= 1, got {period}")
+    values = np.asarray(values, dtype=np.float64)
+    n = values.shape[0]
+    if n < period:
+        raise ValueError(f"need at least {period} values, got {n}")
+
+    result: FloatArray = np.full(n, np.nan, dtype=np.float64)
+    cumulative_sum = np.cumsum(values, dtype=np.float64)
+    result[period - 1] = cumulative_sum[period - 1] / period
+    result[period:] = (cumulative_sum[period:] - cumulative_sum[:-period]) / period
+    return result
 
 
 def ema(values: FloatArray, period: int) -> FloatArray:

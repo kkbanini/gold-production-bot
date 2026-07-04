@@ -31,8 +31,8 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | RQ-004 | Trading state mutations shall occur on exactly one logical thread of control (single-writer core loop). | core | ADR-0001 | `tests/core/test_concurrency_model.py` (pending Phase 10) | SPECIFIED |
 | RQ-005 | Every event and derived state transition shall be persisted transactionally (ACID) such that a crash mid-write cannot desynchronize the event log from derived state. | `storage/` | ADR-0003 | `storage/state_manager.py` implemented and ad hoc verified Phase 2 (see `CHANGELOG.md` §0.3.0) for the FSM-state-snapshot case; full event-log/derived-table divergence guarantee remains narrower than originally specified (see `storage/README.md` "Simplification" note); formal `tests/storage/test_crash_recovery.py` pending Phase 9 | IMPLEMENTED (partial) |
 | RQ-006 | The system shall be able to fully reconstruct current trading state by replaying the persisted event log from the last snapshot. | `storage/`, core | ADR-0001, ADR-0003 | Narrowed this phase to single-snapshot recovery (no intermediate event replay, since no `EventBus`/event log exists yet — pending Phase 10); `tests/storage/test_event_replay.py` pending Phase 9 | SPECIFIED |
-| RQ-007 | Indicator calculations shall be pure functions over numpy arrays with no I/O or broker dependency. | `indicators/` | `docs/API_SPEC.md` §1, `docs/RESEARCH.md` | `indicators/math_engine.py` (`ema`/`atr`/`adx`) implemented Phase 4; ad hoc verified against two independent pure-Python references + boundary/error-path checks (see `CHANGELOG.md` §0.5.0, which also documents a real ADX normalization bug caught this way); formal `tests/indicators/test_purity.py` pending Phase 9 | IMPLEMENTED |
-| RQ-008 | Strategy signal generation shall be deterministic given identical `Bar`/`Tick` history and an identical `ParameterUpdate`. | `strategy/` | `docs/API_SPEC.md` §1 | `strategy/trend_filter.py`'s `evaluate_master_trend()` implemented Phase 4 (trend-alignment filter only, not yet full signal generation — entry triggers land Phase 5) and ad hoc verified (bullish/bearish/mismatched/choppy synthetic scenarios); formal `tests/strategy/test_determinism.py` pending Phase 9 | IMPLEMENTED (partial — trend filter only) |
+| RQ-007 | Indicator calculations shall be pure functions over numpy arrays with no I/O or broker dependency. | `indicators/` | `docs/API_SPEC.md` §1, `docs/RESEARCH.md` | `indicators/math_engine.py` (`sma`/`ema`/`atr`/`adx`) implemented Phase 4-5; ad hoc verified against independent pure-Python references + boundary/error-path checks (see `CHANGELOG.md` §0.5.0, which also documents a real ADX normalization bug caught this way); formal `tests/indicators/test_purity.py` pending Phase 9 | IMPLEMENTED |
+| RQ-008 | Strategy signal generation shall be deterministic given identical `Bar`/`Tick` history and an identical `ParameterUpdate`. | `strategy/` | `docs/API_SPEC.md` §1 | `strategy/trend_filter.py` (Phase 4) + `strategy/execution_triggers.py` (Phase 5: `detect_breakout`/`detect_pullback`/`analyze_wick_fill`) implemented and ad hoc verified (see `CHANGELOG.md` §0.5.0/§0.6.0); pattern shapes for breakout/pullback authored into `docs/RESEARCH.md` §8 this phase, flagged for review since no prior spec existed for their exact shape; combining the three independent trigger signals into one entry decision is deferred to `execution/`; formal `tests/strategy/test_determinism.py` pending Phase 9 | IMPLEMENTED (partial — no `ParameterUpdate` consumption yet) |
 | RQ-009 | Every `Signal` shall pass through a pre-trade risk gate (`RiskGateDecision`) before becoming an `Order`; no direct `Signal → Order` path shall exist. | `execution/`, `risk/` | `docs/API_SPEC.md` §1, `docs/RISK_REGISTER.md` | `tests/execution/test_risk_gate_mandatory.py` (pending Phase 9) | SPECIFIED (pending Phase 6 implementation) |
 | RQ-010 | Order submission shall guard against excess slippage and reject/re-route fills outside a configured tolerance band. | `execution/` | `docs/RISK_REGISTER.md` (RR-006) | `tests/execution/test_slippage_guard.py` (pending Phase 9) | SPECIFIED (pending Phase 6 implementation) |
 | RQ-011 | The system shall support partial position closures as a first-class execution operation. | `execution/`, `broker/` | `docs/API_SPEC.md` §3 (`close_position`) | `tests/execution/test_partial_closure.py` (pending Phase 9) | SPECIFIED (pending Phase 6 implementation) |
@@ -46,12 +46,12 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | RQ-019 | CI shall block merge on any Ruff lint failure, Mypy strict-mode failure, or Pytest failure, and shall report coverage. | `.github/workflows/` | this document | CI pipeline itself is the verification | SPECIFIED |
 | RQ-020 | Every ADR, API contract change, and risk register update shall be reflected in `CHANGELOG.md` with a correct SemVer bump. | project-wide | `CHANGELOG.md` policy | manual release-checklist review (`docs/RUNBOOK.md`) | IMPLEMENTED (process, Phase 0) |
 
-## Coverage Summary (as of Phase 4)
+## Coverage Summary (as of Phase 5)
 
 | Category | Requirements Specified | Implemented | Verified |
 |---|---|---|---|
 | Architecture / Core | RQ-001–RQ-006 | 3 (RQ-001, RQ-002 partial, RQ-005 partial) | 0 |
-| Strategy / Indicators | RQ-007–RQ-008 | 2 (RQ-007; RQ-008 partial — trend filter only) | 0 |
+| Strategy / Indicators | RQ-007–RQ-008 | 2 (RQ-007; RQ-008 partial — no `ParameterUpdate` yet) | 0 |
 | Execution / Risk | RQ-009–RQ-011 | 0 | 0 |
 | Optimizer / Backtest | RQ-012–RQ-015 | 0 | 0 |
 | Analytics / News | RQ-016–RQ-017 | 0 | 0 |
@@ -63,9 +63,10 @@ counts were expected, not a gap. Phase 1 landed `config/config_manager.py`
 (RQ-005, partial — see that row's notes on the narrowed crash-recovery
 guarantee). Phase 3 landed `broker/mt5_gateway.py` (RQ-001; RQ-002 partial —
 offset resolution and the GMT window exist, periodic DST-drift re-validation
-from RR-003 does not yet). Phase 4 lands `indicators/math_engine.py` (RQ-007)
-and `strategy/trend_filter.py` (RQ-008, partial — the D1/H4/H1 trend-alignment
-filter only; entry-trigger signal generation lands Phase 5). No row is yet
+from RR-003 does not yet). Phase 4 landed `indicators/math_engine.py`
+(RQ-007) and `strategy/trend_filter.py` (RQ-008, trend-alignment filter).
+Phase 5 landed `strategy/execution_triggers.py` (breakout/pullback/wick-fill
+signals, RQ-008) and `indicators/math_engine.sma()`. No row is yet
 `VERIFIED`, since that status requires a formal automated test suite
 (Phase 9) and observed paper-trading behavior (post Phase 10), neither of
 which exist yet.

@@ -12,6 +12,10 @@ here is derived from raw OHLC arrays.
 
 `math_engine.py`:
 
+- `sma(values, period)` — simple moving average via a vectorized
+  cumulative-sum window (not an IIR filter like the others, so no
+  recursive loop is needed). First `period - 1` entries are NaN. Used by
+  `strategy/execution_triggers.py`'s tick-volume filter.
 - `ema(values, period)` — exponential moving average, seeded with the
   simple average of the first `period` values. First `period - 1` entries
   are NaN (undefined warm-up).

@@ -24,9 +24,32 @@ across all three timeframes *and* ADX confirms sufficient trend strength.
 Raises `ValueError` (via `indicators.math_engine`) on insufficient history
 rather than silently evaluating against NaN-derived indicator values.
 
+`execution_triggers.py` — three independent entry-trigger signals, precise
+definitions in `docs/RESEARCH.md` §8 (authored this phase — flagged there
+as this implementation's specific choice, since no prior spec existed for
+the breakout/pullback pattern *shapes*, only for the already-given
+50-point and tick-volume thresholds):
+
+- `detect_breakout()` — 2-candle breakout: latest close must clear the
+  prior bar's high/low by ≥ 50 broker points (`SymbolSpec.point` from
+  `broker/`), `volume_confirmed` requires `tick_volume > SMA(20) × 1.5`.
+  `BreakoutSignal.is_valid` requires both.
+- `detect_pullback()` — trend-continuation pullback against a
+  `reference_level` array (typically the trend's own EMA): the latest
+  bar's low/high must touch or cross the level intrabar but close back on
+  the trend side of it. Only meaningful given a non-`"NONE"` trend
+  direction from `trend_filter.py`.
+- `analyze_wick_fill()` — classifies the latest bar's upper/lower shadow
+  as a fraction of its full range; > 60% on either side is a rejection
+  signal (long lower wick → `BUY`, long upper wick → `SELL`). A zero-range
+  bar yields `NONE` rather than a division error.
+
+Also added `indicators.math_engine.sma()` (simple moving average) this
+phase, needed for the tick-volume filter above.
+
 ## Depends On
 
-`indicators/` (`ema`, `adx`, `FloatArray`), `docs/API_SPEC.md` (`Bar`, `Tick`, `Signal`,
+`indicators/` (`ema`, `adx`, `sma`, `FloatArray`), `docs/API_SPEC.md` (`Bar`, `Tick`, `Signal`,
 `ParameterUpdate` shapes).
 
 ## Depended On By
@@ -43,9 +66,10 @@ ADR-0004 (parameter sets must originate from anchored WFO promotion).
 
 ## Non-Goals (This Phase)
 
-Entry-trigger logic (breakout/pullback patterns, wick-fill analytics, tick
-volume filters) is not part of this phase — it lands separately alongside
-execution triggers. No automated `tests/strategy/` suite yet — verification
-this phase was ad hoc (synthetic bullish/bearish/mismatched/choppy OHLC
-scenarios; see `CHANGELOG.md` §0.5.0), consistent with the project's plan
-to introduce the full automated test harness in a dedicated later phase.
+`execution_triggers.py`'s three signals (breakout, pullback, wick-fill) are
+independent — combining them into a single entry decision (e.g. requiring
+breakout AND volume confirmation, or pullback OR wick-fill rejection) is an
+`execution/` concern for a later phase, not decided here. No automated
+`tests/strategy/` suite yet — verification both phases was ad hoc (see
+`CHANGELOG.md` §0.5.0 and §0.6.0), consistent with the project's plan to
+introduce the full automated test harness in a dedicated later phase.

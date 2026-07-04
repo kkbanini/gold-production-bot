@@ -152,3 +152,74 @@ All formulas above operate on the persisted equity curve (`storage/`,
 `EquityCurveRepository`) — never on an in-memory or ad hoc recomputation — per
 RQ-016, so that live-reported analytics and WFO-report analytics share one
 implementation.
+
+## 8. Entry Trigger Specification (`strategy/execution_triggers.py`)
+
+> **Provenance note**: this section is authored in Phase 5 to make the
+> phase directive's "exactly as mapped in `docs/RESEARCH.md`" instruction
+> true going forward. No version of this document prior to Phase 5 defined
+> a breakout/pullback/wick-fill pattern shape — only the 50-point filter
+> and the `Tick_Volume > SMA(20) × 1.5` threshold were given as concrete
+> numbers elsewhere. The pattern *shapes* below (what counts as a
+> "breakout," what counts as a "pullback") are this implementation's
+> specific choice among standard, well-documented technical-analysis
+> conventions, not a pre-existing spec. Flagged for review; revise this
+> section (and `strategy/execution_triggers.py` alongside it) if a
+> different shape is intended.
+
+All three triggers below operate on a single timeframe's closed-bar OHLC
+(+ tick volume) arrays, evaluated at the latest closed bar. They are
+independent signals — combining them into a single entry decision (e.g.
+"breakout AND volume-confirmed" vs. "pullback OR wick-fill rejection") is
+an `execution/` concern for a later phase, not decided here.
+
+### 8.1 Breakout (2-candle pattern + 50-point filter + tick-volume filter)
+
+Given the latest two closed bars `[i-1, i]`:
+
+- **Bullish breakout**: `close[i] - high[i-1] ≥ 50 × point`, where `point`
+  is the instrument's point size (`broker.mt5_gateway.SymbolSpec.point`,
+  resolved per-broker in Phase 3 — never hardcoded).
+- **Bearish breakout**: `low[i-1] - close[i] ≥ 50 × point` (mirror image).
+- **Tick-volume confirmation**: `tick_volume[i] > SMA(20)(tick_volume) × 1.5`,
+  computed over the trailing 20 bars' tick volume ending at bar `i`.
+
+A breakout is only `is_valid` (tradeable) when both the distance filter and
+the volume filter pass simultaneously.
+
+### 8.2 Pullback (trend-continuation logic)
+
+Meaningful only within an already-established trend direction (from
+`strategy/trend_filter.py`'s `TrendAlignment.direction`). Given a
+`reference_level` array (the trend's own EMA — D1 EMA(200), H4 EMA(50), or
+H1 EMA(40), matching whichever timeframe is being evaluated) and the
+latest closed bar:
+
+- **Bullish pullback**: trend direction is `BUY`, and
+  `low[i] ≤ reference_level[i] < close[i]` — price dipped to or through the
+  reference level intrabar (testing it as support) but closed back above
+  it, confirming the level held and the trend is resuming.
+- **Bearish pullback**: trend direction is `SELL`, and
+  `high[i] ≥ reference_level[i] > close[i]` (mirror image, level tested as
+  resistance).
+- No trend (`NONE`) always yields no pullback signal — a pullback without
+  an established trend to continue is not a defined concept here.
+
+### 8.3 Wick Fill Analytics (rejection threshold > 60% of bar range)
+
+Given the latest closed bar's `open, high, low, close`:
+
+```
+bar_range = high - low
+upper_shadow_ratio = (high - max(open, close)) / bar_range
+lower_shadow_ratio = (min(open, close) - low) / bar_range
+```
+
+- **Bullish rejection** (maps to a `BUY`-side signal): `lower_shadow_ratio > 0.60`
+  — a long lower wick indicates price was pushed down intrabar and
+  strongly rejected (demand absorbed the decline), a bullish tell.
+- **Bearish rejection** (maps to a `SELL`-side signal): `upper_shadow_ratio > 0.60`
+  (mirror image).
+- A bar with `bar_range == 0` (no intrabar movement at all) yields no
+  rejection signal (both ratios reported as `0.0`, `rejection = NONE`) —
+  division by a zero range is undefined, not "highly significant."

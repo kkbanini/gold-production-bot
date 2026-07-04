@@ -23,8 +23,71 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing yet. Phase 5 will introduce entry-trigger logic in `strategy/`
-(breakout patterns, pullback logic, wick-fill analytics, tick-volume filter).
+Nothing yet. Phase 6 will introduce `risk/risk_manager.py` (equity-based
+lot compounding) and `execution/position_manager.py` (partial closures,
+breakeven, ATR trailing stop).
+
+## [0.6.0] - 2026-07-04
+
+### Added — Phase 5: Technical Entry Rules & Wick Fill Processing
+
+- `indicators/math_engine.py` — added `sma()` (simple moving average via a
+  vectorized cumulative-sum window; SMA is not an IIR filter like
+  EMA/ATR/ADX, so no recursive loop is needed).
+- `strategy/execution_triggers.py`:
+  - `detect_breakout()` — 2-candle breakout pattern: latest close must
+    clear the prior bar's high (bullish) or low (bearish) by ≥ 50 broker
+    points (`min_breakout_points`, using the instrument's `point` size);
+    `volume_confirmed` requires `tick_volume[-1] > SMA(20)(tick_volume) × 1.5`.
+    `BreakoutSignal.is_valid` requires both.
+  - `detect_pullback()` — trend-continuation pullback: within an
+    established trend direction, the latest bar's low/high must touch or
+    cross a `reference_level` (e.g. the trend's own EMA) intrabar but
+    close back on the trend side of it.
+  - `analyze_wick_fill()` — classifies the latest bar's upper/lower shadow
+    as a fraction of its full range; > 60% (`WICK_FILL_THRESHOLD`) on
+    either side is a rejection signal. Zero-range bars yield `NONE`
+    rather than a division error.
+- `docs/RESEARCH.md` §8 ("Entry Trigger Specification") — added to make
+  the phase directive's "exactly as mapped in `docs/RESEARCH.md`"
+  instruction true going forward.
+- `indicators/README.md`, `strategy/README.md` updated to describe the
+  landed implementation.
+
+### Flagged — pattern shapes were not previously specified anywhere
+
+The phase directive's 50-point filter and `Tick_Volume > SMA(20) × 1.5`
+threshold were fully specified; the *shape* of the "2-candle breakout
+pattern" and "pullback logic" was not — `docs/RESEARCH.md` contained no
+entry-trigger specification prior to this phase (it only covered the WFO
+research spec). Rather than inventing behavior silently, this phase
+authored `docs/RESEARCH.md` §8 defining both pattern shapes using
+standard, well-documented technical-analysis conventions (prior-bar-range
+breakout; EMA-as-support/resistance pullback), marked with an explicit
+provenance note inviting correction if a different shape was intended.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (17 files).
+- `mypy --strict .` — no issues found in 17 source files (mypy 2.1.0
+  locally, per the Phase 4 toolchain note; `pyproject.toml`'s pinned
+  `mypy==1.11.2` is unchanged).
+- `pytest` — 0 tests collected against the still-empty `tests/` layout, as
+  expected (automated `tests/strategy/` coverage deferred to the project's
+  dedicated testing phase).
+- `sma()`: exact match (`rtol=1e-10`) against an independent pure-Python
+  windowed-mean reference over 100 random bars.
+- `detect_breakout()`: bullish/bearish triggers at the exact 50-point
+  boundary, no-trigger just under the boundary, volume-confirmed vs.
+  not-confirmed `is_valid` gating, and `ValueError` on `point <= 0` /
+  insufficient bars.
+- `detect_pullback()`: bullish and bearish pullback detection, `"NONE"`
+  trend direction always yielding no signal regardless of price action,
+  and the boundary case where close sits exactly at the reference level
+  (correctly excluded — strict inequality required).
+- `analyze_wick_fill()`: long-lower-wick → `BUY`, long-upper-wick →
+  `SELL`, balanced-body → `NONE`, and a zero-range bar handled safely
+  (`NONE`, ratios `0.0`, no division error).
 
 ## [0.5.0] - 2026-07-04
 
