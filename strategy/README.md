@@ -10,9 +10,23 @@ responsibility. Consumes the currently-active parameter set published by
 `optimizer/` via `ParameterUpdateEvent`, applied only at a bar-close boundary
 (ADR-0001 §5, RR-014).
 
+## Implementation
+
+`trend_filter.py` — `evaluate_master_trend()`: validates master trend
+alignment across three timeframes, each compared against its *own* EMA
+(D1 EMA(200), H4 EMA(50), H1 EMA(40)) rather than a single cross-timeframe
+price, since each timeframe's close is only available at its own bar-close
+cadence. Direction is `BULLISH` only if all three sit above their EMA,
+`BEARISH` only if all three sit below, otherwise `NONE`. Additionally
+requires the H1 ADX(14) to exceed `ADX_TREND_THRESHOLD` (25.0) —
+`TrendAlignment.is_valid` is `True` only when both the direction agrees
+across all three timeframes *and* ADX confirms sufficient trend strength.
+Raises `ValueError` (via `indicators.math_engine`) on insufficient history
+rather than silently evaluating against NaN-derived indicator values.
+
 ## Depends On
 
-`indicators/` (pure math functions), `docs/API_SPEC.md` (`Bar`, `Tick`, `Signal`,
+`indicators/` (`ema`, `adx`, `FloatArray`), `docs/API_SPEC.md` (`Bar`, `Tick`, `Signal`,
 `ParameterUpdate` shapes).
 
 ## Depended On By
@@ -29,5 +43,9 @@ ADR-0004 (parameter sets must originate from anchored WFO promotion).
 
 ## Non-Goals (This Phase)
 
-No code exists yet. Trend filter / signal trigger implementation and
-`tests/strategy/test_determinism.py` (RQ-008) land in Phase 4.
+Entry-trigger logic (breakout/pullback patterns, wick-fill analytics, tick
+volume filters) is not part of this phase — it lands separately alongside
+execution triggers. No automated `tests/strategy/` suite yet — verification
+this phase was ad hoc (synthetic bullish/bearish/mismatched/choppy OHLC
+scenarios; see `CHANGELOG.md` §0.5.0), consistent with the project's plan
+to introduce the full automated test harness in a dedicated later phase.

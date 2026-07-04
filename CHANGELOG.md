@@ -23,8 +23,88 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing yet. Phase 4 will introduce `indicators/` (pure numpy EMA/ATR/ADX)
-and `strategy/` (D1/H4/H1 trend-alignment filter).
+Nothing yet. Phase 5 will introduce entry-trigger logic in `strategy/`
+(breakout patterns, pullback logic, wick-fill analytics, tick-volume filter).
+
+## [0.5.0] - 2026-07-04
+
+### Added — Phase 4: Pure Math Indicator Engine & Trend Processing
+
+- `indicators/math_engine.py` — `ema()` (standard EMA), `atr()` (Wilder's
+  smoothing, default period 14), `adx()` (full Wilder ADX: +DM/-DM ->
+  Wilder-smoothed +DI/-DI -> DX -> Wilder-smoothed ADX, default period 14).
+  All three are pure numpy functions with no I/O/broker dependency (RQ-007)
+  and raise `ValueError` on insufficient history or mismatched array
+  lengths. Exports `FloatArray` (`npt.NDArray[np.float64]`) as a shared type
+  alias.
+- `strategy/trend_filter.py` — `evaluate_master_trend()`: validates trend
+  alignment across D1 EMA(200), H4 EMA(50), and H1 EMA(40) (each timeframe
+  compared against its own EMA), gated by H1 ADX(14) > 25
+  (`ADX_TREND_THRESHOLD`). Returns a `TrendAlignment` dataclass with a
+  `direction` (`BULLISH`/`BEARISH`/`NONE`) and an `is_valid` property
+  requiring both full alignment and ADX confirmation.
+- `pyproject.toml` — added `numpy.typing`/`TypeAlias` usage in
+  `indicators/math_engine.py`; no new config needed beyond what Phase 1
+  already specified.
+- `indicators/README.md`, `strategy/README.md` updated to describe the
+  landed implementation.
+
+### Fixed — real bug caught during verification
+
+- `adx()`'s first implementation Wilder-smoothed the DX line using the same
+  "smoothed sum" convention as True Range/+DM/-DM, but omitted the final
+  `/ period` normalization that convention requires (exactly the
+  normalization `atr()` already applies to `smoothed_tr`). This let ADX
+  exceed its mathematically required `[0, 100]` bound — a synthetic strong
+  uptrend produced `ADX = 1400.0`. Caught by cross-checking against two
+  independently-derived pure-Python Wilder-ADX reference implementations
+  (sum-then-divide vs. direct step-by-step averaging) plus an explicit
+  bound assertion; the first reference initially shared the same missing
+  division (derived from the same flawed mental model) and did not catch
+  it alone — the second, structurally different derivation did. Fixed by
+  adding the missing `/ period` division. See `indicators/README.md`
+  "Verification note" for the full account.
+
+### Noted — local toolchain artifact, not a codebase issue
+
+- This development sandbox has only Python 3.14 installed (no 3.12, no C
+  compiler to build numpy from source), so `numpy==1.26.4` (the pinned
+  production version, which has no Python 3.14 wheel) could not be
+  installed locally; `MetaTrader5`'s own dependency resolution pulled
+  `numpy==2.5.0` instead for local verification. `mypy==1.11.2` (the pinned
+  dev version) does not understand numpy 2.5's typing stubs and produced
+  spurious `FloatArray? is not indexable`-style errors against otherwise
+  correct, properly-annotated code; upgrading `mypy` to `2.1.0` locally
+  resolved this cleanly. `pyproject.toml`'s pinned `mypy==1.11.2` dev
+  dependency was **not** changed, since the project's actual target
+  toolchain (Python 3.12, where `numpy==1.26.4` installs normally per its
+  published wheels) is not expected to hit this incompatibility — CI runs
+  on Python 3.12 (`.github/workflows/ci.yml`). This is an artifact of this
+  sandbox's Python version, not a defect in the pinned dependency set.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (16 files).
+- `mypy --strict .` — no issues found in 16 source files (using mypy 2.1.0
+  locally per the note above).
+- `pytest` — 0 tests collected against the still-empty `tests/` layout, as
+  expected (automated `tests/indicators/` and `tests/strategy/` coverage
+  deferred to the project's dedicated testing phase).
+- `ema()`: constant-series sanity check, plus exact match (`rtol=1e-10`)
+  against an independent pure-Python reference over 300 random bars.
+- `atr()`: exact match (`rtol=1e-9`) against an independent pure-Python
+  reference over 300 random synthetic OHLC bars.
+- `adx()`: exact match (`rtol=1e-8`) against two independently-derived
+  pure-Python references, an explicit `0 <= ADX <= 100` bound assertion,
+  qualitative sanity (`ADX > 25` on a strong synthetic uptrend, `ADX < 25`
+  on a pure-noise/choppy series), and `ValueError` on insufficient
+  history/mismatched array lengths for all three functions.
+- `evaluate_master_trend()`: full bullish alignment (all three timeframes
+  + ADX confirm) -> `BULLISH`/`is_valid=True`; full bearish alignment ->
+  `BEARISH`/`is_valid=True`; mismatched timeframe alignment (D1 bullish, H1
+  bearish) -> `NONE`; choppy market on all timeframes -> `adx_confirmed=False`
+  even where EMA sides happened to align; insufficient D1 history ->
+  `ValueError` propagated from `indicators.math_engine`.
 
 ## [0.4.0] - 2026-07-04
 
