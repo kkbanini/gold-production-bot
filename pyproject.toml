@@ -1,6 +1,6 @@
 [project]
 name = "gold-production-bot"
-version = "0.6.0"
+version = "0.7.0"
 description = "Event-driven algorithmic trading system for XAUUSD on MetaTrader 5."
 requires-python = ">=3.12"
 dependencies = [
@@ -26,7 +26,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["config*", "storage*", "broker*", "indicators*", "strategy*", "execution*", "optimizer*", "backtester*", "analytics*", "news*"]
+include = ["config*", "storage*", "broker*", "indicators*", "strategy*", "execution*", "risk*", "optimizer*", "backtester*", "analytics*", "news*"]
 
 [tool.ruff]
 target-version = "py312"

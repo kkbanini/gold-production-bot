@@ -35,7 +35,7 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | RQ-008 | Strategy signal generation shall be deterministic given identical `Bar`/`Tick` history and an identical `ParameterUpdate`. | `strategy/` | `docs/API_SPEC.md` §1 | `strategy/trend_filter.py` (Phase 4) + `strategy/execution_triggers.py` (Phase 5: `detect_breakout`/`detect_pullback`/`analyze_wick_fill`) implemented and ad hoc verified (see `CHANGELOG.md` §0.5.0/§0.6.0); pattern shapes for breakout/pullback authored into `docs/RESEARCH.md` §8 this phase, flagged for review since no prior spec existed for their exact shape; combining the three independent trigger signals into one entry decision is deferred to `execution/`; formal `tests/strategy/test_determinism.py` pending Phase 9 | IMPLEMENTED (partial — no `ParameterUpdate` consumption yet) |
 | RQ-009 | Every `Signal` shall pass through a pre-trade risk gate (`RiskGateDecision`) before becoming an `Order`; no direct `Signal → Order` path shall exist. | `execution/`, `risk/` | `docs/API_SPEC.md` §1, `docs/RISK_REGISTER.md` | `tests/execution/test_risk_gate_mandatory.py` (pending Phase 9) | SPECIFIED (pending Phase 6 implementation) |
 | RQ-010 | Order submission shall guard against excess slippage and reject/re-route fills outside a configured tolerance band. | `execution/` | `docs/RISK_REGISTER.md` (RR-006) | `tests/execution/test_slippage_guard.py` (pending Phase 9) | SPECIFIED (pending Phase 6 implementation) |
-| RQ-011 | The system shall support partial position closures as a first-class execution operation. | `execution/`, `broker/` | `docs/API_SPEC.md` §3 (`close_position`) | `tests/execution/test_partial_closure.py` (pending Phase 9) | SPECIFIED (pending Phase 6 implementation) |
+| RQ-011 | The system shall support partial position closures as a first-class execution operation. | `execution/`, `broker/` | `docs/API_SPEC.md` §3 (`close_position`) | `execution/position_manager.py`'s `evaluate_partial_close_and_breakeven()` + `broker/mt5_gateway.py`'s `submit_position_action()` (`TRADE_ACTION_DEAL` path) implemented Phase 6 and ad hoc verified against a fake `MetaTrader5` substitute (see `CHANGELOG.md` §0.7.0); formal `tests/execution/test_partial_closure.py` pending Phase 9 | IMPLEMENTED |
 | RQ-012 | Strategy parameter re-optimization shall run offline (weekend cadence) and shall never mutate live strategy parameters mid-week or mid-signal-evaluation. | `optimizer/` | ADR-0001 §5, ADR-0004 | `tests/optimizer/test_apply_boundary.py` (pending Phase 9) | SPECIFIED (pending Phase 8 implementation) |
 | RQ-013 | Parameter re-optimization shall use anchored walk-forward validation exclusively; non-anchored or shuffled time-series validation is architecturally forbidden. | `optimizer/`, `backtester/` | ADR-0004 | `tests/optimizer/test_anchored_fold_construction.py` (pending Phase 9) | SPECIFIED (pending Phase 8 implementation) |
 | RQ-014 | The optimizer shall refuse to emit a `ParameterUpdateEvent` if Deflated Sharpe Ratio or IS/OOS efficiency ratio gates fail. | `optimizer/` | ADR-0004, `docs/RESEARCH.md` §Promotion Gates | `tests/optimizer/test_promotion_gate_enforcement.py` (pending Phase 9) | SPECIFIED (pending Phase 8 implementation) |
@@ -46,13 +46,13 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | RQ-019 | CI shall block merge on any Ruff lint failure, Mypy strict-mode failure, or Pytest failure, and shall report coverage. | `.github/workflows/` | this document | CI pipeline itself is the verification | SPECIFIED |
 | RQ-020 | Every ADR, API contract change, and risk register update shall be reflected in `CHANGELOG.md` with a correct SemVer bump. | project-wide | `CHANGELOG.md` policy | manual release-checklist review (`docs/RUNBOOK.md`) | IMPLEMENTED (process, Phase 0) |
 
-## Coverage Summary (as of Phase 5)
+## Coverage Summary (as of Phase 6)
 
 | Category | Requirements Specified | Implemented | Verified |
 |---|---|---|---|
 | Architecture / Core | RQ-001–RQ-006 | 3 (RQ-001, RQ-002 partial, RQ-005 partial) | 0 |
 | Strategy / Indicators | RQ-007–RQ-008 | 2 (RQ-007; RQ-008 partial — no `ParameterUpdate` yet) | 0 |
-| Execution / Risk | RQ-009–RQ-011 | 0 | 0 |
+| Execution / Risk | RQ-009–RQ-011 | 1 (RQ-011; RQ-009/RQ-010 not started — see Non-Goals in `execution/README.md`) | 0 |
 | Optimizer / Backtest | RQ-012–RQ-015 | 0 | 0 |
 | Analytics / News | RQ-016–RQ-017 | 0 | 0 |
 | Platform / Process | RQ-018–RQ-020 | 2 (RQ-018 code + manual verification; RQ-020 process) | 0 |
@@ -66,7 +66,10 @@ offset resolution and the GMT window exist, periodic DST-drift re-validation
 from RR-003 does not yet). Phase 4 landed `indicators/math_engine.py`
 (RQ-007) and `strategy/trend_filter.py` (RQ-008, trend-alignment filter).
 Phase 5 landed `strategy/execution_triggers.py` (breakout/pullback/wick-fill
-signals, RQ-008) and `indicators/math_engine.sma()`. No row is yet
+signals, RQ-008) and `indicators/math_engine.sma()`. Phase 6 landed the new
+`risk/risk_manager.py` (equity-based compounding), `execution/position_manager.py`
+(partial close, breakeven, ATR trailing — RQ-011), and
+`broker/mt5_gateway.py`'s `submit_position_action()`. No row is yet
 `VERIFIED`, since that status requires a formal automated test suite
 (Phase 9) and observed paper-trading behavior (post Phase 10), neither of
 which exist yet.

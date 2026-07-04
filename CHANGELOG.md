@@ -23,9 +23,93 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing yet. Phase 6 will introduce `risk/risk_manager.py` (equity-based
-lot compounding) and `execution/position_manager.py` (partial closures,
-breakeven, ATR trailing stop).
+Nothing yet. Phase 7 will introduce `news/news_engine.py` (economic
+calendar feed, News-API-down fail-safe, macro-event trade lockout).
+
+## [0.7.0] - 2026-07-05
+
+### Added — Phase 6: Position Compounding & Advanced Trailing Mechanics
+
+- New `risk/` module (not part of the original Phase 0 scaffold — created
+  this phase per its directive). `risk/risk_manager.py`:
+  - `clamp_lot_size(raw_lots, volume_min, volume_max, volume_step)` —
+    rounds down to the nearest broker volume step and clamps to
+    `[volume_min, volume_max]`.
+  - `calculate_compounded_lot_size(equity, volume_min, volume_max, volume_step, ...)`
+    — equity-based tiered lot sizing: one `lot_increment` (default 0.01)
+    added per `equity_per_lot_increment` (default 1000.0) of equity, on
+    top of `base_lot_size` (default 0.01).
+- `execution/position_manager.py`:
+  - `calculate_base_take_profit()` — `Base_TP = entry ± ATR × 2`.
+  - `evaluate_partial_close_and_breakeven()` — once price reaches
+    `Base_TP`, returns a two-step action list: close 50% of volume, then
+    move the remaining volume's stop-loss to breakeven (exact entry
+    price).
+  - `calculate_trailing_stop()` — dynamic ATR(14) × 1.5 trailing stop,
+    active only once breakeven is set; never returns a candidate that
+    would loosen the existing stop.
+  - All three produce `OrderActionPayload` — a dataclass mirroring a
+    MetaTrader5 `order_send()` request shape without importing
+    `MetaTrader5`.
+- `broker/mt5_gateway.py` — added `BrokerOrderRejectedError` and
+  `submit_position_action()`, which translates an `OrderActionPayload`
+  into a real `mt5.order_send()` request: a `TRADE_ACTION_DEAL` partial
+  close (looks up the live position to determine side, computes the
+  opposite closing order type, reads bid/ask for the closing price) or a
+  `TRADE_ACTION_SLTP` modify request. Raises `BrokerOrderRejectedError` on
+  a non-DONE retcode or an unresolvable position/tick.
+- `risk/README.md` (new), `execution/README.md`, `broker/README.md`
+  updated to describe the landed implementation.
+
+### Design note — preserved the ADR-0002 import boundary
+
+The phase directive describes building the partial-close/breakeven logic
+in `execution/position_manager.py` "using the MT5 Python library payload
+configurations," which read literally could mean constructing
+`mt5.order_send()` requests directly in that file. Doing so would violate
+ADR-0002/RQ-001 (only `broker/` — and `backtester/`'s future test double —
+may import `MetaTrader5`), a boundary verified since Phase 3. Instead,
+`position_manager.py` produces `OrderActionPayload`, which mirrors the
+shape of an MT5 request dict (`action`/`position`/`symbol`/`volume`/`sl`/`tp`/
+`magic`/`comment`) as plain data, and `broker/mt5_gateway.py`'s new
+`submit_position_action()` is the only place that actually imports and
+calls into `MetaTrader5` to submit it. This satisfies the phase's intent
+(payload-shaped position management) without reopening a settled
+architectural boundary.
+
+### Flagged — compounding tier parameters were not specified
+
+Unlike earlier phases (which gave precise numbers — the 50-point breakout
+filter, `SMA(20) × 1.5`), this phase's directive asked for equity-based
+lot compounding without specifying exact tier numbers. The defaults above
+are this implementation's choice among reasonable conventions, flagged in
+`risk/README.md` for review, and fully overridable via keyword arguments.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (20 files).
+- `mypy --strict .` — no issues found in 20 source files (mypy 2.1.0
+  locally, per the Phase 4 toolchain note).
+- `pytest` — 0 tests collected against the still-empty `tests/` layout, as
+  expected (automated `tests/risk/` and `tests/execution/` coverage
+  deferred to the project's dedicated testing phase).
+- `clamp_lot_size()`/`calculate_compounded_lot_size()`: rounding, min/max
+  clamping, non-positive-input handling, equity-tier scaling, and
+  `ValueError` on invalid constraints/non-positive equity.
+- `calculate_base_take_profit()`: correct BUY/SELL distance, `ValueError`
+  on non-positive ATR.
+- `evaluate_partial_close_and_breakeven()`: no action before `Base_TP`;
+  correct 50%-volume partial-close + exact-entry-price breakeven once
+  reached; no further action once already partial-closed.
+- `calculate_trailing_stop()`: inactive before breakeven is set; tightens
+  correctly for both BUY and SELL as price moves favorably; correctly
+  rejects a candidate that would loosen the existing stop.
+- `broker/mt5_gateway.submit_position_action()` (against a fake
+  `MetaTrader5` substitute, no live terminal in this environment):
+  correct BUY-position-close (SELL order @ bid) and SELL-position-close
+  (BUY order @ ask) request shape, correct modify-SLTP request shape,
+  `BrokerOrderRejectedError` on a non-DONE retcode, and on a
+  missing/already-closed position.
 
 ## [0.6.0] - 2026-07-04
 

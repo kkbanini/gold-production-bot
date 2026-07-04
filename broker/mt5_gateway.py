@@ -15,6 +15,7 @@ from typing import Any
 
 import MetaTrader5 as mt5
 
+from execution.position_manager import OrderActionPayload
 from storage.state_manager import TradeLedgerEntry
 
 GOLD_SYMBOL_CANDIDATES: tuple[str, ...] = (
@@ -31,6 +32,11 @@ GOLD_SYMBOL_CANDIDATES: tuple[str, ...] = (
 GMT_SESSION_START_HOUR = 7
 GMT_SESSION_END_HOUR = 22
 
+# Slippage tolerance for partial-close deals, in broker points. A
+# placeholder default, not a policy decision — the full slippage guard
+# (RQ-010, RR-006) is a later-phase concern.
+CLOSE_DEVIATION_POINTS = 20
+
 
 class BrokerConnectionError(Exception):
     """Raised when connecting to the MT5 terminal fails after backoff is exhausted."""
@@ -38,6 +44,12 @@ class BrokerConnectionError(Exception):
 
 class BrokerSymbolUnavailableError(Exception):
     """Raised when no candidate Gold symbol variant is found on the connected broker."""
+
+
+class BrokerOrderRejectedError(Exception):
+    """Raised when MT5 rejects an order/position-modification request (a
+    non-DONE retcode from order_send(), or no result/position/tick found
+    to build the request from)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,3 +289,71 @@ class MT5Gateway:
             broker_only_positions=broker_only,
             ledger_only_entries=ledger_only,
         )
+
+    def submit_position_action(self, payload: OrderActionPayload) -> None:
+        """Translate an execution.position_manager.OrderActionPayload into
+        a real mt5.order_send() request and submit it.
+
+        Raises BrokerOrderRejectedError if MT5 returns a non-DONE retcode,
+        no result at all, or the payload references a ticket/symbol this
+        gateway cannot currently resolve on the broker (e.g. the position
+        already closed, or no tick is available).
+        """
+        if payload.action == "TRADE_ACTION_DEAL":
+            request = self._build_partial_close_request(payload)
+        else:
+            request = self._build_modify_sltp_request(payload)
+
+        result: Any = mt5.order_send(request)
+        retcode = getattr(result, "retcode", None)
+        if result is None or retcode != mt5.TRADE_RETCODE_DONE:
+            raise BrokerOrderRejectedError(
+                f"order_send failed for ticket {payload.position_ticket}: "
+                f"retcode={retcode!r}, last_error={mt5.last_error()!r}"
+            )
+
+    def _build_partial_close_request(self, payload: OrderActionPayload) -> dict[str, Any]:
+        positions: Any = mt5.positions_get(ticket=payload.position_ticket)
+        if not positions:
+            raise BrokerOrderRejectedError(
+                f"cannot partial-close: no open position found for ticket "
+                f"{payload.position_ticket}"
+            )
+        position = positions[0]
+        is_buy_position = position.type == mt5.POSITION_TYPE_BUY
+        closing_order_type = mt5.ORDER_TYPE_SELL if is_buy_position else mt5.ORDER_TYPE_BUY
+
+        tick = mt5.symbol_info_tick(payload.symbol)
+        if tick is None:
+            raise BrokerOrderRejectedError(
+                f"cannot partial-close: no tick available for {payload.symbol!r}"
+            )
+        closing_price = tick.bid if is_buy_position else tick.ask
+
+        return {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "position": payload.position_ticket,
+            "symbol": payload.symbol,
+            "volume": payload.volume,
+            "type": closing_order_type,
+            "price": closing_price,
+            "deviation": CLOSE_DEVIATION_POINTS,
+            "magic": payload.magic,
+            "comment": payload.comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+    def _build_modify_sltp_request(self, payload: OrderActionPayload) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": payload.position_ticket,
+            "symbol": payload.symbol,
+            "magic": payload.magic,
+            "comment": payload.comment,
+        }
+        if payload.stop_loss is not None:
+            request["sl"] = payload.stop_loss
+        if payload.take_profit is not None:
+            request["tp"] = payload.take_profit
+        return request

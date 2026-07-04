@@ -45,10 +45,27 @@ Sole owner of MetaTrader 5 integration. No other module (except
       function only detects and reports divergence; resolving it is a
       caller responsibility (`docs/RUNBOOK.md` §1 step 5, §3.1).
 
-Order submission/cancellation and the remaining `docs/API_SPEC.md` §3
-`BrokerGateway` methods (`submit_order`, `cancel_order`, `close_position`,
-`get_account_state`) are not implemented yet — they land alongside
-`execution/`.
+- `submit_position_action(payload)` (Phase 6) — translates an
+  `execution.position_manager.OrderActionPayload` "intent" into a real
+  `mt5.order_send()` request:
+  - `TRADE_ACTION_DEAL` (partial close): looks up the live position via
+    `mt5.positions_get(ticket=...)` to determine its side, computes the
+    opposite closing order type, reads the current bid/ask via
+    `mt5.symbol_info_tick()` for the closing price, and submits with a
+    `CLOSE_DEVIATION_POINTS` (20) slippage tolerance — a placeholder
+    default, not a policy decision (the full slippage guard is RQ-010,
+    a later phase).
+  - `TRADE_ACTION_SLTP` (modify stop-loss/take-profit): a simpler request
+    carrying only `position`/`symbol`/`magic`/`sl`/`tp`.
+  - Raises `BrokerOrderRejectedError` if `order_send()` returns anything
+    other than `TRADE_RETCODE_DONE`, or if the referenced position/tick
+    can't be found. This keeps the actual `MetaTrader5` payload
+    construction inside `broker/` — `execution/position_manager.py`
+    never imports `MetaTrader5` itself (ADR-0002/RQ-001).
+
+The remaining `docs/API_SPEC.md` §3 `BrokerGateway` methods (`submit_order`,
+`cancel_order`, `get_account_state`, `get_latest_tick`/`get_bars`) are not
+implemented yet.
 
 ## Verification note (no live terminal in this environment)
 
@@ -63,12 +80,18 @@ connection-independent logic — symbol resolution priority/fallback, the GMT
 window's boundary hours, the backoff delay sequence and its exhaustion path,
 and the audit/reconciliation logic — was exercised ad hoc against a fake
 `MetaTrader5` module substituted in place of the real one, covering both
-success and failure paths for each function.
+success and failure paths for each function. Phase 6's
+`submit_position_action()` request-building (BUY-position-close vs.
+SELL-position-close order-type/price mapping, the modify-SLTP request
+shape, and both the missing-position and non-DONE-retcode rejection
+paths) was verified the same way.
 
 ## Depends On
 
-`config/` (credentials, `ENVIRONMENT_MODE`), `storage/` (`TradeLedgerEntry`
-for position-audit reconciliation). External: `MetaTrader5` package,
+`config/` (credentials, `ENVIRONMENT_MODE`), `execution/`
+(`OrderActionPayload`, the "intent" type `submit_position_action()`
+translates into a real MT5 request), `storage/` (`TradeLedgerEntry` for
+position-audit reconciliation). External: `MetaTrader5` package,
 locally-running MT5 terminal process.
 
 ## Depended On By
@@ -88,9 +111,10 @@ connection). `docs/RESEARCH.md` §2 (Time & Session Normalization).
 ## Non-Goals (This Phase)
 
 No automated `tests/broker/` suite yet — verification this phase was ad hoc
-against a fake `MetaTrader5` substitute (see `CHANGELOG.md` §0.4.0),
-consistent with the project's plan to introduce the full automated test
-harness in a dedicated later phase. Order submission/cancellation,
-`get_latest_tick`/`get_bars` for `strategy/` consumption, and the account
-allowlist cross-check referenced in `docs/RISK_REGISTER.md` RR-012 are not
-yet implemented.
+against a fake `MetaTrader5` substitute (see `CHANGELOG.md` §0.4.0 and
+§0.7.0), consistent with the project's plan to introduce the full
+automated test harness in a dedicated later phase. Full order submission
+(`submit_order` for new entries, not just partial closes of existing
+positions), `cancel_order`, `get_account_state`, `get_latest_tick`/`get_bars`
+for `strategy/` consumption, and the account allowlist cross-check
+referenced in `docs/RISK_REGISTER.md` RR-012 are not yet implemented.
