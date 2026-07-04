@@ -23,8 +23,55 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing yet. Phase 2 will introduce `broker/` (MT5 gateway and server-time
-alignment).
+Nothing yet. Phase 3 will introduce `broker/` (MT5 gateway, dynamic Gold
+symbol matching, and server-time alignment).
+
+## [0.3.0] - 2026-07-04
+
+### Added — Phase 2: State Persistence & SQLite Database Engine
+
+- `storage/db_engine.py` — `connect()` opens a SQLite connection with
+  `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`, and
+  `PRAGMA foreign_keys=ON`; `initialize_schema()` creates the `trade_ledger`
+  and `system_state` tables (idempotent, `CREATE TABLE IF NOT EXISTS`).
+  Also provides `checkpoint_wal()` and `integrity_check()`.
+- `storage/state_manager.py` — `StateManager` provides atomic FSM-state
+  persistence (`save_fsm_state()`/`load_fsm_state()`, singleton UPSERT
+  against `system_state`) and idempotent trade-ledger bookkeeping
+  (`record_trade()`/`get_open_trades()`, UPSERT keyed on `client_order_id`
+  per RR-007).
+- `config/__init__.py`, `storage/__init__.py`, `broker/__init__.py`,
+  `indicators/__init__.py`, `strategy/__init__.py`, `execution/__init__.py`,
+  `optimizer/__init__.py`, `backtester/__init__.py`, `analytics/__init__.py`,
+  `news/__init__.py` — package markers added project-wide after discovering
+  `mypy --strict .` (the exact invocation `.github/workflows/ci.yml` runs)
+  failed with "Source file found twice under different module names" once a
+  second module (`state_manager.py`) imported a sibling module
+  (`storage.db_engine`) by dotted path. This is a real fix to a real CI
+  failure, not preventative scaffolding.
+- `storage/README.md` updated to describe the landed implementation and to
+  explicitly document where it simplifies relative to the original
+  multi-repository `docs/API_SPEC.md` §4 design (see the module's own
+  "Simplification vs. the Phase 0 API contract" section).
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (13 files).
+- `mypy --strict .` — no issues found in 13 source files (this is the first
+  phase where this exact CI invocation was exercised against real code, and
+  it caught the module-naming collision above).
+- `pytest` — 0 tests collected against the still-empty `tests/` layout;
+  automated `tests/storage/` coverage is deferred to the project's dedicated
+  testing phase, consistent with Phase 1's precedent.
+- Ad hoc functional verification (scratch script, not committed): WAL mode
+  confirmed active via `PRAGMA journal_mode`; `integrity_check()` passes on a
+  freshly initialized database; a `StateManager` instance's saved FSM state
+  is fully recoverable by a second, independently constructed `StateManager`
+  against the same file after the first instance is dropped without a
+  graceful `close()` (simulated crash); `system_state` always holds exactly
+  one row after repeated saves; `record_trade()` called twice with an
+  identical entry (simulated retry) leaves exactly one `trade_ledger` row;
+  closing a trade removes it from `get_open_trades()`.
 
 ## [0.2.0] - 2026-07-04
 
