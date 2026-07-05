@@ -16,11 +16,22 @@ step back down as equity recovers. Only a `HARD_LOCK` breach is sticky
 `MANUAL_RESET_CONFIRMED` event to clear. This is a deliberate evolution
 beyond Phase 10's "never auto-resumes at any severity" posture — flagged
 in `docs/ARCHITECTURE_SUMMARY.md` §3.
+
+`seed_equity_baselines()`/`roll_equity_baselines()` (below) supersede the
+former "seed once at process boot, never touch again" behavior
+(`docs/ARCHITECTURE_SUMMARY.md` §5's previously-flagged gap): `main()` now
+rolls each tier forward independently the first bar-close cycle that
+crosses its UTC-day/ISO-week/calendar-month boundary, sourcing "now" from
+`ClockProvider` (broker server time) rather than the host machine clock.
+`BaselineEpoch` — the day/week/month each tier was last seeded for — is
+kept out of `EquityBaselines` itself so `classify_drawdown_event()` and
+every existing caller keep dealing with exactly three equity floats.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from enum import Enum
 
 # SOFT_LOCK thresholds: unchanged from Phase 10's original 5%/10%/20%
@@ -74,6 +85,87 @@ class EquityBaselines:
     daily_start_equity: float
     weekly_start_equity: float
     monthly_start_equity: float
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineEpoch:
+    """The UTC calendar day/ISO week/month each `EquityBaselines` tier was
+    last seeded for — the sole bookkeeping `roll_equity_baselines()` needs
+    to decide whether a tier's period boundary has been crossed since."""
+
+    daily_date: date
+    weekly_iso_year_week: tuple[int, int]
+    monthly_year_month: tuple[int, int]
+
+
+def _current_epoch(now_utc: datetime) -> BaselineEpoch:
+    if now_utc.tzinfo is None:
+        raise ValueError("now_utc must be timezone-aware")
+    aware = now_utc.astimezone(timezone.utc)
+    iso_year, iso_week, _ = aware.isocalendar()
+    return BaselineEpoch(
+        daily_date=aware.date(),
+        weekly_iso_year_week=(iso_year, iso_week),
+        monthly_year_month=(aware.year, aware.month),
+    )
+
+
+def seed_equity_baselines(
+    current_equity: float, now_utc: datetime
+) -> tuple[EquityBaselines, BaselineEpoch]:
+    """Construct a fresh `EquityBaselines` with all three tiers set to
+    `current_equity`, stamped with the UTC day/ISO week/month `now_utc`
+    falls in. `main()`'s boot-time seed, called exactly once on its very
+    first bar-close cycle.
+    """
+    baselines = EquityBaselines(
+        daily_start_equity=current_equity,
+        weekly_start_equity=current_equity,
+        monthly_start_equity=current_equity,
+    )
+    return baselines, _current_epoch(now_utc)
+
+
+def roll_equity_baselines(
+    baselines: EquityBaselines,
+    epoch: BaselineEpoch,
+    current_equity: float,
+    now_utc: datetime,
+) -> tuple[EquityBaselines, BaselineEpoch]:
+    """Roll over whichever tier(s) of `baselines` have crossed their period
+    boundary as of `now_utc` (broker server time — `main()` sources this
+    from `ClockProvider`, never the host machine clock), resetting the
+    rolled tier(s) to `current_equity`. A tier whose period hasn't changed
+    since `epoch` passes through unchanged — this is a per-cycle idempotent
+    check, not a per-cycle reset, so calling it every bar-close cycle is
+    safe and required.
+    """
+    new_epoch = _current_epoch(now_utc)
+
+    daily_equity = (
+        current_equity
+        if new_epoch.daily_date != epoch.daily_date
+        else baselines.daily_start_equity
+    )
+    weekly_equity = (
+        current_equity
+        if new_epoch.weekly_iso_year_week != epoch.weekly_iso_year_week
+        else baselines.weekly_start_equity
+    )
+    monthly_equity = (
+        current_equity
+        if new_epoch.monthly_year_month != epoch.monthly_year_month
+        else baselines.monthly_start_equity
+    )
+
+    return (
+        EquityBaselines(
+            daily_start_equity=daily_equity,
+            weekly_start_equity=weekly_equity,
+            monthly_start_equity=monthly_equity,
+        ),
+        new_epoch,
+    )
 
 
 @dataclass(frozen=True, slots=True)

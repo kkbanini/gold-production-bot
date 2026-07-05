@@ -344,16 +344,18 @@ wiring between them is correct too.
   simple poll-and-decide cycle, not the fully event-driven architecture
   ADR-0001 originally specified. Crash recovery is single-snapshot
   (`storage/state_manager.py`), not full event-log replay.
-- **Equity baselines for drawdown checks are seeded once at process start,
-  not rolled over at UTC day/week/month boundaries.** `main()`'s loop sets
-  `EquityBaselines` (now `risk/drawdown_fsm.py`'s, Phase 11d) from the
-  first cycle's equity and never refreshes them. This means the "daily"
-  tier is actually measuring drawdown since *process start*, not since the
-  start of the current UTC day — it will silently stop meaning "daily"
-  after the process has run past midnight UTC. **This must be fixed
-  (baseline rollover logic) before relying on the drawdown FSM for real
-  risk control**, and applies to Phase 11d's `WARNING`/`SOFT_LOCK`/
-  `HARD_LOCK` tiers exactly as it did to Phase 10's single hard lock.
+- ~~Equity baselines for drawdown checks are seeded once at process start,
+  not rolled over at UTC day/week/month boundaries.~~ **Fixed.**
+  `risk/drawdown_fsm.py`'s `seed_equity_baselines()`/
+  `roll_equity_baselines()` now track a `BaselineEpoch` (the UTC
+  day/ISO-week/calendar-month each tier was last set for, kept separate
+  from `EquityBaselines` itself so `classify_drawdown_event()` and every
+  existing caller keep dealing with exactly three equity floats) and
+  independently roll a tier forward the first bar-close cycle whose "now"
+  falls in a new period — a per-cycle idempotent check, not a per-cycle
+  reset. `main()` calls this every cycle, sourcing "now" from
+  `container.clock_provider.get_server_time()` (broker server time, not
+  the host machine clock).
 - **No live control channel exists for a human to clear a `HARD_LOCK`
   (Phase 11d).** `run_bar_close_cycle()`'s `manual_reset_confirmed`
   parameter and the underlying `DrawdownEvent.MANUAL_RESET_CONFIRMED`
@@ -363,24 +365,26 @@ wiring between them is correct too.
   by stopping the process, fixing/reviewing the situation, and either
   restarting with a patched `main()` or manually resetting the persisted
   `FSMContext`. Building the actual control channel is unscheduled.
-- **The news feed and normalized clock are never actually connected in the
-  live loop, despite both now having a working abstraction (Phase 11b).**
-  `main()` still calls `_fetch_market_snapshot(handles.gateway,
-  constraints.magic_number, [])` — the empty list is a hardcoded
-  placeholder, not real news events — and calls `datetime.now(timezone.utc)`
-  directly for `run_bar_close_cycle()`'s `now_utc` and the next-bar-close
-  sleep, rather than through `ClockProvider.get_server_time()`. The
+- **The news feed is never actually connected in the live loop, and the
+  normalized clock is only partially connected, despite both now having a
+  working abstraction (Phase 11b).** `main()` still calls
+  `_fetch_market_snapshot(handles.gateway, constraints.magic_number, [])`
+  — the empty list is a hardcoded placeholder, not real news events — and
+  still calls `datetime.now(timezone.utc)` directly for
+  `run_bar_close_cycle()`'s `now_utc` and the next-bar-close sleep.
+  `ClockProvider.get_server_time()` is now consumed, but only for the
+  equity-baseline rollover decision (see the fixed gap above) — the rest
+  of the loop's timing still reads the host machine clock. The
   NFP/CPI/FOMC blackout and the News-API-down fail-safe (Phase 7) are both
   fully implemented and tested in isolation; `container.py`'s
-  `ApplicationContainer` now holds a fully-wired `calendar_provider`
+  `ApplicationContainer` holds a fully-wired `calendar_provider`
   (`CalendarProviderChain`, defaulting to a network-independent
-  `offline_snapshot` provider) and `clock_provider` (`MT5ClockProvider`,
-  Phase 11b), but nothing in `main.py` calls either one yet. Wiring the
-  network calendar providers to real endpoints additionally requires a
-  real `tradingeconomics`/`finnhub` API contract, which this codebase has
-  never verified (Phase 7 flagged that no provider was ever named;
-  `CALENDAR_TRADINGECONOMICS_BASE_URL`/`CALENDAR_FINNHUB_BASE_URL` must be
-  supplied by a deployer, never guessed).
+  `offline_snapshot` provider), but nothing in `main.py` calls it yet.
+  Wiring the network calendar providers to real endpoints additionally
+  requires a real `tradingeconomics`/`finnhub` API contract, which this
+  codebase has never verified (Phase 7 flagged that no provider was ever
+  named; `CALENDAR_TRADINGECONOMICS_BASE_URL`/`CALENDAR_FINNHUB_BASE_URL`
+  must be supplied by a deployer, never guessed).
 - **`ENVIRONMENT_MODE`'s broker-side cross-check never landed.** `config/`
   validates `ENVIRONMENT_MODE` is `DEMO`/`LIVE`, but `broker/mt5_gateway.py`
   never cross-checks that value against the actually-connected account's
@@ -440,17 +444,17 @@ real capital risk.
 
 1. **Get real MT5 demo credentials** and populate a local `.env` (see
    `.env.template`) — never commit it.
-2. **Fix the equity-baseline rollover gap** (§5) — the drawdown breakers as
-   currently wired don't reset daily/weekly/monthly, which defeats their
-   purpose after the first day of operation.
-3. **Wire `main.py`'s live loop to the `calendar_provider`/`clock_provider`
-   already built into `ApplicationContainer`** (§5) — `main()` still passes
-   a hardcoded empty event list and calls `datetime.now(timezone.utc)`
-   directly; the blackout logic is inert and the clock isn't normalized
-   until this wiring lands. Enabling the network calendar providers
-   (`tradingeconomics`/`finnhub`) additionally requires supplying a real,
-   verified base URL for each via `CALENDAR_<PROVIDER>_BASE_URL` — none is
-   guessed or defaulted.
+2. ~~Fix the equity-baseline rollover gap~~ **Done** (§5) — the drawdown
+   breakers now reset daily/weekly/monthly against broker server time via
+   `roll_equity_baselines()`.
+3. **Wire `main.py`'s live loop to the `calendar_provider` already built
+   into `ApplicationContainer`** (§5) — `main()` still passes a hardcoded
+   empty event list, so the NFP/CPI/FOMC blackout logic is inert.
+   `clock_provider` is now consumed for equity-baseline rollover, but the
+   rest of the loop's timing still reads the host machine clock directly.
+   Enabling the network calendar providers (`tradingeconomics`/`finnhub`)
+   additionally requires supplying a real, verified base URL for each via
+   `CALENDAR_<PROVIDER>_BASE_URL` — none is guessed or defaulted.
 4. **Add the broker-side `ENVIRONMENT_MODE` cross-check** (RR-012, §5)
    before trusting the demo/live guard.
 5. **Review every flagged design choice in §3** — especially the entry

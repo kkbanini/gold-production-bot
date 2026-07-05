@@ -7,8 +7,12 @@ bootstrap logic with a single object graph assembled in one place: every
 dependency a component needs is passed into its constructor explicitly,
 rather than each component importing/constructing its own collaborators.
 Phase 11b added `calendar_provider`/`clock_provider` (`CalendarProvider`/
-`ClockProvider`, docs/PRODUCTION_SPEC.md §2/§3); `main.py`'s live loop does
-not consume `clock_provider` yet — see `docs/ARCHITECTURE_SUMMARY.md` §5.
+`ClockProvider`, docs/PRODUCTION_SPEC.md §2/§3). `main.py`'s live loop now
+consumes `clock_provider` for equity-baseline rollover (broker server time
+decides UTC-day/ISO-week/calendar-month boundaries, `risk/drawdown_fsm.py`'s
+`roll_equity_baselines()`); it still does not consume `calendar_provider`,
+nor does it source the bar-close-wait timing from `clock_provider` — see
+`docs/ARCHITECTURE_SUMMARY.md` §5.
 Phase 11d added `feature_flags` (`FeatureFlagManager`,
 docs/PRODUCTION_SPEC.md §6), consumed by `main.py`'s `run_bar_close_cycle()`
 to decide `HARD_LOCK`'s liquidate-vs-freeze behavior. Phase 11e added

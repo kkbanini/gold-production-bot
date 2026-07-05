@@ -44,6 +44,13 @@ rather than trusting a possibly-stale local snapshot, and from
 settled, `ACTIVE` otherwise). Formally tested against a real
 `ApplicationContainer` built with a `FakeMT5`
 (tests/integration/test_integration.py::TestApplicationContainer).
+
+`main()`'s loop also skips a cycle entirely (no MT5 calls at all) during
+the weekly forex/CFD market closure (`broker.mt5_gateway.is_weekend_market_closed()`,
+Friday 22:00 UTC - Sunday 22:00 UTC), rechecking every `WEEKEND_RECHECK_SECONDS`
+instead of every 5-minute bar close. This is a separate axis from
+`is_within_execution_window()`'s daily GMT hour filter, which remains
+unwired (see docs/ARCHITECTURE_SUMMARY.md §5).
 """
 
 from __future__ import annotations
@@ -61,10 +68,13 @@ from broker.mt5_gateway import (
     TIMEFRAME_D1,
     TIMEFRAME_H1,
     TIMEFRAME_H4,
+    WEEKEND_CLOSE_HOUR_UTC,
+    WEEKEND_REOPEN_HOUR_UTC,
     AccountState,
     BrokerOrderRejectedError,
     BrokerPosition,
     MT5Gateway,
+    is_weekend_market_closed,
 )
 from config.feature_flags import FeatureFlagManager
 from container import ApplicationContainer
@@ -80,6 +90,7 @@ from execution.position_manager import (
 from indicators.math_engine import atr, ema
 from news.news_engine import EconomicEvent, is_trade_entry_locked
 from risk.drawdown_fsm import (
+    BaselineEpoch,
     DrawdownClassification,
     DrawdownEvent,
     DrawdownState,
@@ -88,6 +99,8 @@ from risk.drawdown_fsm import (
     blocks_position_management,
     classify_drawdown_event,
     decide_hard_lock_response,
+    roll_equity_baselines,
+    seed_equity_baselines,
     transition_drawdown_state,
 )
 from risk.risk_manager import calculate_compounded_lot_size
@@ -108,6 +121,13 @@ Direction = Literal["BUY", "SELL", "NONE"]
 
 PROCESSING_CAP_MS = 200.0
 BAR_CLOSE_TIMEFRAME_MINUTES = 5
+
+# How often main() rechecks whether the weekend market closure has ended,
+# while it's still closed. Deliberately longer than the 5-minute bar-close
+# cadence — nothing is going to change for hours during a weekend closure,
+# so there is no reason to burn a full bar-close cycle's worth of MT5
+# calls every 5 minutes just to find that out again.
+WEEKEND_RECHECK_SECONDS = 900.0
 
 # Distance (in ATR multiples) from the current price to the initial
 # stop-loss on a new entry. Mirrors position_manager's Base_TP multiplier
@@ -658,6 +678,7 @@ def main() -> None:
 
     context = _seed_initial_fsm_context(container)
     baselines: EquityBaselines | None = None
+    baseline_epoch: BaselineEpoch | None = None
     constraints = SymbolConstraints(
         point=container.gateway.symbol_spec.point,
         volume_min=container.gateway.symbol_spec.volume_min,
@@ -665,20 +686,43 @@ def main() -> None:
         volume_step=container.gateway.symbol_spec.volume_step,
         magic_number=container.config.strategy_magic_number,
     )
+    logger.info(
+        "Entering bar-close loop: state=%s position=%s drawdown_state=%s",
+        context.state.value,
+        context.position.ticket if context.position is not None else None,
+        context.drawdown_state.value,
+    )
 
     while True:
-        time.sleep(seconds_until_next_bar_close(datetime.now(timezone.utc)))
+        if is_weekend_market_closed(datetime.now(timezone.utc)):
+            logger.info(
+                "Weekend market closure (Fri %02d:00 UTC - Sun %02d:00 UTC): "
+                "skipping cycle, rechecking in %.0fs.",
+                WEEKEND_CLOSE_HOUR_UTC,
+                WEEKEND_REOPEN_HOUR_UTC,
+                WEEKEND_RECHECK_SECONDS,
+            )
+            time.sleep(WEEKEND_RECHECK_SECONDS)
+            continue
+
+        wait_seconds = seconds_until_next_bar_close(datetime.now(timezone.utc))
+        logger.info("Waiting %.1fs for next M5 bar close.", wait_seconds)
+        time.sleep(wait_seconds)
 
         started = time.perf_counter()
         account_state = container.gateway.get_account_state()
-        if baselines is None:
-            # First cycle: seed all three baselines from current equity.
-            # Real daily/weekly/monthly rollover tracking is a further
-            # refinement — see docs/ARCHITECTURE_SUMMARY.md.
-            baselines = EquityBaselines(
-                daily_start_equity=account_state.equity,
-                weekly_start_equity=account_state.equity,
-                monthly_start_equity=account_state.equity,
+        server_now = container.clock_provider.get_server_time(container.gateway.symbol_spec.name)
+        if baselines is None or baseline_epoch is None:
+            # First cycle: seed all three baselines from current equity,
+            # stamped against broker server time.
+            baselines, baseline_epoch = seed_equity_baselines(account_state.equity, server_now)
+        else:
+            # Every subsequent cycle: roll forward whichever tier(s) have
+            # crossed their UTC-day/ISO-week/calendar-month boundary since
+            # they were last set — a no-op unless the period actually
+            # changed (docs/ARCHITECTURE_SUMMARY.md §5).
+            baselines, baseline_epoch = roll_equity_baselines(
+                baselines, baseline_epoch, account_state.equity, server_now
             )
 
         snapshot = _fetch_market_snapshot(container.gateway, constraints.magic_number, [])

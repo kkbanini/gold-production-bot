@@ -33,7 +33,30 @@ Phase 11a.
 
 ## [Unreleased]
 
-No changes staged.
+### Fixed — Equity Baseline Rollover
+
+- `risk/drawdown_fsm.py` — `seed_equity_baselines()`/
+  `roll_equity_baselines()` and the new `BaselineEpoch` dataclass:
+  daily/weekly/monthly `EquityBaselines` tiers now roll forward
+  independently the first bar-close cycle whose broker-server "now"
+  crosses that tier's UTC-day/ISO-week/calendar-month boundary, instead of
+  being seeded once at process start and never refreshed
+  (`docs/ARCHITECTURE_SUMMARY.md` §5). `BaselineEpoch` is kept separate
+  from `EquityBaselines` so `classify_drawdown_event()` and every existing
+  caller keep dealing with exactly three equity floats. Both functions
+  are pure and reject naive datetimes.
+- `main.py` — the bar-close loop now calls `container.clock_provider
+  .get_server_time()` every cycle (broker server time, not the host
+  machine clock) to seed/roll `EquityBaselines`, closing part of the
+  previously-flagged "`clock_provider` built but never consumed" gap —
+  the bar-close-wait cadence still reads the host clock directly, a
+  narrower remaining gap.
+
+### Verified
+
+- `pytest tests/unit tests/integration` — all tests pass, including 8 new
+  `TestEquityBaselineRollover` cases covering same-period no-op, each
+  tier's isolated boundary crossing, and the naive-datetime error path.
 
 ## [1.0.0-RC1] - 2026-07-05
 

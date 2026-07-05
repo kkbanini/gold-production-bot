@@ -54,6 +54,7 @@ from optimizer.self_learning import (
     run_monte_carlo_bootstrap,
 )
 from risk.drawdown_fsm import (
+    BaselineEpoch,
     DrawdownEvent,
     DrawdownState,
     EquityBaselines,
@@ -61,6 +62,8 @@ from risk.drawdown_fsm import (
     blocks_position_management,
     classify_drawdown_event,
     decide_hard_lock_response,
+    roll_equity_baselines,
+    seed_equity_baselines,
     transition_drawdown_state,
 )
 from risk.risk_manager import calculate_compounded_lot_size, clamp_lot_size
@@ -1175,6 +1178,45 @@ class TestBrokerPureLogic:
         gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=1)
         assert gateway.is_ticket_still_open(999) is False
 
+    def test_weekend_market_closed_friday_boundary(self) -> None:
+        # 2026-07-03 is a Friday.
+        assert (
+            gw.is_weekend_market_closed(datetime(2026, 7, 3, 21, 59, tzinfo=timezone.utc)) is False
+        )
+        assert gw.is_weekend_market_closed(datetime(2026, 7, 3, 22, 0, tzinfo=timezone.utc)) is True
+        assert (
+            gw.is_weekend_market_closed(datetime(2026, 7, 3, 23, 59, tzinfo=timezone.utc)) is True
+        )
+
+    def test_weekend_market_closed_all_saturday(self) -> None:
+        # 2026-07-04 is a Saturday.
+        assert gw.is_weekend_market_closed(datetime(2026, 7, 4, 0, 0, tzinfo=timezone.utc)) is True
+        assert gw.is_weekend_market_closed(datetime(2026, 7, 4, 12, 0, tzinfo=timezone.utc)) is True
+        assert (
+            gw.is_weekend_market_closed(datetime(2026, 7, 4, 23, 59, tzinfo=timezone.utc)) is True
+        )
+
+    def test_weekend_market_closed_sunday_boundary(self) -> None:
+        # 2026-07-05 is a Sunday.
+        assert gw.is_weekend_market_closed(datetime(2026, 7, 5, 0, 0, tzinfo=timezone.utc)) is True
+        assert (
+            gw.is_weekend_market_closed(datetime(2026, 7, 5, 21, 59, tzinfo=timezone.utc)) is True
+        )
+        assert (
+            gw.is_weekend_market_closed(datetime(2026, 7, 5, 22, 0, tzinfo=timezone.utc)) is False
+        )
+
+    def test_weekend_market_closed_false_on_a_weekday(self) -> None:
+        # 2026-07-01 is a Wednesday.
+        assert gw.is_weekend_market_closed(datetime(2026, 7, 1, 3, 0, tzinfo=timezone.utc)) is False
+        assert (
+            gw.is_weekend_market_closed(datetime(2026, 7, 1, 23, 0, tzinfo=timezone.utc)) is False
+        )
+
+    def test_weekend_market_closed_naive_datetime_raises(self) -> None:
+        with pytest.raises(ValueError, match="timezone-aware"):
+            gw.is_weekend_market_closed(datetime(2026, 7, 4, 12, 0))
+
 
 # ---------------------------------------------------------------------------
 # broker/clock_provider.py (docs/PRODUCTION_SPEC.md §3)
@@ -1741,6 +1783,86 @@ class TestClassifyDrawdownEvent:
     def test_negative_equity_raises(self, baselines: EquityBaselines) -> None:
         with pytest.raises(ValueError, match="current_equity"):
             classify_drawdown_event(-1.0, baselines)
+
+
+class TestEquityBaselineRollover:
+    """`seed_equity_baselines()`/`roll_equity_baselines()`
+    (docs/ARCHITECTURE_SUMMARY.md §5's equity-baseline rollover gap):
+    `main()` re-seeds each tier independently the first bar-close cycle
+    that crosses its UTC-day/ISO-week/calendar-month boundary. Fixture
+    dates: 2026-07-01 (Wed) / 07-02 (Thu) share both ISO week and month;
+    2026-07-05 (Sun) / 07-06 (Mon) share month but cross an ISO week
+    boundary; 2026-07-31 (Fri) / 2026-08-01 (Sat) share an ISO week but
+    cross a month boundary.
+    """
+
+    def test_seed_sets_all_three_tiers_to_current_equity(self) -> None:
+        now = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+        baselines, epoch = seed_equity_baselines(10_000.0, now)
+        assert baselines == EquityBaselines(10_000.0, 10_000.0, 10_000.0)
+        assert epoch == BaselineEpoch(
+            daily_date=now.date(),
+            weekly_iso_year_week=now.isocalendar()[:2],
+            monthly_year_month=(2026, 7),
+        )
+
+    def test_seed_naive_datetime_raises(self) -> None:
+        with pytest.raises(ValueError, match="timezone-aware"):
+            seed_equity_baselines(10_000.0, datetime(2026, 7, 1, 12, 0))
+
+    def test_roll_no_boundary_crossed_is_unchanged(self) -> None:
+        baselines, epoch = seed_equity_baselines(
+            10_000.0, datetime(2026, 7, 1, 0, 5, tzinfo=timezone.utc)
+        )
+        later_same_day = datetime(2026, 7, 1, 23, 0, tzinfo=timezone.utc)
+        rolled, new_epoch = roll_equity_baselines(baselines, epoch, 9_000.0, later_same_day)
+        # A same-period equity dip must NOT reset the baseline.
+        assert rolled == baselines
+        assert new_epoch == epoch
+
+    def test_roll_daily_boundary_only(self) -> None:
+        baselines, epoch = seed_equity_baselines(
+            10_000.0, datetime(2026, 7, 1, 23, 0, tzinfo=timezone.utc)
+        )
+        next_day = datetime(2026, 7, 2, 0, 5, tzinfo=timezone.utc)
+        rolled, new_epoch = roll_equity_baselines(baselines, epoch, 9_500.0, next_day)
+        assert rolled.daily_start_equity == 9_500.0
+        assert rolled.weekly_start_equity == 10_000.0
+        assert rolled.monthly_start_equity == 10_000.0
+        assert new_epoch.daily_date == next_day.date()
+        assert new_epoch.weekly_iso_year_week == epoch.weekly_iso_year_week
+        assert new_epoch.monthly_year_month == epoch.monthly_year_month
+
+    def test_roll_weekly_boundary_rolls_daily_too_monthly_unchanged(self) -> None:
+        baselines, epoch = seed_equity_baselines(
+            10_000.0, datetime(2026, 7, 5, 23, 0, tzinfo=timezone.utc)
+        )
+        monday = datetime(2026, 7, 6, 0, 5, tzinfo=timezone.utc)
+        rolled, new_epoch = roll_equity_baselines(baselines, epoch, 9_200.0, monday)
+        assert rolled.daily_start_equity == 9_200.0
+        assert rolled.weekly_start_equity == 9_200.0
+        assert rolled.monthly_start_equity == 10_000.0
+        assert new_epoch.weekly_iso_year_week != epoch.weekly_iso_year_week
+        assert new_epoch.monthly_year_month == epoch.monthly_year_month
+
+    def test_roll_monthly_boundary_rolls_daily_too_weekly_unchanged(self) -> None:
+        baselines, epoch = seed_equity_baselines(
+            10_000.0, datetime(2026, 7, 31, 23, 0, tzinfo=timezone.utc)
+        )
+        aug_1 = datetime(2026, 8, 1, 0, 5, tzinfo=timezone.utc)
+        rolled, new_epoch = roll_equity_baselines(baselines, epoch, 8_800.0, aug_1)
+        assert rolled.daily_start_equity == 8_800.0
+        assert rolled.weekly_start_equity == 10_000.0
+        assert rolled.monthly_start_equity == 8_800.0
+        assert new_epoch.weekly_iso_year_week == epoch.weekly_iso_year_week
+        assert new_epoch.monthly_year_month != epoch.monthly_year_month
+
+    def test_roll_naive_datetime_raises(self) -> None:
+        baselines, epoch = seed_equity_baselines(
+            10_000.0, datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+        )
+        with pytest.raises(ValueError, match="timezone-aware"):
+            roll_equity_baselines(baselines, epoch, 9_000.0, datetime(2026, 7, 2, 12, 0))
 
 
 class TestTransitionDrawdownState:
