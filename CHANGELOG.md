@@ -23,9 +23,56 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing yet. Phase 9 will introduce `tests/test_unit.py` and
-`tests/test_integration.py` (the project's first formal automated test
-suite, targeting >90% coverage).
+Nothing yet. Phase 10 will introduce `main.py` (the master FSM
+orchestration loop), the 200ms processing-cap metric, and the
+5%/10%/20% daily/weekly/monthly drawdown hard locks.
+
+## [0.10.0] - 2026-07-05
+
+### Added — Phase 9: Automated Unit Testing & Integration Harness
+
+- `tests/conftest.py` — shared fixtures: `FakeMT5` (drop-in
+  `MetaTrader5` module substitute, with `FakeSymbolInfo`/`FakeTick`/
+  `FakePosition`/`FakeOrderResult`) and a `tmp_path`-backed `StateManager`
+  fixture.
+- `tests/test_unit.py` — 66 tests covering `config/`, `storage/db_engine.py`,
+  `indicators/math_engine.py` (every function cross-checked against an
+  independent pure-Python reference implementation — the same technique
+  that caught the Phase 4 ADX bug, now permanently regression-tested),
+  `strategy/trend_filter.py`, `strategy/execution_triggers.py`
+  ("M5 candle flags"), `risk/risk_manager.py` ("lot math metrics"),
+  `execution/position_manager.py`, and the pure-logic portions of
+  `broker/mt5_gateway.py`, `news/news_engine.py`, and
+  `optimizer/self_learning.py`.
+- `tests/test_integration.py` — 18 tests covering exactly the four
+  scenarios the phase directive named: MT5 server dropouts (backoff +
+  recovery, backoff exhaustion, full order-action request-building and
+  rejection paths), socket disconnections (`news_engine.py`'s
+  `fetch_calendar_events()` against a faked `requests.get` — connection
+  error, timeout, HTTP error, invalid JSON), database rollbacks (a real
+  SQLite constraint violation forced mid-transaction, proving the whole
+  transaction rolls back, not just the failing statement), and data state
+  validation processes (crash recovery, WAL/integrity checks, broker/ledger
+  reconciliation, and the optimizer's isolation guarantee verified against
+  a real SQLite database).
+- `tests/__init__.py` — added to resolve a `mypy --strict` module-resolution
+  ambiguity once test files began importing `tests.conftest` by dotted
+  path (the same fix applied to `storage/`, `broker/`, etc. in earlier
+  phases).
+- `pyproject.toml` — added `[tool.coverage.run]`/`[tool.coverage.report]`
+  scoping coverage measurement to the nine source packages.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (26 files).
+- `mypy --strict .` — no issues found in 26 source files (mypy 2.1.0
+  locally, per the Phase 4 toolchain note).
+- `pytest --cov=. --cov-report=term-missing --cov-fail-under=90` (the
+  exact `.github/workflows/ci.yml` invocation) — **97 tests pass, 97.27%
+  total coverage**, every one of the nine source modules individually
+  above 90% (`storage/db_engine.py` reached 100% after two small
+  additions: a read-only-connection test and a `checkpoint_wal()`
+  smoke test).
 
 ## [0.9.0] - 2026-07-05
 
