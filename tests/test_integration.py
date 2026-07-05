@@ -7,6 +7,7 @@ weekend optimizer's isolation guarantee against active trading state).
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ import requests
 import broker.mt5_gateway as gw
 import news.news_engine as ne
 import optimizer.self_learning as sl
+from container import ApplicationContainer
 from execution.position_manager import OrderActionPayload
 from storage.state_manager import StateManager, TradeLedgerEntry
 from tests.conftest import FakeMT5, FakePosition, FakeSymbolInfo, FakeTick
@@ -654,3 +656,114 @@ class TestOptimizerIsolation:
             "SELECT COUNT(*) FROM parameter_history"
         ).fetchone()[0]
         assert param_history_count_after == 1
+
+
+# ---------------------------------------------------------------------------
+# container.py's ApplicationContainer: the DI composition root wiring
+# config/ + storage/ + broker/ together (docs/PRODUCTION_SPEC.md §1's
+# "Core Orchestration Directive" #1).
+# ---------------------------------------------------------------------------
+
+
+class TestApplicationContainer:
+    REQUIRED_ENV = {
+        "MT5_LOGIN": "12345",
+        "MT5_PASSWORD": "secret",
+        "MT5_SERVER": "Broker-Demo",
+        "ECONOMIC_CALENDAR_API_KEY": "abc123",
+        "STRATEGY_MAGIC_NUMBER": "555",
+        "ENVIRONMENT_MODE": "DEMO",
+    }
+
+    def test_build_wires_config_storage_and_broker(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        app = ApplicationContainer.build(
+            env_file="nonexistent.env", db_path=tmp_path / "container.db"
+        )
+        try:
+            assert app.config.mt5_login == 12345
+            assert app.gateway.symbol_spec.name == "XAUUSD"
+            assert app.state_manager.get_open_trades() == []
+        finally:
+            app.state_manager.close()
+
+    def test_build_logs_position_audit_divergence(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        # A position open on the broker with no matching local ledger row.
+        fake_mt5.positions[100] = FakePosition(100, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555)
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        with caplog.at_level("WARNING"):
+            app = ApplicationContainer.build(
+                env_file="nonexistent.env", db_path=tmp_path / "container_divergence.db"
+            )
+        try:
+            assert "divergence" in caplog.text
+        finally:
+            app.state_manager.close()
+
+    def test_build_attaches_secret_redaction_to_root_logger(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        root_logger = logging.getLogger()
+        filters_before = list(root_logger.filters)
+        app = ApplicationContainer.build(
+            env_file="nonexistent.env", db_path=tmp_path / "container2.db"
+        )
+        try:
+            new_filters = [
+                f
+                for f in root_logger.filters
+                if f not in filters_before and isinstance(f, logging.Filter)
+            ]
+            assert len(new_filters) == 1
+            record = logging.LogRecord(
+                name="test",
+                level=logging.INFO,
+                pathname="",
+                lineno=0,
+                msg="password is secret",
+                args=(),
+                exc_info=None,
+            )
+            new_filters[0].filter(record)
+            assert "secret" not in record.getMessage()
+        finally:
+            app.state_manager.close()
+            root_logger.filters = filters_before
+
+    def test_build_propagates_config_error_uncaught(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for key in self.REQUIRED_ENV:
+            monkeypatch.delenv(key, raising=False)
+        with pytest.raises(Exception, match="Missing required environment"):
+            ApplicationContainer.build(env_file="nonexistent.env", db_path=tmp_path / "x.db")

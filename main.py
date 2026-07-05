@@ -11,12 +11,12 @@ remain open gaps, see docs/TRACEABILITY_MATRIX.md and
 docs/ARCHITECTURE_SUMMARY.md.
 
 `run_bar_close_cycle()` is a pure decision function: no I/O, fully
-deterministic given its inputs, and the unit of testing. `bootstrap_system()`
-and `main()` are the impure I/O layer that fetches real data and executes
-decisions against the broker — reviewed for correctness but not executed
-against a live/demo account in this environment (no real MT5 credentials
-exist here; see docs/ARCHITECTURE_SUMMARY.md "Before your first live/demo
-run").
+deterministic given its inputs, and the unit of testing.
+`ApplicationContainer.build()` (container.py) and `main()` are the impure
+I/O layer that fetches real data and executes decisions against the
+broker — reviewed for correctness but not executed against a live/demo
+account in this environment (no real MT5 credentials exist here; see
+docs/ARCHITECTURE_SUMMARY.md "Before your first live/demo run").
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from broker.mt5_gateway import (
     AccountState,
     MT5Gateway,
 )
-from config.config_manager import ConfigManager
+from container import ApplicationContainer
 from execution.position_manager import (
     BASE_TP_ATR_MULTIPLIER,
     OrderActionPayload,
@@ -47,7 +47,7 @@ from execution.position_manager import (
 from indicators.math_engine import atr, ema
 from news.news_engine import EconomicEvent, is_trade_entry_locked
 from risk.risk_manager import calculate_compounded_lot_size
-from storage.state_manager import StateManager, TradeLedgerEntry
+from storage.state_manager import TradeLedgerEntry
 from strategy.execution_triggers import (
     BreakoutSignal,
     PullbackSignal,
@@ -414,50 +414,12 @@ def run_bar_close_cycle(
 
 
 # ---------------------------------------------------------------------------
-# Impure I/O layer: bootstrap and the live loop. Reviewed for correctness
-# but not executed against a live/demo account in this environment — see
-# docs/ARCHITECTURE_SUMMARY.md "Before your first live/demo run".
+# Impure I/O layer: the live loop (bootstrap itself now lives in
+# container.py's ApplicationContainer, docs/PRODUCTION_SPEC.md's DI
+# composition root). Reviewed for correctness but not executed against a
+# live/demo account in this environment — see docs/ARCHITECTURE_SUMMARY.md
+# "Before your first live/demo run".
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class RuntimeHandles:
-    """Live objects the running process holds for its lifetime."""
-
-    config: ConfigManager
-    state_manager: StateManager
-    gateway: MT5Gateway
-
-
-def bootstrap_system(env_file: str | None = None) -> RuntimeHandles:
-    """Boot sequence per docs/RUNBOOK.md §1: load config, open storage,
-    connect the broker (with exponential backoff), and reconcile broker-
-    reported positions against the local ledger before returning.
-
-    Raises whatever the underlying step raises (ConfigurationError,
-    BrokerConnectionError, etc.) — startup is fail-closed, never
-    fail-open into a partially-initialized state.
-    """
-    config = ConfigManager.load(env_file=env_file)
-    state_manager = StateManager()
-
-    gateway = MT5Gateway(
-        login=config.mt5_login,
-        password=config.mt5_password,
-        server=config.mt5_server,
-        magic_number=config.strategy_magic_number,
-    )
-    gateway.connect()
-
-    audit = gateway.audit_open_positions(state_manager.get_open_trades())
-    if not audit.is_clean:
-        logger.warning(
-            "Position audit found divergence on startup: broker_only=%s ledger_only=%s",
-            [p.ticket for p in audit.broker_only_positions],
-            [e.client_order_id for e in audit.ledger_only_entries],
-        )
-
-    return RuntimeHandles(config=config, state_manager=state_manager, gateway=gateway)
 
 
 def _fetch_market_snapshot(
@@ -528,23 +490,23 @@ def main() -> None:
     account.
     """
     logging.basicConfig(level=logging.INFO)
-    handles = bootstrap_system()
+    container = ApplicationContainer.build()
 
     context = FSMContext(state=TradingState.IDLE, position=None, halt_reason=None)
     baselines: EquityBaselines | None = None
     constraints = SymbolConstraints(
-        point=handles.gateway.symbol_spec.point,
-        volume_min=handles.gateway.symbol_spec.volume_min,
-        volume_max=handles.gateway.symbol_spec.volume_max,
-        volume_step=handles.gateway.symbol_spec.volume_step,
-        magic_number=handles.config.strategy_magic_number,
+        point=container.gateway.symbol_spec.point,
+        volume_min=container.gateway.symbol_spec.volume_min,
+        volume_max=container.gateway.symbol_spec.volume_max,
+        volume_step=container.gateway.symbol_spec.volume_step,
+        magic_number=container.config.strategy_magic_number,
     )
 
     while True:
         time.sleep(seconds_until_next_bar_close(datetime.now(timezone.utc)))
 
         started = time.perf_counter()
-        account_state = handles.gateway.get_account_state()
+        account_state = container.gateway.get_account_state()
         if baselines is None:
             # First cycle: seed all three baselines from current equity.
             # Real daily/weekly/monthly rollover tracking is a further
@@ -555,7 +517,7 @@ def main() -> None:
                 monthly_start_equity=account_state.equity,
             )
 
-        snapshot = _fetch_market_snapshot(handles.gateway, constraints.magic_number, [])
+        snapshot = _fetch_market_snapshot(container.gateway, constraints.magic_number, [])
         ended = time.perf_counter()
 
         result = run_bar_close_cycle(
@@ -568,7 +530,7 @@ def main() -> None:
         context = result.context
 
         for action in result.position_actions:
-            handles.gateway.submit_position_action(action)
+            container.gateway.submit_position_action(action)
 
         if (
             result.entry_decision is not None
@@ -577,14 +539,14 @@ def main() -> None:
             and result.entry_volume is not None
         ):
             client_order_id = str(uuid.uuid4())
-            broker_position = handles.gateway.submit_market_order(
+            broker_position = container.gateway.submit_market_order(
                 side=result.entry_decision.direction,
                 volume=result.entry_volume,
                 stop_loss=result.entry_stop_loss,
                 take_profit=None,
                 comment=client_order_id,
             )
-            handles.state_manager.record_trade(
+            container.state_manager.record_trade(
                 TradeLedgerEntry(
                     client_order_id=client_order_id,
                     symbol=broker_position.symbol,

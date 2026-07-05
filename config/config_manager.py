@@ -3,11 +3,19 @@
 Sole owner of environment/secret access (ADR-0002 consumers, RQ-018,
 docs/RISK_REGISTER.md RR-001, RR-012). No other module reads `os.environ`
 directly for a trading-relevant value.
+
+`ConfigValidator` (docs/PRODUCTION_SPEC.md §1) inspects every required key
+at initialization for presence, placeholder/default-value leakage, and
+syntactic validity. Raising `ConfigurationError` from any check is the
+"fatal application panic" §1 requires: it propagates uncaught through
+`ConfigManager.load()`, halting process startup rather than proceeding
+with a partial or leaked configuration.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,14 +32,96 @@ REQUIRED_ENV_VARS: tuple[str, ...] = (
 
 VALID_ENVIRONMENT_MODES: tuple[str, ...] = ("DEMO", "LIVE")
 
+# Substrings (case-insensitive) that indicate a value was left as a
+# template/example placeholder rather than replaced with a real credential
+# (docs/PRODUCTION_SPEC.md §1's "default-leaked" check). Deliberately a
+# curated list, not a generic weak-password check — false positives here
+# would block legitimate startup.
+_PLACEHOLDER_MARKERS: tuple[str, ...] = (
+    "changeme",
+    "change_me",
+    "your_",
+    "xxxx",
+    "placeholder",
+    "insert_",
+    "<your",
+    "replace_me",
+    "example.com",
+    "todo",
+)
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    lowered = value.strip().lower()
+    return any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
+
 
 class ConfigurationError(Exception):
-    """Raised when required environment variables are missing or invalid.
+    """Raised when required environment variables are missing, leaked
+    placeholders, or syntactically invalid.
 
-    Raising this at boot time is the enforcement mechanism for RQ-018 and
-    RR-012: the system must never start with an incomplete or ambiguous
-    configuration.
+    Raising this at boot time is the enforcement mechanism for RQ-018,
+    RR-012, and docs/PRODUCTION_SPEC.md §1: the system must never start
+    with an incomplete, leaked, or ambiguous configuration.
     """
+
+
+class ConfigValidator:
+    """Inspects raw environment values at boot time (docs/PRODUCTION_SPEC.md §1).
+
+    Each `check_*` method raises `ConfigurationError` on its own failure
+    mode so the specific problem (missing / leaked / malformed) is always
+    named in the exception rather than folded into one generic message.
+    """
+
+    def __init__(self, required_vars: tuple[str, ...] = REQUIRED_ENV_VARS) -> None:
+        self.required_vars = required_vars
+
+    def check_presence(self, env: Mapping[str, str]) -> None:
+        missing = [key for key in self.required_vars if not env.get(key)]
+        if missing:
+            raise ConfigurationError(
+                "Missing required environment variable(s): "
+                f"{', '.join(missing)}. Populate them in your local .env file "
+                "(see .env.template) before starting the system."
+            )
+
+    def check_no_placeholder_leak(self, env: Mapping[str, str]) -> None:
+        leaked = [key for key in self.required_vars if _looks_like_placeholder(env.get(key, ""))]
+        if leaked:
+            raise ConfigurationError(
+                f"Placeholder/default value(s) still set for: {', '.join(leaked)}. "
+                "Replace these with real values before starting the system "
+                "(docs/PRODUCTION_SPEC.md §1)."
+            )
+
+    def check_environment_mode(self, env: Mapping[str, str]) -> str:
+        environment_mode = env["ENVIRONMENT_MODE"].strip().upper()
+        if environment_mode not in VALID_ENVIRONMENT_MODES:
+            raise ConfigurationError(
+                f"ENVIRONMENT_MODE={environment_mode!r} is invalid; expected "
+                f"one of {VALID_ENVIRONMENT_MODES}."
+            )
+        return environment_mode
+
+    def check_integer(self, env: Mapping[str, str], key: str) -> int:
+        raw = env[key]
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ConfigurationError(f"{key}={raw!r} is not a valid integer.") from exc
+
+    def validate(self, env: Mapping[str, str]) -> tuple[int, int, str]:
+        """Run every check in order (fail fast on the first violation);
+        returns `(mt5_login, strategy_magic_number, environment_mode)`
+        once all checks pass.
+        """
+        self.check_presence(env)
+        self.check_no_placeholder_leak(env)
+        environment_mode = self.check_environment_mode(env)
+        mt5_login = self.check_integer(env, "MT5_LOGIN")
+        strategy_magic_number = self.check_integer(env, "STRATEGY_MAGIC_NUMBER")
+        return mt5_login, strategy_magic_number, environment_mode
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,42 +142,13 @@ class ConfigManager:
         Populates `os.environ` from `env_file` (defaults to `.env` in the
         current working directory, via python-dotenv's own discovery) without
         overriding variables already set in the process environment, then
-        validates that every required key is present and well-formed before
-        returning. Raises ConfigurationError on any validation failure so
-        that startup halts rather than proceeding with a partial config.
+        runs `ConfigValidator` against it before returning. Raises
+        `ConfigurationError` on any validation failure so that startup halts
+        rather than proceeding with a partial or leaked configuration.
         """
         load_dotenv(dotenv_path=env_file, override=False)
 
-        missing = [key for key in REQUIRED_ENV_VARS if not os.getenv(key)]
-        if missing:
-            raise ConfigurationError(
-                "Missing required environment variable(s): "
-                f"{', '.join(missing)}. Populate them in your local .env file "
-                "(see .env.template) before starting the system."
-            )
-
-        environment_mode = os.environ["ENVIRONMENT_MODE"].strip().upper()
-        if environment_mode not in VALID_ENVIRONMENT_MODES:
-            raise ConfigurationError(
-                f"ENVIRONMENT_MODE={environment_mode!r} is invalid; expected "
-                f"one of {VALID_ENVIRONMENT_MODES}."
-            )
-
-        mt5_login_raw = os.environ["MT5_LOGIN"]
-        try:
-            mt5_login = int(mt5_login_raw)
-        except ValueError as exc:
-            raise ConfigurationError(
-                f"MT5_LOGIN={mt5_login_raw!r} is not a valid integer account number."
-            ) from exc
-
-        magic_number_raw = os.environ["STRATEGY_MAGIC_NUMBER"]
-        try:
-            strategy_magic_number = int(magic_number_raw)
-        except ValueError as exc:
-            raise ConfigurationError(
-                f"STRATEGY_MAGIC_NUMBER={magic_number_raw!r} is not a valid integer."
-            ) from exc
+        mt5_login, strategy_magic_number, environment_mode = ConfigValidator().validate(os.environ)
 
         return cls(
             mt5_login=mt5_login,

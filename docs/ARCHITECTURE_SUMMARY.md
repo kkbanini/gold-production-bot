@@ -1,13 +1,23 @@
-# Architecture Summary — End of Phase 10
+# Architecture Summary — End of Phase 10 (+ Phase 11 in progress)
 
 | Field | Value |
 |---|---|
 | Status | Capstone document — read this first before touching a real account |
-| Covers | Phases 0–10, VERSION `0.11.0` |
+| Covers | Phases 0–10 (the original roadmap) plus Phase 11 sub-phases as they land |
 
 This document is the single place to understand what this system actually
 does, what it deliberately doesn't do yet, and exactly what to check before
 connecting it to a real MT5 account — demo or live.
+
+> **Phase 11 note**: `docs/PRODUCTION_SPEC.md` introduced a set of
+> production-hardening contracts (secrets/boot validation, dynamic calendar
+> failover, a normalized clock abstraction, pre-flight idempotency, event
+> sourcing, a pure-function drawdown FSM, and resiliency/SLO/disaster
+> recovery). These are being implemented as gated sub-phases (11a, 11b, …),
+> each with its own `CHANGELOG.md` entry, exactly like Phases 0–10. `VERSION`
+> stays below `1.0.0` until the gaps in §5 below are actually closed, not
+> just documented — a `1.0.0`/release-candidate label is not applied on the
+> strength of a specification alone.
 
 ## 1. What was built, phase by phase
 
@@ -24,6 +34,7 @@ connecting it to a real MT5 account — demo or live.
 | 8 | Saturday-gated rule-based parameter shift, Monte Carlo bootstrap, isolated `parameter_history` | `optimizer/self_learning.py` |
 | 9 | First formal automated test suite (unit + integration), 97%+ coverage | `tests/` |
 | 10 | Master FSM orchestration loop, 200ms processing-cap metric, drawdown hard locks, account/bar/order broker methods | `main.py`, `broker/mt5_gateway.py` |
+| 11a | Boot-validation hardening (placeholder-leak detection), secret-redacting log filter, `ApplicationContainer` DI composition root | `config/config_manager.py`, `config/secret_redaction.py`, `container.py` |
 
 Every phase's commit message and the corresponding `CHANGELOG.md` entry
 records what was verified and what was explicitly flagged as a design

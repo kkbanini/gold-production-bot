@@ -6,6 +6,7 @@ persistence) belongs in test_integration.py instead.
 
 from __future__ import annotations
 
+import logging
 import random
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +16,8 @@ import pytest
 
 import broker.mt5_gateway as gw
 import main as orchestrator
-from config.config_manager import ConfigManager, ConfigurationError
+from config.config_manager import ConfigManager, ConfigurationError, ConfigValidator
+from config.secret_redaction import SecretRedactingFilter
 from execution.position_manager import (
     PositionState,
     calculate_base_take_profit,
@@ -99,6 +101,118 @@ class TestConfigManager:
         monkeypatch.setenv("MT5_LOGIN", "not-a-number")
         with pytest.raises(ConfigurationError, match="MT5_LOGIN"):
             ConfigManager.load(env_file="nonexistent.env")
+
+    def test_placeholder_password_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("MT5_PASSWORD", "CHANGEME")
+        with pytest.raises(ConfigurationError, match="Placeholder"):
+            ConfigManager.load(env_file="nonexistent.env")
+
+    def test_placeholder_api_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("ECONOMIC_CALENDAR_API_KEY", "your_api_key_here")
+        with pytest.raises(ConfigurationError, match="Placeholder"):
+            ConfigManager.load(env_file="nonexistent.env")
+
+    def test_placeholder_check_case_insensitive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("MT5_SERVER", "REPLACE_ME")
+        with pytest.raises(ConfigurationError, match="Placeholder"):
+            ConfigManager.load(env_file="nonexistent.env")
+
+    def test_real_looking_values_do_not_false_positive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # "Broker-Demo" and "abc123" must not trip the placeholder check.
+        self._clear_env(monkeypatch)
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        cfg = ConfigManager.load(env_file="nonexistent.env")
+        assert cfg.mt5_server == "Broker-Demo"
+
+
+class TestConfigValidator:
+    """Direct unit tests for ConfigValidator's individual check methods,
+    independent of ConfigManager.load()'s environment-variable plumbing."""
+
+    VALID_ENV = {
+        "MT5_LOGIN": "1",
+        "MT5_PASSWORD": "secret",
+        "MT5_SERVER": "Broker-Demo",
+        "ECONOMIC_CALENDAR_API_KEY": "abc123",
+        "STRATEGY_MAGIC_NUMBER": "555",
+        "ENVIRONMENT_MODE": "LIVE",
+    }
+
+    def test_validate_returns_typed_tuple(self) -> None:
+        validator = ConfigValidator()
+        mt5_login, magic_number, mode = validator.validate(self.VALID_ENV)
+        assert (mt5_login, magic_number, mode) == (1, 555, "LIVE")
+
+    def test_check_presence_passes_silently_when_complete(self) -> None:
+        ConfigValidator().check_presence(self.VALID_ENV)
+
+    def test_check_no_placeholder_leak_passes_silently_when_clean(self) -> None:
+        ConfigValidator().check_no_placeholder_leak(self.VALID_ENV)
+
+
+# ---------------------------------------------------------------------------
+# config/secret_redaction.py
+# ---------------------------------------------------------------------------
+
+
+class TestSecretRedaction:
+    def _make_record(self, message: str) -> logging.LogRecord:
+        return logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg=message,
+            args=(),
+            exc_info=None,
+        )
+
+    def test_redacts_configured_secret(self) -> None:
+        filt = SecretRedactingFilter(["super-secret-password"])
+        record = self._make_record("login failed with password super-secret-password")
+        assert filt.filter(record) is True
+        assert "super-secret-password" not in record.getMessage()
+        assert SecretRedactingFilter.REDACTED in record.getMessage()
+
+    def test_leaves_unrelated_messages_untouched(self) -> None:
+        filt = SecretRedactingFilter(["super-secret-password"])
+        record = self._make_record("connected to broker successfully")
+        filt.filter(record)
+        assert record.getMessage() == "connected to broker successfully"
+
+    def test_empty_secret_list_is_a_no_op(self) -> None:
+        filt = SecretRedactingFilter([])
+        record = self._make_record("anything goes here")
+        assert filt.filter(record) is True
+        assert record.getMessage() == "anything goes here"
+
+    def test_ignores_blank_secret_values(self) -> None:
+        # An empty-string "secret" (e.g. an optional field left unset)
+        # must never cause every log message to be wiped out.
+        filt = SecretRedactingFilter(["", "real-secret"])
+        record = self._make_record("some message with real-secret in it")
+        filt.filter(record)
+        assert record.getMessage() == f"some message with {SecretRedactingFilter.REDACTED} in it"
+
+    def test_longest_match_wins_for_overlapping_secrets(self) -> None:
+        # "secret" is a substring of "secret123"; redacting the shorter one
+        # first would leave a mangled "***REDACTED***123" behind.
+        filt = SecretRedactingFilter(["secret", "secret123"])
+        record = self._make_record("token=secret123")
+        filt.filter(record)
+        assert record.getMessage() == f"token={SecretRedactingFilter.REDACTED}"
 
 
 # ---------------------------------------------------------------------------

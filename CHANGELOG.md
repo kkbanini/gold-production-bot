@@ -23,9 +23,53 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing scheduled. This was the final phase of the original 10-phase
-roadmap — see `docs/ARCHITECTURE_SUMMARY.md` for the consolidated list of
-what remains before a live/demo run.
+Phase 11b will build `CalendarProvider` (dynamic economic-calendar feed
+priority/failover) and `ClockProvider` (normalized server-time
+abstraction), per `docs/PRODUCTION_SPEC.md` §2/§3.
+
+## [0.12.0] - 2026-07-05
+
+### Added — Phase 11a: Secrets Hardening & Dependency-Injection Composition Root
+
+- `docs/PRODUCTION_SPEC.md` — new production-hardening engineering
+  contracts (§1 secrets/boot validation, §2 calendar feed priority, §3
+  clock abstraction, §4 pre-flight idempotency, §5 event sourcing, §6
+  FSM drawdown breaker, §7 resiliency/SLO/disaster recovery), being
+  implemented as gated Phase 11 sub-phases rather than one combined pass
+  — see the note at the top of `docs/ARCHITECTURE_SUMMARY.md`.
+- `config/config_manager.py` — `ConfigValidator` (§1): `check_presence()`,
+  `check_no_placeholder_leak()` (curated substring detection for
+  un-replaced template values like `CHANGEME`/`your_`/`REPLACE_ME`),
+  `check_environment_mode()`, `check_integer()`. `ConfigManager.load()`
+  now delegates to it; any check failure's `ConfigurationError` is the
+  "fatal application panic" §1 requires.
+- `config/secret_redaction.py` — `SecretRedactingFilter`, a `logging.Filter`
+  that replaces configured secret values with a fixed marker in every log
+  record before any handler sees it (§1's "exclude sensitive values from
+  structured logging" requirement).
+- `container.py` — `ApplicationContainer`, a constructor-based dependency-
+  injection composition root ("Core Orchestration Directive" #1):
+  `ApplicationContainer.build()` loads config, attaches the secret-redaction
+  filter to the root logger, opens storage, connects the broker (with
+  backoff), and reconciles broker-reported positions against the ledger —
+  replacing the `RuntimeHandles`/`bootstrap_system()` logic that
+  previously lived inline in `main.py`.
+- `main.py` — refactored to construct an `ApplicationContainer` instead of
+  calling the now-removed `bootstrap_system()`; no behavior change.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (29 files).
+- `mypy --strict .` — no issues found in 29 source files (mypy 2.1.0
+  locally, per the Phase 4 toolchain note).
+- `pytest --cov=. --cov-fail-under=90` — **147 tests pass, 96.50% total
+  coverage**. `config/config_manager.py`, `config/secret_redaction.py`,
+  and `container.py` all reached 100% coverage, including the
+  placeholder-leak detection (password, API key, and case-insensitivity
+  cases), the redaction filter's overlapping-substring and blank-secret
+  edge cases, and `ApplicationContainer.build()`'s divergence-warning
+  branch (a broker-only position with no matching ledger row) exercised
+  against a real `FakeMT5` + temp SQLite database.
 
 ## [0.11.0] - 2026-07-05
 

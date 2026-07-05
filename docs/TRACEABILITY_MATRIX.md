@@ -10,7 +10,10 @@ been corrected to match the actual approved roadmap:
 Phase 1 `config/` · Phase 2 `storage/` · Phase 3 `broker/` · Phase 4
 `indicators/`+`strategy/` (trend filter) · Phase 5 `strategy/` (entry triggers) ·
 Phase 6 `risk/`+`execution/` · Phase 7 `news/` · Phase 8 `optimizer/` · Phase 9
-`tests/` (formal automated suite) · Phase 10 `main.py` (core FSM loop).
+`tests/` (formal automated suite) · Phase 10 `main.py` (core FSM loop) · Phase 11
+(sub-phased) `docs/PRODUCTION_SPEC.md`-driven hardening: 11a secrets/DI, 11b
+calendar/clock providers, 11c pre-flight idempotency/event sourcing, 11d FSM
+drawdown breaker, 11e resiliency/SLO/disaster recovery + test reorg.
 
 Two Phase-0-specified requirements (RQ-015 `backtester/`, RQ-016 `analytics/`) have
 no phase assigned in the current roadmap — flagged explicitly below rather than
@@ -47,8 +50,10 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | RQ-020 | Every ADR, API contract change, and risk register update shall be reflected in `CHANGELOG.md` with a correct SemVer bump. | project-wide | `CHANGELOG.md` policy | manual release-checklist review (`docs/RUNBOOK.md`) | IMPLEMENTED (process, Phase 0) |
 | RQ-021 | The system shall measure per-bar-close processing time and flag any cycle exceeding a 200ms cap. | `main.py` | `docs/ARCHITECTURE_SUMMARY.md` §2 | `main.py`'s `evaluate_processing_time()` implemented and formally tested Phase 10 (`tests/test_unit.py::TestProcessingCap`, `TestBarCloseCycle::test_processing_cap_breach_is_logged`). An operational metric (logs a warning), not a trading halt | IMPLEMENTED |
 | RQ-022 | The system shall hard-lock new trade entries when account drawdown exceeds 5% daily, 10% weekly, or 20% monthly. | `main.py` | `docs/RISK_REGISTER.md` (risk-of-ruin), `docs/ARCHITECTURE_SUMMARY.md` §2/§5 | `main.py`'s `check_drawdown_breach()` implemented and formally tested Phase 10 (`tests/test_unit.py::TestDrawdownBreach`, `TestBarCloseCycle::test_drawdown_breach_halts_and_blocks_entry`/`test_halted_state_stays_halted_regardless_of_recovery`); **equity baselines are seeded once at process start and never rolled over at UTC day/week/month boundaries**, so the "daily"/"weekly"/"monthly" framing degrades the longer the process runs uninterrupted — flagged as a must-fix-before-live item in `docs/ARCHITECTURE_SUMMARY.md` §5 | IMPLEMENTED (partial — baseline rollover not wired) |
+| RQ-023 | Credentials shall be validated at boot for presence, placeholder/default-value leakage, and syntactic validity, triggering a fatal panic on any violation; secrets shall be redacted from structured logs. | `config/` | `docs/PRODUCTION_SPEC.md` §1 | `config/config_manager.py`'s `ConfigValidator` and `config/secret_redaction.py`'s `SecretRedactingFilter` implemented and formally tested Phase 11a (`tests/test_unit.py::TestConfigManager`/`TestConfigValidator`/`TestSecretRedaction`, `tests/test_integration.py::TestApplicationContainer::test_build_attaches_secret_redaction_to_root_logger`) | IMPLEMENTED |
+| RQ-024 | Long-lived services (config, storage, broker) shall be constructed and wired through a centralized composition root using constructor-based dependency injection. | `container.py` | `docs/PRODUCTION_SPEC.md` "Core Orchestration Directive" #1 | `container.py`'s `ApplicationContainer.build()` implemented Phase 11a, replacing `main.py`'s inline `bootstrap_system()`; formally tested (`tests/test_integration.py::TestApplicationContainer`) | IMPLEMENTED |
 
-## Coverage Summary (as of Phase 10 — final phase of the original roadmap)
+## Coverage Summary (as of Phase 11a)
 
 | Category | Requirements Specified | Implemented | Verified |
 |---|---|---|---|
@@ -58,7 +63,8 @@ silently carried forward, since neither module appears in the approved 10-phase 
 | Optimizer / Backtest | RQ-012–RQ-015 | 1 (RQ-012, partial — cadence/isolation only; RQ-013/RQ-014 deliberately not built, see `optimizer/README.md`) | 0 |
 | Analytics / News | RQ-016–RQ-017 | 1 (RQ-017, partial — logic wired but fed no real data, see `docs/ARCHITECTURE_SUMMARY.md` §5) | 0 |
 | Platform / Process | RQ-018–RQ-020 | 3 (RQ-018, RQ-019 locally verified, RQ-020 process) | 0 |
-| Orchestration (new, Phase 10) | RQ-021–RQ-022 | 2 (RQ-021; RQ-022 partial — baseline rollover not wired) | 0 |
+| Orchestration (Phase 10) | RQ-021–RQ-022 | 2 (RQ-021; RQ-022 partial — baseline rollover not wired) | 0 |
+| Production Hardening (Phase 11a, new) | RQ-023–RQ-024 | 2 (both fully implemented and tested) | 0 |
 
 Phase 0 was documentation-only by directive, so its 0/0 implemented/verified
 counts were expected, not a gap. Phase 1 landed `config/config_manager.py`
@@ -86,11 +92,17 @@ with committed, CI-runnable tests.
 **Phase 10 landed `main.py`** (the master FSM orchestration loop, RQ-021,
 RQ-022 partial) and the `broker/mt5_gateway.py` methods needed to make it
 real (`get_account_state`, `get_bars`, `submit_market_order`) — 131 tests,
-95.68% total coverage. This is the **final phase of the original 10-phase
+95.68% total coverage. This was the **final phase of the original 10-phase
 roadmap**; `docs/ARCHITECTURE_SUMMARY.md` is the consolidated capstone
 document listing every open gap across all ten phases and the concrete
-checklist before a first live/demo run. No row in this matrix is `VERIFIED`
-— per this document's Legend, that status additionally requires *observed
-paper-trading behavior*, which cannot exist until a human runs this system
-against a real demo/live account, following `docs/ARCHITECTURE_SUMMARY.md`
-§7 and `docs/DEPLOYMENT.md`'s explicit promotion gates.
+checklist before a first live/demo run.
+
+**Phase 11a landed** `config/config_manager.py`'s `ConfigValidator`,
+`config/secret_redaction.py`, and `container.py`'s `ApplicationContainer`
+(RQ-023, RQ-024 — both new rows, `docs/PRODUCTION_SPEC.md`'s first
+sub-phase) — 147 tests, 96.50% total coverage. No row in this matrix is
+`VERIFIED` — per this document's Legend, that status additionally requires
+*observed paper-trading behavior*, which cannot exist until a human runs
+this system against a real demo/live account, following
+`docs/ARCHITECTURE_SUMMARY.md` §7 and `docs/DEPLOYMENT.md`'s explicit
+promotion gates.
