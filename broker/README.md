@@ -44,6 +44,21 @@ Sole owner of MetaTrader 5 integration. No other module (except
       disagrees — e.g. closed by SL/TP while the bot was down). This
       function only detects and reports divergence; resolving it is a
       caller responsibility (`docs/RUNBOOK.md` §1 step 5, §3.1).
+    - `resolve_position_audit(report)` (Phase 11e, `docs/PRODUCTION_SPEC.md`
+      §7's Disaster Recovery bullet) — turns a `PositionAuditReport` into a
+      concrete `DisasterRecoveryPlan`: broker-only positions are
+      reconstructed into a new `OPEN` `trade_ledger` row from the broker's
+      own fields (a deterministic `f"disaster-recovery-{ticket}"`
+      `client_order_id`, idempotent across repeated reconciliation runs);
+      ledger-only entries are settled by marking them `CLOSED_RECONCILED`
+      at the reconciliation moment. Any divergence at all sets
+      `requires_manual_review=True` — `docs/RUNBOOK.md`'s own established
+      policy already treats a position-audit mismatch as `HIGH`-severity,
+      blocking automated trading pending manual review (RR-008); the
+      caller (`container.py`) honors that by starting the FSM's
+      `drawdown_state` at `MANUAL_RESET_REQUIRED` rather than `ACTIVE`
+      whenever this is `True`. Pure — no I/O of its own; `container.py`
+      applies the plan's `ledger_upserts` via `StateManager.record_trade()`.
 
 - `submit_position_action(payload)` (Phase 6) — translates an
   `execution.position_manager.OrderActionPayload` "intent" into a real
@@ -63,6 +78,23 @@ Sole owner of MetaTrader 5 integration. No other module (except
     construction inside `broker/` — `execution/position_manager.py`
     never imports `MetaTrader5` itself (ADR-0002/RQ-001).
 
+- `clock_provider.py` (Phase 11b, `docs/PRODUCTION_SPEC.md` §3):
+  - `ClockProvider` — a `Protocol` (`get_server_time(symbol) -> AwareDatetime`)
+    so session-boundary logic never touches the host machine's local clock
+    or a hardcoded DST table directly.
+  - `MT5ClockProvider` — the production implementation: adds the connected
+    `MT5Gateway`'s `broker_utc_offset` (itself derived from the resolved
+    Gold symbol's latest tick, never a hardcoded value) to the current
+    host UTC time to reconstruct current broker server time. Raises
+    `ValueError` if called with a symbol other than the one the gateway is
+    bound to (this system trades a single Gold symbol; multi-symbol clocks
+    are out of scope).
+- `is_ticket_still_open(ticket)` (Phase 11c, `docs/PRODUCTION_SPEC.md` §4) —
+  queries `mt5.positions_get(ticket=...)`, returning whether it's still
+  open. The "query the server cache" half of the pre-flight idempotency
+  audit before an automated retry; the "audit the local transaction
+  engine" half is `storage.state_manager.get_latest_order_event()`. Both
+  feed `execution.validation.check_duplicate_order_before_retry()`.
 - `get_account_state()` (Phase 10) — snapshots `mt5.account_info()`
   (balance/equity/margin) into an `AccountState`, the input `main.py`'s
   drawdown-breaker checks are computed from. Raises `BrokerConnectionError`
@@ -101,7 +133,10 @@ SELL-position-close order-type/price mapping, the modify-SLTP request
 shape, and both the missing-position and non-DONE-retcode rejection
 paths) was verified the same way. Phase 10's `get_account_state()`,
 `get_bars()`, and `submit_market_order()` were verified the same way too,
-now as formal `tests/test_integration.py::TestBrokerAccountAndBars` cases.
+now as formal `tests/integration/test_integration.py::TestBrokerAccountAndBars`
+cases. Phase 11e's `resolve_position_audit()` is fully unit-tested
+(`tests/unit/test_unit.py::TestResolvePositionAudit`) since it's pure —
+no fake `MetaTrader5` needed.
 
 ## Depends On
 
@@ -109,13 +144,30 @@ now as formal `tests/test_integration.py::TestBrokerAccountAndBars` cases.
 (`OrderActionPayload`, the "intent" type `submit_position_action()`
 translates into a real MT5 request), `storage/` (`TradeLedgerEntry` for
 position-audit reconciliation). External: `MetaTrader5` package,
-locally-running MT5 terminal process.
+locally-running MT5 terminal process. `clock_provider.py` additionally
+depends on `mt5_gateway.py`'s own `MT5Gateway`/`broker_utc_offset` — it
+adds no new external dependency.
 
 ## Depended On By
 
 `main.py` (Phase 10): connection lifecycle, startup position
 reconciliation, bar/account fetching, and order submission for the master
-FSM orchestration loop.
+FSM orchestration loop. `container.py`'s `ApplicationContainer` (Phase
+11b): constructs `MT5ClockProvider(gateway=gateway)` and holds it as
+`clock_provider` — **not yet consumed by `main.py`'s live loop**, which
+still calls `datetime.now(timezone.utc)` directly for `run_bar_close_cycle()`'s
+`now_utc` and the next-bar-close sleep, rather than through
+`ClockProvider.get_server_time()`; see `docs/ARCHITECTURE_SUMMARY.md` §5.
+`execution/validation.py` (Phase 11c: `is_ticket_still_open()` is the
+input a future automated retry loop would pass to
+`check_duplicate_order_before_retry()` — no such loop exists in `main.py`
+yet, see `docs/ARCHITECTURE_SUMMARY.md` §5). `container.py`'s
+`ApplicationContainer` (Phase 11e: calls `resolve_position_audit()` right
+after `audit_open_positions()`, applies the resulting
+`DisasterRecoveryPlan.ledger_upserts`, and computes
+`initial_drawdown_state`); `main.py` (Phase 11e:
+`_seed_initial_fsm_context()` calls `get_open_positions_by_magic()`
+directly to resume `IN_POSITION` from the broker's live truth on boot).
 
 ## Governing Docs
 
@@ -134,4 +186,9 @@ and the account allowlist cross-check referenced in
 `config/` but never cross-checked against the actually-connected account's
 real demo/live status) are still not implemented — see
 `docs/ARCHITECTURE_SUMMARY.md` §5 for the full list of gaps to close
-before live use.
+before live use. `submit_market_order()`/`submit_position_action()` still
+fold "MT5 explicitly rejected this" and "MT5 returned nothing (ambiguous
+— possibly a transient timeout)" into the same `BrokerOrderRejectedError`
+(Phase 11e, `resilience/README.md`'s Non-Goals) — distinguishing them is
+a prerequisite for safely wrapping either call in an automated retry
+loop, and this phase does not do it.

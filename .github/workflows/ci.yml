@@ -61,7 +61,7 @@ jobs:
           }
 
   test:
-    name: Pytest + Coverage
+    name: Pytest + Coverage (tests/unit + tests/integration only)
     runs-on: windows-latest
     needs: typecheck
     steps:
@@ -81,6 +81,12 @@ jobs:
           if (Test-Path tests) {
             $testFiles = Get-ChildItem -Path tests -Recurse -Filter "test_*.py" -ErrorAction SilentlyContinue
             if ($testFiles) {
+              # No explicit path: relies on pyproject.toml's `testpaths`
+              # (tests/unit + tests/integration only, Phase 11e). The
+              # long-running/fault-simulation suites (tests/chaos/,
+              # tests/stress/) are deliberately excluded from the
+              # standard pipeline — run them explicitly and separately
+              # via `pytest tests/chaos tests/stress`.
               pytest --cov=. --cov-report=term-missing --cov-fail-under=90
             } else {
               Write-Host "No tests collected yet (Phase 0) — nothing to run."
@@ -95,8 +101,12 @@ jobs:
       - name: Verify VERSION matches latest CHANGELOG.md entry
         shell: powershell
         run: |
+          # Pattern allows an optional SemVer pre-release suffix
+          # (e.g. "1.0.0-RC1") since Phase 11e introduced one — a plain
+          # `\d+\.\d+\.\d+` pattern would silently skip that header line
+          # and match an older, unrelated entry instead of failing loudly.
           $version = (Get-Content VERSION -Raw).Trim()
-          $changelogHead = Select-String -Path CHANGELOG.md -Pattern '^\#\# \[(\d+\.\d+\.\d+)\]' | Select-Object -First 1
+          $changelogHead = Select-String -Path CHANGELOG.md -Pattern '^\#\# \[(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)\]' | Select-Object -First 1
           if (-not $changelogHead) {
             Write-Error "CHANGELOG.md has no versioned entry matching '## [x.y.z]'."
             exit 1

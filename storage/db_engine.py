@@ -4,6 +4,19 @@ Sole low-level owner of the SQLite connection lifecycle and schema
 definition for the storage/ transactional ledger (ADR-0003). No other
 module opens a sqlite3.Connection directly; storage/state_manager.py is
 the only consumer of this module's connect()/initialize_schema().
+
+`docs/PRODUCTION_SPEC.md` §7: "SQLite operations are barred from
+sleep-based retries and must utilize immediate rollbacks combined with
+explicit `busy_timeout` definitions." `connect()` sets `PRAGMA
+busy_timeout` (SQLite's own native wait-and-retry on `SQLITE_BUSY`,
+implemented in the C library, not a Python `time.sleep()` loop) so a
+transient writer/reader lock contention resolves itself without any
+application-level retry logic; every write already goes through `with
+connection:` (Python's own transaction context manager), which rolls back
+immediately and atomically on any exception — no module in this codebase
+ever wraps a SQLite call in a sleep-and-retry loop
+(`tests/unit/test_unit.py::TestStorageNeverSleeps` statically enforces
+this).
 """
 
 from __future__ import annotations
@@ -12,6 +25,7 @@ import sqlite3
 from pathlib import Path
 
 DEFAULT_DB_PATH: Path = Path(__file__).resolve().parent / "gold_bot.db"
+DEFAULT_BUSY_TIMEOUT_MS = 5000
 
 _SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS trade_ledger (
@@ -63,7 +77,10 @@ CREATE INDEX IF NOT EXISTS idx_parameter_history_name ON parameter_history (para
 
 
 def connect(
-    db_path: Path | str = DEFAULT_DB_PATH, *, read_only: bool = False
+    db_path: Path | str = DEFAULT_DB_PATH,
+    *,
+    read_only: bool = False,
+    busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
 ) -> sqlite3.Connection:
     """Open a connection to the SQLite ledger with WAL mode enabled.
 
@@ -71,6 +88,12 @@ def connect(
     per ADR-0003's single-writer principle. read_only connections may be
     opened concurrently (e.g. by analytics/ or manual inspection) without
     blocking the writer, since WAL allows concurrent readers.
+
+    `busy_timeout_ms` (default 5000) sets SQLite's native `busy_timeout`:
+    if this connection finds the database locked by another connection, it
+    waits (internally, without any Python-level sleep loop) up to this many
+    milliseconds for the lock to clear before raising `sqlite3.OperationalError`
+    (`docs/PRODUCTION_SPEC.md` §7).
     """
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +107,7 @@ def connect(
     connection.execute("PRAGMA journal_mode = WAL;")
     connection.execute("PRAGMA synchronous = FULL;")
     connection.execute("PRAGMA foreign_keys = ON;")
+    connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)};")
     if read_only:
         connection.execute("PRAGMA query_only = ON;")
     connection.row_factory = sqlite3.Row

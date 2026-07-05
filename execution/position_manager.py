@@ -170,3 +170,25 @@ def calculate_trailing_stop(
         comment="atr_trailing_stop",
         stop_loss=candidate_sl,
     )
+
+
+EMERGENCY_LIQUIDATION_COMMENT = "emergency_liquidation_hard_lock"
+
+
+def build_emergency_liquidation_action(position: PositionState) -> OrderActionPayload:
+    """Full-volume market close — the `FeatureFlagManager`-driven
+    emergency liquidation payload `docs/PRODUCTION_SPEC.md` §6 requires
+    when `liquidate_on_hard_lock` is `True`. Unlike
+    `evaluate_partial_close_and_breakeven`'s 50% partial close, this closes
+    the position's *entire* remaining volume in a single
+    `TRADE_ACTION_DEAL` — `broker.mt5_gateway.MT5Gateway.submit_position_action()`
+    already translates a full-volume `TRADE_ACTION_DEAL` into a real
+    `mt5.order_send()` close, so no new broker-side method is needed."""
+    return OrderActionPayload(
+        action="TRADE_ACTION_DEAL",
+        position_ticket=position.ticket,
+        symbol=position.symbol,
+        magic=position.magic_number,
+        comment=EMERGENCY_LIQUIDATION_COMMENT,
+        volume=position.volume,
+    )

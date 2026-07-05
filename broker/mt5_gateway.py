@@ -8,6 +8,7 @@ the MetaTrader5 package directly (RQ-001).
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -110,6 +111,84 @@ class PositionAuditReport:
     @property
     def is_clean(self) -> bool:
         return not self.broker_only_positions and not self.ledger_only_entries
+
+
+@dataclass(frozen=True, slots=True)
+class DisasterRecoveryPlan:
+    """The settlement `docs/PRODUCTION_SPEC.md` §7 requires: "verify data
+    integrity against active live tickets... and settle any parameter
+    discrepancies before transitioning the FSM." Computed purely from an
+    already-fetched `PositionAuditReport` — no I/O of its own. The caller
+    (`container.py`) applies `ledger_upserts` via
+    `StateManager.record_trade()` and gates FSM startup on
+    `requires_manual_review`.
+    """
+
+    ledger_upserts: tuple[TradeLedgerEntry, ...]
+    requires_manual_review: bool
+    summary: str
+
+
+def resolve_position_audit(
+    report: PositionAuditReport, *, reconciled_at_utc: datetime | None = None
+) -> DisasterRecoveryPlan:
+    """Turn a `PositionAuditReport` into a concrete settlement plan.
+
+    Broker-only positions (open on the broker, no local ledger row) are
+    reconstructed into a new `OPEN` `trade_ledger` row from the broker's
+    own reported fields, keyed by a deterministic
+    `f"disaster-recovery-{ticket}"` `client_order_id` — idempotent:
+    re-running reconciliation for the same still-open ticket upserts the
+    same row rather than duplicating it (RR-007's usual idempotency
+    guarantee, applied here too). Ledger-only entries (the ledger thinks
+    it's open, the broker disagrees) are settled by marking them closed at
+    `reconciled_at_utc` (the reconciliation moment — the position's real
+    close time isn't knowable after the fact, an approximation flagged
+    here explicitly).
+
+    Any divergence at all (either list non-empty) sets
+    `requires_manual_review=True` — `docs/RUNBOOK.md`'s own established
+    policy already treats a position-audit mismatch as a `HIGH`-severity
+    RiskBreach (RR-008) that "blocks automated trading pending manual
+    reconciliation"; the caller must honor that by not starting the FSM in
+    `ACTIVE` when this is `True`.
+    """
+    now = reconciled_at_utc if reconciled_at_utc is not None else datetime.now(timezone.utc)
+    upserts: list[TradeLedgerEntry] = []
+
+    for position in report.broker_only_positions:
+        upserts.append(
+            TradeLedgerEntry(
+                client_order_id=f"disaster-recovery-{position.ticket}",
+                symbol=position.symbol,
+                side=position.side,
+                volume_lots=position.volume,
+                status="OPEN",
+                opened_at_utc=position.opened_at_utc.isoformat(),
+                open_price=position.price_open,
+                stop_loss_price=position.stop_loss,
+                take_profit_price=position.take_profit,
+                profit=position.profit,
+                magic_number=position.magic,
+                broker_ticket=position.ticket,
+            )
+        )
+
+    for entry in report.ledger_only_entries:
+        upserts.append(
+            dataclasses.replace(entry, status="CLOSED_RECONCILED", closed_at_utc=now.isoformat())
+        )
+
+    summary = (
+        f"reconciled={len(report.reconciled_tickets)} "
+        f"broker_only_settled={len(report.broker_only_positions)} "
+        f"ledger_only_settled={len(report.ledger_only_entries)}"
+    )
+    return DisasterRecoveryPlan(
+        ledger_upserts=tuple(upserts),
+        requires_manual_review=not report.is_clean,
+        summary=summary,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +365,16 @@ class MT5Gateway:
                 )
             )
         return matched
+
+    def is_ticket_still_open(self, ticket: int) -> bool:
+        """Query the broker's live position cache for `ticket` — the
+        "query the server cache" half of the pre-flight idempotency audit
+        `docs/PRODUCTION_SPEC.md` §4 requires before any automated retry:
+        confirms whether a ticket recorded locally from a previous `SENT`
+        attempt is still open on the broker, so a retry after an ambiguous
+        timeout doesn't blindly resubmit an order that actually landed."""
+        positions: Any = mt5.positions_get(ticket=ticket)
+        return bool(positions)
 
     def audit_open_positions(
         self, ledger_open_trades: list[TradeLedgerEntry]

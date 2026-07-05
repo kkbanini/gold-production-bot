@@ -21,11 +21,389 @@ API must not be considered stable until `1.0.0`. `MINOR` bumps during the `0.y.z
 may contain breaking changes if, and only if, the ADR introducing the change is marked
 `Status: Accepted` and the Traceability Matrix is updated in the same phase commit.
 
+A `-RC<N>` pre-release suffix (e.g. `1.0.0-RC1`, per SemVer §9's pre-release
+identifier syntax) marks a **release candidate**: every `docs/PRODUCTION_SPEC.md`
+contract scheduled for that release is implemented and tested, but
+`docs/ARCHITECTURE_SUMMARY.md` §5's open gaps are not yet closed and no
+paper-trading observation has occurred. Dropping the suffix to a plain
+`1.0.0` requires those gaps to close and `docs/DEPLOYMENT.md`'s promotion
+gates to actually be observed, not just documented — the same "not on the
+strength of a specification alone" standard this project has held since
+Phase 11a.
+
 ## [Unreleased]
 
-Phase 11b will build `CalendarProvider` (dynamic economic-calendar feed
-priority/failover) and `ClockProvider` (normalized server-time
-abstraction), per `docs/PRODUCTION_SPEC.md` §2/§3.
+No changes staged.
+
+## [1.0.0-RC1] - 2026-07-05
+
+### Added — Phase 11e: Bifurcated Resiliency, Audit Trail, Disaster Recovery & Test Suite Reorganization
+
+- `resilience/backoff.py` (new package) — the canonical exponential
+  backoff + retry budget for network I/O (§7): `compute_backoff_delays()`
+  (pure, defaults to the spec's exact `2s, 4s, 8s, 16s, 32s`) and
+  `retry_with_backoff()` (retries an operation up to `max_attempts`
+  additional times — a "retry budget" — sleeping the backoff delay
+  between each; `sleep` is injectable for deterministic tests; raises
+  `RetryBudgetExhaustedError`, chained, once exhausted). Applied to
+  `news/calendar_provider.py`'s `NetworkCalendarProvider`, deliberately
+  overridden to a small 1-retry budget so Phase 11b's fast
+  provider-failover guarantee isn't undermined by a ~62s worst-case
+  stall; `RetryBudgetExhaustedError` is caught and re-raised as
+  `NewsFeedConnectionError` so `CalendarProviderChain`'s existing
+  fallback contract still applies. `broker/mt5_gateway.py`'s
+  `MT5Gateway.connect()` (its own independently-tuned, already-tested
+  backoff since Phase 3) was deliberately *not* refactored onto this
+  module — see Flagged.
+- `storage/db_engine.py` — `connect()` now sets `PRAGMA busy_timeout`
+  (default 5000ms, overridable via `busy_timeout_ms=`): SQLite's native
+  wait-on-lock-contention mechanism, so a transient writer/reader lock
+  resolves without any Python-level sleep-and-retry loop. Every write
+  already used `with connection:` (atomic, immediate rollback on any
+  exception) since Phase 2.
+- `storage/migrations.py` — migration version 2: the `audit_trail` table,
+  made **structurally** append-only by `trg_audit_trail_no_update`/
+  `_no_delete` triggers (the same pattern Phase 11c's `order_events`
+  established).
+- `storage/state_manager.py` — `AuditActionType` (convenience constants
+  for the spec's 3 illustrative categories — not a closed, DB-enforced
+  set, unlike `OrderLifecycleState`), `AuditEvent`, `record_audit_event()`
+  (SHA-256-hashes the caller-supplied `actor` before storage — the
+  spec's literal "actor hashes" — and stringifies `old_value`/`new_value`
+  for the delta columns), `get_audit_trail()`.
+- `broker/mt5_gateway.py` — `DisasterRecoveryPlan`/`resolve_position_audit()`:
+  turns a `PositionAuditReport` into a concrete settlement plan.
+  Broker-only positions become new reconciled `trade_ledger` rows
+  (`f"disaster-recovery-{ticket}"` `client_order_id`, idempotent across
+  repeated runs); ledger-only entries are marked `CLOSED_RECONCILED` at
+  the reconciliation moment. Any divergence sets
+  `requires_manual_review=True`, honoring `docs/RUNBOOK.md`'s
+  pre-existing `HIGH`-severity policy for a position-audit mismatch
+  (RR-008) instead of silently auto-resuming.
+- `container.py` — `ApplicationContainer.build()` now applies
+  `resolve_position_audit()`'s plan (upserting the settled ledger rows),
+  records a `DISASTER_RECOVERY_RECONCILIATION` Audit Trail entry on any
+  divergence, and computes a new `initial_drawdown_state` field
+  (`MANUAL_RESET_REQUIRED` on divergence, `ACTIVE` otherwise).
+- `main.py` — `_seed_initial_fsm_context()`: seeds `main()`'s starting
+  `FSMContext` from the broker's *live* open positions
+  (`get_open_positions_by_magic()`) rather than a possibly-stale local
+  snapshot, using `container.initial_drawdown_state` for the drawdown
+  axis. `partial_closed`/`breakeven_set` default to `False` when resuming
+  mid-position (not derivable from broker-reported fields alone — a
+  known limitation, flagged).
+- Test suite reorganized (§7's explicit instruction): `tests/test_unit.py`
+  → `tests/unit/test_unit.py`; `tests/test_integration.py` split into
+  `tests/integration/test_integration.py` (boundary-crossing tests that
+  aren't fault simulations) and `tests/chaos/test_chaos.py` (MT5 server
+  dropouts, socket/HTTP disconnections, an abrupt process crash);
+  `tests/stress/` added as an honest, currently-empty placeholder (see
+  its own README). `pyproject.toml`'s `testpaths` now scopes the default
+  `pytest`/CI invocation to `tests/unit` + `tests/integration` only;
+  `tests/chaos`/`tests/stress` run via an explicit separate invocation
+  and are `omit`-excluded from the coverage report so an unexecuted file
+  never drags down the standard gate.
+- `.github/workflows/ci.yml` — the `docs-consistency` job's version regex
+  now accepts an optional SemVer pre-release suffix (`-RC1`, etc.) — a
+  plain `\d+\.\d+\.\d+` pattern would silently skip a suffixed header and
+  match an older entry instead of failing loudly.
+- `VERSION` / `CHANGELOG.md` → `1.0.0-RC1`; `pyproject.toml`'s
+  `[project] version` → `1.0.0rc1` (PEP 440's canonical pre-release
+  form — no hyphen, lowercase `rc` — a Python-packaging requirement, not
+  a style choice; distinct from `VERSION`'s SemVer-style `-RC1`).
+
+### Flagged
+
+- SLO Metrics (§7's fourth bullet — a background daemon thread tracking
+  `trade_latency`/`spread`/`order_reject_rate`/`mt5_latency`/`retry_count`/
+  `heartbeat_failures`) were **not built this sub-phase**. The phase
+  directive's explicit 4-item instruction list substituted the test-suite
+  reorganization for this bullet. Tracked as its own row
+  (`docs/TRACEABILITY_MATRIX.md` RQ-034, `SPECIFIED`, not `IMPLEMENTED`)
+  rather than silently folded into an "implemented" row.
+- The duplicate-order retry loop (flagged since Phase 11c) still cannot
+  be safely built: `broker/mt5_gateway.py`'s `submit_market_order()`/
+  `submit_position_action()` fold "MT5 explicitly rejected this" and
+  "MT5 returned nothing (ambiguous — possibly a transient timeout)" into
+  the same `BrokerOrderRejectedError`. Wrapping either call in
+  `retry_with_backoff()` today would retry indiscriminately, including
+  genuine, permanent rejections a retry can never fix.
+- `resilience.backoff`'s `max_attempts` counts retries *after* the
+  initial attempt (so the default of 5 permits up to 6 total attempts) —
+  a "5 total tries" reading of the spec would leave the last listed delay
+  (32s) always unused.
+- Test-suite reorganization measurably lowered two files' *standard-pipeline*
+  coverage: `news/news_engine.py` (97%→77%) and `broker/mt5_gateway.py`
+  (95%→93%), both because their only HTTP/reconnect-fault tests moved to
+  `tests/chaos/`. The overall `--cov-fail-under=90` gate still passes
+  (95%+ total); both files are fully covered again by `pytest tests/chaos`.
+  Flagged so this isn't mistaken for a regression later.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed.
+- `mypy --strict .` — no issues found.
+- `pytest --cov=. --cov-report=term-missing --cov-fail-under=90` (now
+  scoped by `pyproject.toml`'s `testpaths` to `tests/unit` + `tests/integration`)
+  — **265 tests pass, 96.65% total coverage**. `resilience/backoff.py`
+  reached 100% coverage; `storage/state_manager.py`'s new Audit Trail
+  methods and `broker/mt5_gateway.py`'s new `resolve_position_audit()`
+  are both fully covered. `pytest tests/chaos tests/stress` separately:
+  **11 more tests pass** (0 in `tests/stress/`, an intentional gap).
+  Combined (`pytest tests/unit tests/integration tests/chaos tests/stress`):
+  **276 tests pass**.
+
+## [0.15.0] - 2026-07-05
+
+### Added — Phase 11d: Pure-Function FSM Drawdown Breaker & Feature Flags
+
+- `risk/drawdown_fsm.py` — the single, centralized pure-function drawdown
+  FSM (§6): `DrawdownState` (`ACTIVE`/`WARNING`/`SOFT_LOCK`/`HARD_LOCK`/
+  `MANUAL_RESET_REQUIRED`, the 5 states named verbatim), `DrawdownEvent`,
+  `classify_drawdown_event()` (the sole numeric-to-symbolic boundary —
+  daily/weekly/monthly drawdown against `EquityBaselines`, classified into
+  the worst severity), and `transition_drawdown_state()` (the exact
+  `FSM(current_state, event) -> new_state` signature the spec requires).
+  `ACTIVE`/`WARNING`/`SOFT_LOCK` are recoverable (re-evaluated fresh every
+  cycle); only `HARD_LOCK` is sticky, always advancing to
+  `MANUAL_RESET_REQUIRED`, cleared solely by an explicit
+  `DrawdownEvent.MANUAL_RESET_CONFIRMED`. `blocks_new_entries()`/
+  `blocks_position_management()` are the two predicates `main.py` gates
+  its entry/position-management branches on — `SOFT_LOCK` freezes new
+  entries only, explicitly leaving trailing-stop/breakeven/partial-close
+  running. `decide_hard_lock_response()` is the `FeatureFlagManager`-driven
+  decision the instant `HARD_LOCK` is freshly entered.
+- `config/feature_flags.py` — `FeatureFlags`/`FeatureFlagManager`:
+  `FLAG_LIQUIDATE_ON_HARD_LOCK` (defaulting to `false` — freeze, the
+  safer choice), the config flag `docs/PRODUCTION_SPEC.md` §6 names as
+  `config.flags.liquidate_on_hard_lock`.
+- `execution/position_manager.py` — `build_emergency_liquidation_action()`:
+  a full-volume `TRADE_ACTION_DEAL` close, the payload
+  `liquidate_on_hard_lock=True` triggers. No new broker-side method was
+  needed — `submit_position_action()` already translates any
+  `TRADE_ACTION_DEAL` into a real close.
+- `main.py` — `run_bar_close_cycle()` now transitions through the
+  drawdown FSM every cycle (via the new `_evaluate_drawdown_transition()`/
+  `_handle_hard_lock_response()` helpers, factored out to stay under this
+  project's `ruff`-enforced cyclomatic-complexity limit) and gates its
+  entry/position-management branches on the resulting predicates. A fresh
+  `HARD_LOCK` with `liquidate_on_hard_lock=True` and an open position emits
+  `build_emergency_liquidation_action()`'s payload through the existing
+  `submit_with_pre_flight_ledger()` wrapper (Phase 11c); `main()` clears
+  `FSMContext.position` back to `None` on a confirmed liquidation, since
+  unlike a partial close it leaves nothing open. `TradingState.HALTED` is
+  removed — `FSMContext` now carries `drawdown_state`/`drawdown_reason` as
+  a fully orthogonal axis from `state`/`position` (a position can be
+  `IN_POSITION` while simultaneously `SOFT_LOCK`ed).
+- `container.py` — `ApplicationContainer` gains a `feature_flags`
+  (`FeatureFlagManager`) field, constructed via `FeatureFlags.from_env()`.
+- `.env.template` — documents the new optional `FLAG_LIQUIDATE_ON_HARD_LOCK`.
+
+### Flagged
+
+- `HARD_LOCK` thresholds (10%/20%/40%, double each `SOFT_LOCK` tier) and
+  the `WARNING` ratio (60% of the nearest `SOFT_LOCK` limit) are new,
+  made-up-but-documented defaults — the spec names the 5 states but gives
+  no catastrophic-tier percentage. `SOFT_LOCK`'s 5%/10%/20% is unchanged
+  from Phase 10's original hard locks (RQ-022).
+- `ACTIVE`/`WARNING`/`SOFT_LOCK` recovering automatically as equity
+  improves, with only `HARD_LOCK` requiring a human to clear, is a
+  deliberate evolution beyond Phase 10's "once halted, never auto-resumes
+  at any severity" posture — flagged in case every tier was intended to
+  stay sticky like the old single `HALTED` state.
+- No live control channel exists for a human to actually send
+  `MANUAL_RESET_CONFIRMED` — `run_bar_close_cycle()`'s
+  `manual_reset_confirmed` parameter is fully wired and tested, but
+  `main()` always passes `False`; there is no API/CLI/admin signal for an
+  operator to set it against a running process yet.
+- Equity-baseline rollover (carried over from RQ-022, Phase 10) is still
+  not implemented — the "daily"/"weekly"/"monthly" framing still degrades
+  the longer the process runs past its first UTC day, applying identically
+  to the new `WARNING`/`SOFT_LOCK`/`HARD_LOCK` tiers.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed.
+  `run_bar_close_cycle()` initially exceeded this project's
+  `max-complexity = 10` mccabe limit; factored into
+  `_evaluate_drawdown_transition()`/`_handle_hard_lock_response()` helpers
+  to bring it back under the limit.
+- `mypy --strict .` — no issues found.
+- `pytest --cov=. --cov-fail-under=90` — **251 tests pass, 97.14% total
+  coverage**. `risk/drawdown_fsm.py`, `config/feature_flags.py`, and
+  `execution/position_manager.py`'s new function all reached 100%
+  coverage, including every FSM transition-table branch, both
+  `liquidate_on_hard_lock` values, `SOFT_LOCK` continuing position
+  management while blocking new entries, `HARD_LOCK`'s freeze/liquidate
+  split, `MANUAL_RESET_REQUIRED`'s stickiness, and
+  `MANUAL_RESET_CONFIRMED` clearing the lock.
+
+## [0.14.0] - 2026-07-05
+
+### Added — Phase 11c: Pre-Flight Idempotency & Event-Sourced Order Ledger
+
+- `storage/migrations.py` — a lightweight internal schema-migration
+  framework (§4's "track db status securely" requirement):
+  `apply_pending_migrations()`/`get_applied_migrations()` track applied
+  versions in a `schema_migrations` table and apply any pending
+  `Migration` in ascending order. Seeded with one migration: the
+  `order_events`/`order_ledger` DDL, plus two SQLite triggers
+  (`trg_order_events_no_update`/`_no_delete`) making `order_events`
+  **structurally** append-only (`sqlite3.IntegrityError` at the database
+  engine level, not just Python-side convention). Phase 2/3/8's original
+  tables remain outside this framework — see `storage/README.md`'s
+  Simplification note for why.
+- `storage/state_manager.py` — `OrderLifecycleState` (the 11 institutional
+  lifecycle states §5 names verbatim: `REQUESTED`/`VALIDATED`/`SENT`/
+  `PENDING`/`PARTIALLY_FILLED`/`FILLED`/`MODIFIED`/`CANCELLED`/`REJECTED`/
+  `EXPIRED`/`CLOSED`), `OrderEvent` (one immutable Event Store row), and
+  `record_order_event()`/`get_order_ledger_state()`/`get_order_events()`/
+  `get_latest_order_event()`. `record_order_event()` appends to
+  `order_events` and folds the new state into the `order_ledger`
+  projection atomically — the same transaction — satisfying §4's literal
+  "atomic transaction block" requirement. `StateManager.__init__` now also
+  calls `apply_pending_migrations()`.
+- `broker/mt5_gateway.py` — `MT5Gateway.is_ticket_still_open(ticket)`: the
+  "query the server cache" half of §4's pre-retry audit.
+- `execution/validation.py` — `SeverityLevel` (`INFO`/`WARNING`/`ERROR`/
+  `CRITICAL`) and `ValidationResult` (`is_valid`/`reason_code`/`severity`/
+  `is_retryable`/`metadata`), §5's exact rich validator payload (`metadata`
+  typed `dict[str, Any]` rather than the spec's literal bare `dict`, since
+  `mypy --strict`'s `disallow-any-generics` forbids the latter).
+  `check_duplicate_order_before_retry()` — the `PreTradeValidator`
+  pipeline's concrete duplicate-order gate (RR-007): reduces the local
+  Event Store's latest recorded state and whether the broker still
+  confirms a previously-recorded ticket open into a `ValidationResult`.
+  Ambiguous post-`SENT` states with no confirmed-open ticket are refused
+  (not assumed safe) — the conservative reading of "strictly mitigating
+  duplicate order anomalies".
+- `main.py` — `submit_with_pre_flight_ledger()` wraps both real
+  broker-submission call sites (a new market order; every position
+  action) with the pre-flight `REQUESTED` write, then `SENT` + a terminal
+  `FILLED`/`MODIFIED` event on success or `REJECTED` (re-raised unchanged)
+  on failure. This is the one part of this phase that changes `main.py`'s
+  actual runtime behavior — additively; the happy path and rejection path
+  are otherwise unchanged.
+
+### Flagged
+
+- `order_ledger.timestamp` uses the spec's literal column name rather
+  than this project's usual `_utc`-suffixed convention, since §4's SQL
+  example names it verbatim — only the column name deviates, not its
+  format (still a UTC ISO8601 string).
+- The retry-audit gate (`check_duplicate_order_before_retry()` +
+  `is_ticket_still_open()`) is fully built and tested but **not wired
+  into an actual retry loop** — `main.py` has no automated
+  order-submission retry mechanism today; a single
+  `BrokerOrderRejectedError` still propagates uncaught. That retry loop's
+  backoff cadence is `docs/PRODUCTION_SPEC.md` §7's explicit domain (Max 5
+  attempts: 2s/4s/8s/16s/32s), a later sub-phase.
+- Unlike Phase 11b's precedent (build the abstraction, leave `main.py`
+  untouched), this phase does wire the pre-flight ledger write directly
+  into `main.py`'s live loop — justified because the two real submission
+  call sites, and the `client_order_id` generation itself, already existed
+  there; wrapping them is a small, bounded, behavior-preserving addition,
+  unlike inventing a new retry loop would be.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed.
+- `mypy --strict .` — no issues found. Two lambdas passed to
+  `submit_with_pre_flight_ledger()` in `main.py` were rewritten as
+  annotated nested `def`s (`mypy` cannot infer a lambda's parameter types
+  against a `TypeVar`-generic `Callable` parameter); `ruff`'s B023 (loop
+  variable not bound in a nested function) was resolved the same way,
+  binding narrowed locals as default-parameter values.
+- `pytest --cov=. --cov-fail-under=90` — **193 tests pass, 96.95% total
+  coverage**. `storage/migrations.py` and `execution/validation.py`
+  reached 100% coverage, including the append-only triggers' rejection of
+  a raw `UPDATE`/`DELETE`, the CHECK constraint rejecting an invalid
+  lifecycle state, migration idempotency on a re-run, and every branch of
+  `check_duplicate_order_before_retry()`'s decision table.
+  `submit_with_pre_flight_ledger()` is exercised directly against a real
+  temp-file `StateManager` with a fake `submit` callable (no MT5 needed),
+  covering both its success and `BrokerOrderRejectedError` paths.
+
+## [0.13.0] - 2026-07-05
+
+### Added — Phase 11b: Dynamic Calendar Feed Priority & Normalized Clock Abstraction
+
+- `news/calendar_provider.py` — `CalendarProvider` (§2): a `Protocol`
+  (`name` + `fetch_events(from_utc, to_utc)`) unifying every calendar
+  source behind one interface. `NetworkCalendarProvider` wraps
+  `news_engine.fetch_calendar_events()` for HTTP-backed providers;
+  `OfflineSnapshotCalendarProvider` reads a local JSON snapshot file
+  (`news/offline_calendar_snapshot.json`, ships as an empty `[]`) as the
+  network-independent final fallback. `RateLimiter` is a non-blocking
+  sliding-window limiter (`allow()` refuses rather than sleeps once
+  `max_calls_per_minute` is exhausted in the trailing 60 seconds — this
+  system's bar-close loop runs under a 200ms processing cap and must
+  never block on a rate limit). `CalendarProviderChain.fetch_events()`
+  tries each configured provider in priority order, falling through to
+  the next on any `NewsFeedConnectionError` or exhausted rate limit, and
+  only raising once every provider has failed.
+- `config/calendar_config.py` — `CalendarConfig.from_env()` loads the new
+  optional `CALENDAR_*` environment variables (`CALENDAR_PROVIDER_PRIORITY`,
+  `CALENDAR_TIMEOUT_MS`, `CALENDAR_RATE_LIMIT_PER_MIN`,
+  `CALENDAR_<PROVIDER>_BASE_URL`, `CALENDAR_OFFLINE_SNAPSHOT_PATH`).
+  Defaults to a safe `offline_snapshot`-only chain requiring no additional
+  configuration; raises `ConfigurationError` — the same fail-closed
+  exception `config_manager.py` raises — if an unknown provider name is
+  listed or a network provider is listed without its base URL configured.
+  No vendor base URL is ever hardcoded or guessed (`news/README.md`'s
+  provenance note: no real `tradingeconomics`/`finnhub` API contract has
+  been verified in this codebase).
+- `broker/clock_provider.py` — `ClockProvider` (§3): a `Protocol`
+  (`get_server_time(symbol) -> AwareDatetime`). `MT5ClockProvider` derives
+  server time strictly from the connected `MT5Gateway`'s own
+  `broker_utc_offset` (ADR-0002) — never a hardcoded DST table or the
+  host machine's local clock.
+- `news/news_engine.py` — `_parse_event()` renamed to public
+  `parse_calendar_event()`, since `calendar_provider.py`'s offline
+  snapshot fallback now parses the same event shape from a local file.
+- `container.py` — `ApplicationContainer` gains `calendar_provider`
+  (`CalendarProviderChain`) and `clock_provider` (`MT5ClockProvider`)
+  fields, constructed in `build()` via
+  `news.calendar_provider.build_calendar_provider_chain()` and
+  `MT5ClockProvider(gateway=gateway)`.
+- `.env.template` — documents the new optional `CALENDAR_*` variables.
+
+### Flagged
+
+- Default `CALENDAR_PROVIDER_PRIORITY` is `("offline_snapshot",)` alone,
+  not the spec's illustrative `['tradingeconomics', 'finnhub',
+  'offline_snapshot']` — see `docs/ARCHITECTURE_SUMMARY.md` §3 for why an
+  unconditional 3-provider default was rejected (it would require every
+  deployment to configure two unverified vendor base URLs just to boot).
+  The full chain remains fully supported, opt-in via
+  `CALENDAR_PROVIDER_PRIORITY`.
+- `CalendarConfig.timeout_ms` is applied to both the HTTP connect and read
+  phase of a network provider's request — the spec gives one unified
+  timeout, while `fetch_calendar_events()` (Phase 7) takes a separate
+  connect/read pair.
+- `main.py`'s live loop does not yet consume either new provider —
+  `_fetch_market_snapshot()` still passes a hardcoded empty event list and
+  `run_bar_close_cycle()`/the bar-close sleep still call
+  `datetime.now(timezone.utc)` directly. Both are held by
+  `ApplicationContainer`, ready to be wired in; see
+  `docs/ARCHITECTURE_SUMMARY.md` §5.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (32 files).
+- `mypy --strict .` — no issues found in 32 source files. `CalendarProvider`'s
+  `name` had to be declared as a read-only `@property` rather than a plain
+  `name: str` attribute — mypy's Protocol structural-typing rules require a
+  settable attribute for the latter, which the frozen dataclass providers
+  (`NetworkCalendarProvider`, `OfflineSnapshotCalendarProvider`) don't have.
+- `pytest --cov=. --cov-fail-under=90` — **168 tests pass, 96.97% total
+  coverage**. `config/calendar_config.py`, `broker/clock_provider.py`, and
+  `news/calendar_provider.py` all reached 100% coverage, including the
+  rate limiter's sliding-window expiry, the provider chain's fallback and
+  full-exhaustion paths, the offline snapshot's missing-file/malformed-JSON
+  errors, and `ApplicationContainer.build()`'s default (`offline_snapshot`-
+  only) and misconfigured-network-provider paths exercised against a real
+  `FakeMT5` + temp SQLite database.
 
 ## [0.12.0] - 2026-07-05
 

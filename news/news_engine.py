@@ -9,8 +9,8 @@ project (docs/DEPLOYMENT.md and config/.env.template only declare a
 generic ECONOMIC_CALENDAR_API_KEY). This module assumes a generic REST/JSON
 calendar API shape (GET {base_url}?from=...&to=... returning a JSON list of
 {title, country, impact, date} objects) rather than targeting one specific
-named vendor — flagged for review; adapt `_parse_event()` to a concrete
-provider's real response shape once one is chosen.
+named vendor — flagged for review; adapt `parse_calendar_event()` to a
+concrete provider's real response shape once one is chosen.
 """
 
 from __future__ import annotations
@@ -110,10 +110,16 @@ def fetch_calendar_events(
             f"economic calendar feed returned invalid JSON: {exc}"
         ) from exc
 
-    return [_parse_event(item) for item in payload]
+    return [parse_calendar_event(item) for item in payload]
 
 
-def _parse_event(item: dict[str, Any]) -> EconomicEvent:
+def parse_calendar_event(item: dict[str, Any]) -> EconomicEvent:
+    """Parse one raw calendar-feed JSON object into an `EconomicEvent`.
+
+    Public (not module-private) because `news/calendar_provider.py`'s
+    offline-snapshot fallback parses the same `{title, country, impact,
+    date}` shape from a local file rather than a live HTTP response.
+    """
     scheduled_at = datetime.fromisoformat(item["date"])
     if scheduled_at.tzinfo is None:
         scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)

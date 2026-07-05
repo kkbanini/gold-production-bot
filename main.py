@@ -3,12 +3,15 @@
 close (docs/RUNBOOK.md §1's boot sequence, ADR-0001's event-driven
 principle applied without a full EventBus/`core`, which no phase built).
 
-This module owns the trading state machine (TradingState) and the two
-mechanisms this phase specifically adds: the 200ms processing-cap metric
-and the 5%/10%/20% daily/weekly/monthly drawdown hard locks. It does NOT
-implement a pre-trade risk gate or slippage guard (RQ-009/RQ-010) — those
-remain open gaps, see docs/TRACEABILITY_MATRIX.md and
-docs/ARCHITECTURE_SUMMARY.md.
+This module owns the trading state machine (TradingState) and the 200ms
+processing-cap metric. Global capital protection (drawdown) is Phase 11d's
+`risk/drawdown_fsm.py` — a separate, centralized pure-function FSM
+(`docs/PRODUCTION_SPEC.md` §6) this module only *consumes* (calls
+`classify_drawdown_event()`/`transition_drawdown_state()` and applies the
+resulting `blocks_new_entries()`/`blocks_position_management()`
+predicates), never reimplements. It does NOT implement a pre-trade risk
+gate or slippage guard (RQ-009/RQ-010) — those remain open gaps, see
+docs/TRACEABILITY_MATRIX.md and docs/ARCHITECTURE_SUMMARY.md.
 
 `run_bar_close_cycle()` is a pure decision function: no I/O, fully
 deterministic given its inputs, and the unit of testing.
@@ -17,6 +20,30 @@ I/O layer that fetches real data and executes decisions against the
 broker — reviewed for correctness but not executed against a live/demo
 account in this environment (no real MT5 credentials exist here; see
 docs/ARCHITECTURE_SUMMARY.md "Before your first live/demo run").
+
+`submit_with_pre_flight_ledger()` (Phase 11c, docs/PRODUCTION_SPEC.md §4)
+wraps every real broker-submission call site in `main()`'s loop body
+(position actions, a new entry, and Phase 11d's emergency liquidation): it
+writes a REQUESTED event to the storage/ Event Store before the payload
+reaches the MT5 gateway, then SENT + a terminal FILLED/MODIFIED event on
+success or REJECTED (re-raising unchanged) on rejection. Unlike the rest
+of `main()`'s loop body, this function takes its I/O as injected
+parameters (a StateManager and a submit callable) rather than reaching
+for globals, so it is directly unit-tested
+(tests/unit/test_unit.py::TestSubmitWithPreFlightLedger) despite being
+impure. It does not itself retry — no automated order-submission retry
+loop exists in this module (see docs/ARCHITECTURE_SUMMARY.md §5).
+
+`_seed_initial_fsm_context()` (Phase 11e, docs/PRODUCTION_SPEC.md §7)
+is Disaster Recovery's second half: `main()` calls it right after
+`ApplicationContainer.build()` to seed the starting `FSMContext` directly
+from the broker's live open positions (`container.gateway.get_open_positions_by_magic()`)
+rather than trusting a possibly-stale local snapshot, and from
+`container.initial_drawdown_state` (computed by `build()`'s reconciliation
+— `MANUAL_RESET_REQUIRED` if a broker/ledger divergence was found and
+settled, `ACTIVE` otherwise). Formally tested against a real
+`ApplicationContainer` built with a `FakeMT5`
+(tests/integration/test_integration.py::TestApplicationContainer).
 """
 
 from __future__ import annotations
@@ -24,30 +51,47 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal, TypeVar
 
 from broker.mt5_gateway import (
     TIMEFRAME_D1,
     TIMEFRAME_H1,
     TIMEFRAME_H4,
     AccountState,
+    BrokerOrderRejectedError,
+    BrokerPosition,
     MT5Gateway,
 )
+from config.feature_flags import FeatureFlagManager
 from container import ApplicationContainer
 from execution.position_manager import (
     BASE_TP_ATR_MULTIPLIER,
+    EMERGENCY_LIQUIDATION_COMMENT,
     OrderActionPayload,
     PositionState,
+    build_emergency_liquidation_action,
     calculate_trailing_stop,
     evaluate_partial_close_and_breakeven,
 )
 from indicators.math_engine import atr, ema
 from news.news_engine import EconomicEvent, is_trade_entry_locked
+from risk.drawdown_fsm import (
+    DrawdownClassification,
+    DrawdownEvent,
+    DrawdownState,
+    EquityBaselines,
+    blocks_new_entries,
+    blocks_position_management,
+    classify_drawdown_event,
+    decide_hard_lock_response,
+    transition_drawdown_state,
+)
 from risk.risk_manager import calculate_compounded_lot_size
-from storage.state_manager import TradeLedgerEntry
+from storage.state_manager import OrderLifecycleState, StateManager, TradeLedgerEntry
 from strategy.execution_triggers import (
     BreakoutSignal,
     PullbackSignal,
@@ -65,10 +109,6 @@ Direction = Literal["BUY", "SELL", "NONE"]
 PROCESSING_CAP_MS = 200.0
 BAR_CLOSE_TIMEFRAME_MINUTES = 5
 
-DAILY_DRAWDOWN_LIMIT = 0.05
-WEEKLY_DRAWDOWN_LIMIT = 0.10
-MONTHLY_DRAWDOWN_LIMIT = 0.20
-
 # Distance (in ATR multiples) from the current price to the initial
 # stop-loss on a new entry. Mirrors position_manager's Base_TP multiplier
 # for symmetry; not independently specified anywhere, flagged for review.
@@ -81,40 +121,17 @@ M5_BAR_COUNT = 40
 
 
 class TradingState(str, Enum):
-    """Master FSM states for the orchestration loop."""
+    """Master FSM states for the orchestration loop: flat vs. in-position
+    bookkeeping only. Capital-protection halting is a fully orthogonal
+    axis (`FSMContext.drawdown_state`, `risk/drawdown_fsm.py`) — a
+    position can be `IN_POSITION` while the account is simultaneously
+    `SOFT_LOCK`ed, since `SOFT_LOCK` explicitly keeps position management
+    running (docs/PRODUCTION_SPEC.md §6). Phase 11d removed the old
+    `HALTED` member, which conflated these two concerns."""
 
     INITIALIZING = "INITIALIZING"
     IDLE = "IDLE"
     IN_POSITION = "IN_POSITION"
-    HALTED = "HALTED"
-
-
-class DrawdownBreaker(str, Enum):
-    DAILY = "DAILY"
-    WEEKLY = "WEEKLY"
-    MONTHLY = "MONTHLY"
-
-
-@dataclass(frozen=True, slots=True)
-class EquityBaselines:
-    """Reference equity captured at the start of the current UTC
-    day/ISO week/calendar month, against which drawdown is measured."""
-
-    daily_start_equity: float
-    weekly_start_equity: float
-    monthly_start_equity: float
-
-
-@dataclass(frozen=True, slots=True)
-class DrawdownCheckResult:
-    daily_drawdown_pct: float
-    weekly_drawdown_pct: float
-    monthly_drawdown_pct: float
-    breached: tuple[DrawdownBreaker, ...]
-
-    @property
-    def is_halted(self) -> bool:
-        return len(self.breached) > 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,11 +152,14 @@ class EntryDecision:
 @dataclass(frozen=True, slots=True)
 class FSMContext:
     """The orchestration loop's full state, threaded through every
-    bar-close cycle."""
+    bar-close cycle. `state`/`position` track flat-vs-in-position;
+    `drawdown_state`/`drawdown_reason` (Phase 11d) track the independent
+    capital-protection FSM (`risk/drawdown_fsm.py`)."""
 
     state: TradingState
     position: PositionState | None
-    halt_reason: str | None
+    drawdown_state: DrawdownState
+    drawdown_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,14 +189,14 @@ class SymbolConstraints:
 
 @dataclass(frozen=True, slots=True)
 class BarCloseCycleResult:
-    """Everything one call to `run_bar_close_cycle` decided. `context` only
-    reflects a drawdown-triggered HALT transition — entry/position-
-    management transitions happen in `main()` after the broker confirms
-    the corresponding action succeeded, which this pure function cannot
-    know."""
+    """Everything one call to `run_bar_close_cycle` decided. `context`
+    only reflects the drawdown-FSM transition (`drawdown_state`/
+    `drawdown_reason`) — flat/in-position transitions happen in `main()`
+    after the broker confirms the corresponding action succeeded, which
+    this pure function cannot know."""
 
     context: FSMContext
-    drawdown: DrawdownCheckResult
+    drawdown: DrawdownClassification
     processing: ProcessingCapResult
     entry_decision: EntryDecision | None
     entry_stop_loss: float | None
@@ -209,52 +229,6 @@ def evaluate_processing_time(duration_seconds: float) -> ProcessingCapResult:
     duration_ms = duration_seconds * 1000.0
     return ProcessingCapResult(
         duration_ms=duration_ms, exceeded_cap=duration_ms > PROCESSING_CAP_MS
-    )
-
-
-def check_drawdown_breach(current_equity: float, baselines: EquityBaselines) -> DrawdownCheckResult:
-    """Compute daily/weekly/monthly drawdown against the supplied
-    baselines and flag any breaker exceeding its hard-lock threshold
-    (5%/10%/20% respectively).
-
-    A breach halts new entries (`FSMContext.state -> HALTED`) but never
-    force-closes an existing position, matching `docs/RUNBOOK.md`'s
-    established `CRITICAL`-severity posture (autonomous de-risk means no
-    new risk added, not an automatic flatten).
-    """
-    for label, baseline in (
-        ("daily", baselines.daily_start_equity),
-        ("weekly", baselines.weekly_start_equity),
-        ("monthly", baselines.monthly_start_equity),
-    ):
-        if baseline <= 0:
-            raise ValueError(f"{label}_start_equity must be > 0, got {baseline}")
-    if current_equity < 0:
-        raise ValueError(f"current_equity must be >= 0, got {current_equity}")
-
-    daily_dd = max(
-        0.0, (baselines.daily_start_equity - current_equity) / baselines.daily_start_equity
-    )
-    weekly_dd = max(
-        0.0, (baselines.weekly_start_equity - current_equity) / baselines.weekly_start_equity
-    )
-    monthly_dd = max(
-        0.0, (baselines.monthly_start_equity - current_equity) / baselines.monthly_start_equity
-    )
-
-    breached: list[DrawdownBreaker] = []
-    if daily_dd >= DAILY_DRAWDOWN_LIMIT:
-        breached.append(DrawdownBreaker.DAILY)
-    if weekly_dd >= WEEKLY_DRAWDOWN_LIMIT:
-        breached.append(DrawdownBreaker.WEEKLY)
-    if monthly_dd >= MONTHLY_DRAWDOWN_LIMIT:
-        breached.append(DrawdownBreaker.MONTHLY)
-
-    return DrawdownCheckResult(
-        daily_drawdown_pct=daily_dd,
-        weekly_drawdown_pct=weekly_dd,
-        monthly_drawdown_pct=monthly_dd,
-        breached=tuple(breached),
     )
 
 
@@ -293,19 +267,119 @@ def decide_entry_signal(
     return EntryDecision("NONE", "no entry trigger agrees with the confirmed trend direction")
 
 
+def _evaluate_drawdown_transition(
+    context: FSMContext,
+    snapshot: MarketSnapshot,
+    baselines: EquityBaselines,
+    *,
+    manual_reset_confirmed: bool,
+) -> tuple[FSMContext, DrawdownClassification]:
+    """Classifies this cycle's drawdown severity, transitions
+    `context.drawdown_state` through `risk/drawdown_fsm.py`'s pure FSM,
+    logs at a severity matching the resulting state, and returns the
+    updated `FSMContext` (drawdown fields only; `state`/`position` pass
+    through unchanged) alongside the raw classification. Factored out of
+    `run_bar_close_cycle()` to keep that function's cyclomatic complexity
+    under this project's `ruff`-enforced limit (`pyproject.toml`
+    `max-complexity = 10`).
+    """
+    classification = classify_drawdown_event(snapshot.account_state.equity, baselines)
+    drawdown_event = (
+        DrawdownEvent.MANUAL_RESET_CONFIRMED if manual_reset_confirmed else classification.event
+    )
+    new_drawdown_state = transition_drawdown_state(context.drawdown_state, drawdown_event)
+
+    drawdown_reason: str | None = None
+    if new_drawdown_state != DrawdownState.ACTIVE:
+        drawdown_reason = (
+            f"drawdown_state={new_drawdown_state.value} event={drawdown_event.value} "
+            f"(daily={classification.daily_drawdown_pct:.1%}, "
+            f"weekly={classification.weekly_drawdown_pct:.1%}, "
+            f"monthly={classification.monthly_drawdown_pct:.1%})"
+        )
+        if new_drawdown_state == DrawdownState.WARNING:
+            logger.warning("Drawdown WARNING: %s", drawdown_reason)
+        elif new_drawdown_state == DrawdownState.SOFT_LOCK:
+            logger.error("Drawdown SOFT_LOCK (new entries frozen): %s", drawdown_reason)
+        else:
+            logger.critical("Drawdown %s: %s", new_drawdown_state.value, drawdown_reason)
+
+    updated_context = FSMContext(
+        state=context.state,
+        position=context.position,
+        drawdown_state=new_drawdown_state,
+        drawdown_reason=drawdown_reason,
+    )
+    return updated_context, classification
+
+
+def _handle_hard_lock_response(
+    context: FSMContext,
+    updated_context: FSMContext,
+    classification: DrawdownClassification,
+    processing: ProcessingCapResult,
+    feature_flags: FeatureFlagManager,
+) -> BarCloseCycleResult | None:
+    """Returns a terminal `BarCloseCycleResult` if `updated_context` is a
+    fresh `HARD_LOCK` breach this cycle (either an emergency-liquidation
+    action, or an empty-action freeze), or `None` if no `HARD_LOCK`
+    response applies so `run_bar_close_cycle()` should continue its normal
+    decision flow. Factored out for the same `max-complexity` reason as
+    `_evaluate_drawdown_transition()`.
+    """
+    hard_lock_response = decide_hard_lock_response(
+        updated_context.drawdown_state, liquidate_on_hard_lock=feature_flags.liquidate_on_hard_lock
+    )
+    if hard_lock_response is None:
+        return None
+
+    empty_result = BarCloseCycleResult(
+        context=updated_context,
+        drawdown=classification,
+        processing=processing,
+        entry_decision=None,
+        entry_stop_loss=None,
+        entry_volume=None,
+        position_actions=(),
+    )
+    if not hard_lock_response.should_liquidate or context.position is None:
+        logger.critical("Absolute system freeze triggered: %s", hard_lock_response.reason)
+        return empty_result
+
+    logger.critical("Emergency liquidation triggered: %s", hard_lock_response.reason)
+    return BarCloseCycleResult(
+        context=updated_context,
+        drawdown=classification,
+        processing=processing,
+        entry_decision=None,
+        entry_stop_loss=None,
+        entry_volume=None,
+        position_actions=(build_emergency_liquidation_action(context.position),),
+    )
+
+
 def run_bar_close_cycle(
     context: FSMContext,
     snapshot: MarketSnapshot,
     baselines: EquityBaselines,
     constraints: SymbolConstraints,
+    feature_flags: FeatureFlagManager,
     *,
     cycle_duration_seconds: float,
+    manual_reset_confirmed: bool = False,
 ) -> BarCloseCycleResult:
     """Pure decision function for a single M5 bar-close cycle: no I/O,
     entirely deterministic given its inputs. `main()` fetches the inputs
     (broker/storage calls) and executes the resulting
     `position_actions`/entry decision against the broker, then persists
     the outcome and constructs the next cycle's `FSMContext`.
+
+    `manual_reset_confirmed` is the sole channel for a human to clear a
+    locked `drawdown_state` (`risk/drawdown_fsm.py`'s
+    `DrawdownEvent.MANUAL_RESET_CONFIRMED`) — always `False` today, since
+    `main()` has no live control channel (API/CLI/admin signal) for an
+    operator to actually set it yet; this is an open gap, see
+    `docs/ARCHITECTURE_SUMMARY.md` §5.
     """
     processing = evaluate_processing_time(cycle_duration_seconds)
     if processing.exceeded_cap:
@@ -313,10 +387,13 @@ def run_bar_close_cycle(
             "Bar-close cycle exceeded the 200ms processing cap: %.1fms", processing.duration_ms
         )
 
-    drawdown = check_drawdown_breach(snapshot.account_state.equity, baselines)
+    updated_context, classification = _evaluate_drawdown_transition(
+        context, snapshot, baselines, manual_reset_confirmed=manual_reset_confirmed
+    )
+    new_drawdown_state = updated_context.drawdown_state
     no_action = BarCloseCycleResult(
-        context=context,
-        drawdown=drawdown,
+        context=updated_context,
+        drawdown=classification,
         processing=processing,
         entry_decision=None,
         entry_stop_loss=None,
@@ -324,37 +401,31 @@ def run_bar_close_cycle(
         position_actions=(),
     )
 
-    if drawdown.is_halted:
-        halted_context = FSMContext(
-            state=TradingState.HALTED,
-            position=context.position,
-            halt_reason=f"drawdown breaker(s) tripped: {[b.value for b in drawdown.breached]}",
-        )
-        return BarCloseCycleResult(
-            context=halted_context,
-            drawdown=drawdown,
-            processing=processing,
-            entry_decision=None,
-            entry_stop_loss=None,
-            entry_volume=None,
-            position_actions=(),
-        )
+    hard_lock_result = _handle_hard_lock_response(
+        context, updated_context, classification, processing, feature_flags
+    )
+    if hard_lock_result is not None:
+        return hard_lock_result
 
-    if context.state == TradingState.HALTED:
-        # Remains halted until a human clears it (docs/RUNBOOK.md
-        # CRITICAL posture) — never auto-resumes even if drawdown recovers.
+    if blocks_position_management(new_drawdown_state):
+        # MANUAL_RESET_REQUIRED (carried over from a prior cycle's
+        # HARD_LOCK): no operations at all until a human confirms a reset.
         return no_action
 
     news_locked = is_trade_entry_locked(snapshot.now_utc, snapshot.news_events)
 
     if context.position is None:
+        if blocks_new_entries(new_drawdown_state):
+            # SOFT_LOCK, flat: nothing to manage and no new entries allowed.
+            return no_action
+
         entry_decision = decide_entry_signal(
             snapshot.trend, snapshot.breakout, snapshot.pullback, snapshot.wick_fill, news_locked
         )
         if entry_decision.direction == "NONE" or snapshot.current_price is None:
             return BarCloseCycleResult(
-                context=context,
-                drawdown=drawdown,
+                context=updated_context,
+                drawdown=classification,
                 processing=processing,
                 entry_decision=entry_decision,
                 entry_stop_loss=None,
@@ -375,8 +446,8 @@ def run_bar_close_cycle(
             constraints.volume_step,
         )
         return BarCloseCycleResult(
-            context=context,
-            drawdown=drawdown,
+            context=updated_context,
+            drawdown=classification,
             processing=processing,
             entry_decision=entry_decision,
             entry_stop_loss=entry_stop_loss,
@@ -387,6 +458,10 @@ def run_bar_close_cycle(
     if snapshot.current_price is None:
         return no_action
 
+    # SOFT_LOCK reaches here too (blocks_new_entries is True for it, but
+    # that only gated the flat/no-position branch above): position
+    # management keeps running under SOFT_LOCK by design
+    # (docs/PRODUCTION_SPEC.md §6).
     actions = evaluate_partial_close_and_breakeven(
         context.position,
         snapshot.current_price,
@@ -403,8 +478,8 @@ def run_bar_close_cycle(
             actions = [trailing_action]
 
     return BarCloseCycleResult(
-        context=context,
-        drawdown=drawdown,
+        context=updated_context,
+        drawdown=classification,
         processing=processing,
         entry_decision=None,
         entry_stop_loss=None,
@@ -420,6 +495,49 @@ def run_bar_close_cycle(
 # live/demo account in this environment — see docs/ARCHITECTURE_SUMMARY.md
 # "Before your first live/demo run".
 # ---------------------------------------------------------------------------
+
+_SubmitResult = TypeVar("_SubmitResult")
+
+
+def submit_with_pre_flight_ledger(
+    state_manager: StateManager,
+    submit: Callable[[str], _SubmitResult],
+    metadata: dict[str, Any],
+    terminal_state: OrderLifecycleState,
+) -> tuple[str, _SubmitResult]:
+    """Wrap one broker submission with the pre-flight idempotency write
+    `docs/PRODUCTION_SPEC.md` §4 requires: a fresh `client_order_id`
+    (UUIDv4) is written to the Event Store as `REQUESTED` — atomically,
+    via `StateManager.record_order_event()` — *before* `submit` (the
+    payload's actual route to the MT5 gateway) is called at all.
+
+    On success, records `SENT` then `terminal_state` (`FILLED` for a new
+    market order or a partial-close deal, `MODIFIED` for an SLTP change).
+    On `BrokerOrderRejectedError`, records `REJECTED` (capturing the error
+    in metadata) and re-raises unchanged — this wrapper only adds an audit
+    trail around the call, it does not change what the caller observes on
+    failure, and it does not itself retry (`docs/PRODUCTION_SPEC.md` §7's
+    backoff-driven retry loop is a separate, later sub-phase; see
+    `docs/ARCHITECTURE_SUMMARY.md` §5 for what a future retry loop would
+    still need to call — `execution.validation.check_duplicate_order_before_retry()`
+    plus `MT5Gateway.is_ticket_still_open()` — before resubmitting).
+
+    Returns `(client_order_id, submit`'s return value`)` so callers that
+    need the generated id (e.g. to persist a `TradeLedgerEntry`) don't have
+    to generate a second one.
+    """
+    client_order_id = str(uuid.uuid4())
+    state_manager.record_order_event(client_order_id, OrderLifecycleState.REQUESTED, metadata)
+    try:
+        result = submit(client_order_id)
+    except BrokerOrderRejectedError as exc:
+        state_manager.record_order_event(
+            client_order_id, OrderLifecycleState.REJECTED, {**metadata, "error": str(exc)}
+        )
+        raise
+    state_manager.record_order_event(client_order_id, OrderLifecycleState.SENT, metadata)
+    state_manager.record_order_event(client_order_id, terminal_state, metadata)
+    return client_order_id, result
 
 
 def _fetch_market_snapshot(
@@ -483,6 +601,52 @@ def _fetch_market_snapshot(
     )
 
 
+def _seed_initial_fsm_context(container: ApplicationContainer) -> FSMContext:
+    """Disaster Recovery's second half (`docs/PRODUCTION_SPEC.md` §7):
+    seeds `main()`'s starting `FSMContext` directly from the broker's live
+    open positions (the authoritative source) rather than a possibly-stale
+    local snapshot. `container.initial_drawdown_state` already reflects
+    whether `ApplicationContainer.build()`'s reconciliation found a
+    divergence requiring manual review.
+
+    If exactly one open position exists under this gateway's magic
+    number, resumes `IN_POSITION` with it — `partial_closed`/
+    `breakeven_set` default to `False` since neither is derivable from
+    broker-reported fields alone (a known limitation: resuming
+    mid-position after a crash may repeat an already-completed
+    partial-close/breakeven step; see `docs/ARCHITECTURE_SUMMARY.md` §5).
+    Zero or more than one open position starts flat (`IDLE`) — "more than
+    one" is anomalous for this single-instrument system and would already
+    be caught by the disaster-recovery reconciliation's own divergence
+    check in the ordinary case.
+    """
+    open_positions = container.gateway.get_open_positions_by_magic()
+    if len(open_positions) == 1:
+        broker_position = open_positions[0]
+        return FSMContext(
+            state=TradingState.IN_POSITION,
+            position=PositionState(
+                ticket=broker_position.ticket,
+                symbol=broker_position.symbol,
+                side=broker_position.side,  # type: ignore[arg-type]
+                volume=broker_position.volume,
+                entry_price=broker_position.price_open,
+                stop_loss=broker_position.stop_loss,
+                magic_number=broker_position.magic,
+                partial_closed=False,
+                breakeven_set=False,
+            ),
+            drawdown_state=container.initial_drawdown_state,
+            drawdown_reason=None,
+        )
+    return FSMContext(
+        state=TradingState.IDLE,
+        position=None,
+        drawdown_state=container.initial_drawdown_state,
+        drawdown_reason=None,
+    )
+
+
 def main() -> None:
     """Entry point: bootstrap, then loop forever, acting once per new M5
     bar close. Not executed in this environment (no live MT5 credentials);
@@ -492,7 +656,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     container = ApplicationContainer.build()
 
-    context = FSMContext(state=TradingState.IDLE, position=None, halt_reason=None)
+    context = _seed_initial_fsm_context(container)
     baselines: EquityBaselines | None = None
     constraints = SymbolConstraints(
         point=container.gateway.symbol_spec.point,
@@ -525,12 +689,47 @@ def main() -> None:
             snapshot,
             baselines,
             constraints,
+            container.feature_flags,
             cycle_duration_seconds=ended - started,
         )
         context = result.context
 
         for action in result.position_actions:
-            container.gateway.submit_position_action(action)
+            action_metadata: dict[str, Any] = {
+                "symbol": action.symbol,
+                "action": action.action,
+                "position_ticket": action.position_ticket,
+                "comment": action.comment,
+            }
+            action_terminal_state = (
+                OrderLifecycleState.MODIFIED
+                if action.action == "TRADE_ACTION_SLTP"
+                else OrderLifecycleState.FILLED
+            )
+
+            def _submit_action(
+                _client_order_id: str, *, bound_action: OrderActionPayload = action
+            ) -> None:
+                container.gateway.submit_position_action(bound_action)
+
+            submit_with_pre_flight_ledger(
+                container.state_manager,
+                _submit_action,
+                action_metadata,
+                action_terminal_state,
+            )
+
+            if action.comment == EMERGENCY_LIQUIDATION_COMMENT:
+                # A full-volume liquidation deal, unlike a partial close,
+                # leaves nothing open — clear the tracked position rather
+                # than waiting for the next cycle's stale management logic
+                # to act on a ticket that no longer exists.
+                context = FSMContext(
+                    state=TradingState.IDLE,
+                    position=None,
+                    drawdown_state=context.drawdown_state,
+                    drawdown_reason=context.drawdown_reason,
+                )
 
         if (
             result.entry_decision is not None
@@ -538,13 +737,39 @@ def main() -> None:
             and result.entry_stop_loss is not None
             and result.entry_volume is not None
         ):
-            client_order_id = str(uuid.uuid4())
-            broker_position = container.gateway.submit_market_order(
-                side=result.entry_decision.direction,
-                volume=result.entry_volume,
-                stop_loss=result.entry_stop_loss,
-                take_profit=None,
-                comment=client_order_id,
+            # Narrowed into plain locals (rather than read from `result.*`
+            # inside `_submit_entry` below) since mypy's Optional/Literal
+            # narrowing from the `if` above does not propagate into a
+            # nested function body.
+            entry_side = result.entry_decision.direction
+            entry_stop_loss = result.entry_stop_loss
+            entry_volume = result.entry_volume
+            entry_metadata: dict[str, Any] = {
+                "symbol": container.gateway.symbol_spec.name,
+                "side": entry_side,
+                "volume": entry_volume,
+            }
+
+            def _submit_entry(
+                cid: str,
+                *,
+                side: Literal["BUY", "SELL"] = entry_side,
+                volume: float = entry_volume,
+                stop_loss: float = entry_stop_loss,
+            ) -> BrokerPosition:
+                return container.gateway.submit_market_order(
+                    side=side,
+                    volume=volume,
+                    stop_loss=stop_loss,
+                    take_profit=None,
+                    comment=cid,
+                )
+
+            client_order_id, broker_position = submit_with_pre_flight_ledger(
+                container.state_manager,
+                _submit_entry,
+                entry_metadata,
+                OrderLifecycleState.FILLED,
             )
             container.state_manager.record_trade(
                 TradeLedgerEntry(
@@ -573,7 +798,8 @@ def main() -> None:
                     partial_closed=False,
                     breakeven_set=False,
                 ),
-                halt_reason=None,
+                drawdown_state=context.drawdown_state,
+                drawdown_reason=context.drawdown_reason,
             )
 
 

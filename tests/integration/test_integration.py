@@ -1,8 +1,14 @@
-"""Integration tests: exercises that cross a real boundary — a simulated
-MT5 server dropout, a simulated socket/HTTP disconnection, a real SQLite
-database's transactional rollback behavior, and cross-module state
-validation (broker/ledger reconciliation, crash recovery, and the
-weekend optimizer's isolation guarantee against active trading state).
+"""Integration tests: exercises that cross a real boundary — order/position
+request building against a simulated MT5, account/bar fetching, a real
+SQLite database's transactional rollback behavior, and cross-module state
+validation (broker/ledger reconciliation and the weekend optimizer's
+isolation guarantee against active trading state).
+
+Simulated *fault/disruption* scenarios (MT5 server dropouts, socket/HTTP
+disconnections, an abrupt process crash) live in `tests/chaos/` instead
+(Phase 11e's test-suite reorganization, `docs/PRODUCTION_SPEC.md` §7) —
+isolated from this fast suite so the standard CI pipeline's feedback loop
+never depends on them.
 """
 
 from __future__ import annotations
@@ -13,68 +19,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-import requests
 
 import broker.mt5_gateway as gw
-import news.news_engine as ne
+import main as orchestrator
 import optimizer.self_learning as sl
+from broker.clock_provider import MT5ClockProvider
 from container import ApplicationContainer
 from execution.position_manager import OrderActionPayload
+from news.calendar_provider import OfflineSnapshotCalendarProvider
+from risk.drawdown_fsm import DrawdownState
 from storage.state_manager import StateManager, TradeLedgerEntry
 from tests.conftest import FakeMT5, FakePosition, FakeSymbolInfo, FakeTick
-
-# ---------------------------------------------------------------------------
-# Simulated MT5 server dropouts (broker/mt5_gateway.py)
-# ---------------------------------------------------------------------------
-
-
-class TestMT5ServerDropouts:
-    def test_reconnect_succeeds_after_transient_failures(
-        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Simulates a flaky MT5 terminal: two failed initialize() calls
-        (as if the terminal/server connection dropped) followed by a
-        successful third attempt, verifying exponential backoff delays
-        and that the gateway ends up fully initialized."""
-        fake_mt5.initialize_results = [False, False, True]
-        fake_mt5.symbols["XAUUSD"] = _make_symbol("XAUUSD", visible=True)
-        fake_mt5.ticks["XAUUSD"] = FakeTick(
-            time_=int(datetime(2026, 7, 4, 12, 0, tzinfo=timezone.utc).timestamp())
-        )
-        monkeypatch.setattr(gw, "mt5", fake_mt5)
-
-        sleep_calls: list[float] = []
-        monkeypatch.setattr(
-            "broker.mt5_gateway.time.sleep", lambda seconds: sleep_calls.append(seconds)
-        )
-
-        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
-        gateway.connect(max_attempts=6, initial_delay_seconds=1.0, max_delay_seconds=60.0)
-
-        assert sleep_calls == [1.0, 2.0]
-        assert gateway.symbol_spec.name == "XAUUSD"
-        assert gateway.broker_utc_offset is not None
-
-    def test_reconnect_exhaustion_raises_with_last_error(
-        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Simulates a fully down MT5 server: every initialize() attempt
-        fails, and backoff exhausts without ever connecting."""
-        fake_mt5.initialize_results = [False, False, False]
-        fake_mt5.last_error_value = (10004, "no connection")
-        monkeypatch.setattr(gw, "mt5", fake_mt5)
-        monkeypatch.setattr("broker.mt5_gateway.time.sleep", lambda seconds: None)
-
-        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=1)
-        with pytest.raises(gw.BrokerConnectionError, match="3 attempts"):
-            gateway.connect(max_attempts=3, initial_delay_seconds=0.01, max_delay_seconds=1.0)
-
-
-def _make_symbol(
-    name: str, visible: bool, point: float = 0.01, tick_value: float = 1.0
-) -> FakeSymbolInfo:
-    return FakeSymbolInfo(name, visible=visible, point=point, tick_value=tick_value)
-
 
 # ---------------------------------------------------------------------------
 # Order/position-action request building against a simulated MT5 (also part
@@ -321,117 +276,6 @@ class TestBrokerAccountAndBars:
 
 
 # ---------------------------------------------------------------------------
-# Simulated socket/HTTP disconnections (news/news_engine.py)
-# ---------------------------------------------------------------------------
-
-
-class FakeHTTPResponse:
-    def __init__(self, status_code: int, json_data: object = None, text: str = "") -> None:
-        self.status_code = status_code
-        self._json_data = json_data
-        self.text = text
-
-    def json(self) -> object:
-        if self._json_data is None:
-            raise ValueError("no JSON body")
-        return self._json_data
-
-
-class TestNewsFeedSocketDisconnections:
-    FROM_UTC = datetime(2026, 7, 4, tzinfo=timezone.utc)
-    TO_UTC = datetime(2026, 7, 11, tzinfo=timezone.utc)
-
-    def test_successful_fetch_with_custom_timeouts(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        captured = {}
-
-        def fake_get(
-            url: str,
-            params: dict[str, str] | None = None,
-            timeout: tuple[float, float] | None = None,
-        ) -> FakeHTTPResponse:
-            captured["timeout"] = timeout
-            return FakeHTTPResponse(
-                200,
-                [
-                    {
-                        "title": "Non-Farm Payrolls",
-                        "country": "US",
-                        "impact": "High",
-                        "date": "2026-07-04T12:30:00+00:00",
-                    }
-                ],
-            )
-
-        monkeypatch.setattr(requests, "get", fake_get)
-        events = ne.fetch_calendar_events(
-            "https://example.com/calendar",
-            "fake-key",
-            self.FROM_UTC,
-            self.TO_UTC,
-            connect_timeout_seconds=3.0,
-            read_timeout_seconds=7.0,
-        )
-        assert len(events) == 1
-        assert captured["timeout"] == (3.0, 7.0)
-
-    def test_connection_error_raises_news_feed_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(
-            url: str,
-            params: dict[str, str] | None = None,
-            timeout: tuple[float, float] | None = None,
-        ) -> FakeHTTPResponse:
-            raise requests.exceptions.ConnectionError("socket refused")
-
-        monkeypatch.setattr(requests, "get", fake_get)
-        with pytest.raises(ne.NewsFeedConnectionError, match="unreachable"):
-            ne.fetch_calendar_events(
-                "https://example.com/calendar", "fake-key", self.FROM_UTC, self.TO_UTC
-            )
-
-    def test_timeout_raises_news_feed_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(
-            url: str,
-            params: dict[str, str] | None = None,
-            timeout: tuple[float, float] | None = None,
-        ) -> FakeHTTPResponse:
-            raise requests.exceptions.Timeout("timed out")
-
-        monkeypatch.setattr(requests, "get", fake_get)
-        with pytest.raises(ne.NewsFeedConnectionError, match="unreachable"):
-            ne.fetch_calendar_events(
-                "https://example.com/calendar", "fake-key", self.FROM_UTC, self.TO_UTC
-            )
-
-    def test_non_200_status_raises_news_feed_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(
-            url: str,
-            params: dict[str, str] | None = None,
-            timeout: tuple[float, float] | None = None,
-        ) -> FakeHTTPResponse:
-            return FakeHTTPResponse(503, text="Service Unavailable")
-
-        monkeypatch.setattr(requests, "get", fake_get)
-        with pytest.raises(ne.NewsFeedConnectionError, match="HTTP 503"):
-            ne.fetch_calendar_events(
-                "https://example.com/calendar", "fake-key", self.FROM_UTC, self.TO_UTC
-            )
-
-    def test_invalid_json_raises_news_feed_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_get(
-            url: str,
-            params: dict[str, str] | None = None,
-            timeout: tuple[float, float] | None = None,
-        ) -> FakeHTTPResponse:
-            return FakeHTTPResponse(200, json_data=None)
-
-        monkeypatch.setattr(requests, "get", fake_get)
-        with pytest.raises(ne.NewsFeedConnectionError, match="invalid JSON"):
-            ne.fetch_calendar_events(
-                "https://example.com/calendar", "fake-key", self.FROM_UTC, self.TO_UTC
-            )
-
-
-# ---------------------------------------------------------------------------
 # Database rollback (storage/)
 # ---------------------------------------------------------------------------
 
@@ -501,22 +345,10 @@ class TestDatabaseRollback:
 # ---------------------------------------------------------------------------
 
 
-class TestCrashRecovery:
-    def test_fsm_state_survives_ungraceful_process_death(self, tmp_path: Path) -> None:
-        db_path = tmp_path / "crash.db"
-        first_instance = StateManager(db_path)
-        first_instance.save_fsm_state(
-            {"open_positions": ["XAUUSD"], "phase": "AWAITING_FILL"}, last_sequence_id=42
-        )
-        del first_instance  # simulate abrupt process death (no close())
-
-        second_instance = StateManager(db_path)
-        loaded = second_instance.load_fsm_state()
-        assert loaded is not None
-        state, sequence_id = loaded
-        assert state == {"open_positions": ["XAUUSD"], "phase": "AWAITING_FILL"}
-        assert sequence_id == 42
-        second_instance.close()
+class TestDatabaseIntegrity:
+    """WAL mode / integrity sanity checks. The abrupt-process-death crash-
+    recovery simulation (dropping a StateManager without close()) moved to
+    `tests/chaos/test_chaos.py::TestCrashRecovery` (Phase 11e reorg)."""
 
     def test_wal_mode_and_integrity(self, state_manager: StateManager) -> None:
         from storage.db_engine import integrity_check
@@ -694,6 +526,7 @@ class TestApplicationContainer:
             assert app.config.mt5_login == 12345
             assert app.gateway.symbol_spec.name == "XAUUSD"
             assert app.state_manager.get_open_trades() == []
+            assert app.initial_drawdown_state == DrawdownState.ACTIVE
         finally:
             app.state_manager.close()
 
@@ -718,6 +551,71 @@ class TestApplicationContainer:
             )
         try:
             assert "divergence" in caplog.text
+            # Phase 11e's Disaster Recovery reconciliation: a divergence
+            # blocks the FSM from starting ACTIVE, settles the broker-only
+            # ticket into a real ledger row, and records an audit entry.
+            assert app.initial_drawdown_state == DrawdownState.MANUAL_RESET_REQUIRED
+            reconciled = [e for e in app.state_manager.get_open_trades() if e.broker_ticket == 100]
+            assert len(reconciled) == 1
+            assert reconciled[0].client_order_id == "disaster-recovery-100"
+            audit_trail = app.state_manager.get_audit_trail()
+            assert len(audit_trail) == 1
+            assert audit_trail[0].action_type == "DISASTER_RECOVERY_RECONCILIATION"
+        finally:
+            app.state_manager.close()
+
+    def test_build_seeds_initial_fsm_context_from_live_broker_position(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """main._seed_initial_fsm_context() (Phase 11e Disaster Recovery,
+        docs/PRODUCTION_SPEC.md §7) resumes IN_POSITION directly from the
+        broker's live open positions rather than a stale local snapshot."""
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        fake_mt5.positions[777] = FakePosition(
+            777, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555, volume=0.2
+        )
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        app = ApplicationContainer.build(
+            env_file="nonexistent.env", db_path=tmp_path / "container_seed.db"
+        )
+        try:
+            context = orchestrator._seed_initial_fsm_context(app)
+            assert context.state == orchestrator.TradingState.IN_POSITION
+            assert context.position is not None
+            assert context.position.ticket == 777
+            assert context.position.volume == 0.2
+            assert context.position.partial_closed is False
+            assert context.position.breakeven_set is False
+        finally:
+            app.state_manager.close()
+
+    def test_build_seeds_flat_context_when_no_open_positions(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        app = ApplicationContainer.build(
+            env_file="nonexistent.env", db_path=tmp_path / "container_seed_flat.db"
+        )
+        try:
+            context = orchestrator._seed_initial_fsm_context(app)
+            assert context.state == orchestrator.TradingState.IDLE
+            assert context.position is None
+            assert context.drawdown_state == DrawdownState.ACTIVE
         finally:
             app.state_manager.close()
 
@@ -767,3 +665,67 @@ class TestApplicationContainer:
             monkeypatch.delenv(key, raising=False)
         with pytest.raises(Exception, match="Missing required environment"):
             ApplicationContainer.build(env_file="nonexistent.env", db_path=tmp_path / "x.db")
+
+    def test_build_wires_calendar_and_clock_providers_with_defaults(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """No CALENDAR_* env vars set: build() must still succeed, wiring
+        the safe `offline_snapshot`-only default chain (docs/PRODUCTION_SPEC.md
+        §2/§3) — this is what keeps every pre-existing container test above
+        passing without any new required configuration."""
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        for key in (
+            "CALENDAR_PROVIDER_PRIORITY",
+            "CALENDAR_TRADINGECONOMICS_BASE_URL",
+            "CALENDAR_FINNHUB_BASE_URL",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(
+            time_=int(datetime(2026, 7, 4, 12, 0, tzinfo=timezone.utc).timestamp())
+        )
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        app = ApplicationContainer.build(
+            env_file="nonexistent.env", db_path=tmp_path / "container_calendar.db"
+        )
+        try:
+            assert len(app.calendar_provider.providers) == 1
+            assert isinstance(app.calendar_provider.providers[0], OfflineSnapshotCalendarProvider)
+            assert (
+                app.calendar_provider.fetch_events(
+                    datetime(2026, 7, 4, tzinfo=timezone.utc),
+                    datetime(2026, 7, 11, tzinfo=timezone.utc),
+                )
+                == []
+            )
+            assert isinstance(app.clock_provider, MT5ClockProvider)
+            assert app.clock_provider.get_server_time("XAUUSD").tzinfo is not None
+        finally:
+            app.state_manager.close()
+
+    def test_build_propagates_calendar_config_error_uncaught(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A network provider listed in CALENDAR_PROVIDER_PRIORITY without
+        its base URL configured must halt startup, same fail-closed
+        posture as a missing broker credential."""
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("CALENDAR_PROVIDER_PRIORITY", "finnhub")
+        monkeypatch.delenv("CALENDAR_FINNHUB_BASE_URL", raising=False)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        with pytest.raises(Exception, match="CALENDAR_FINNHUB_BASE_URL"):
+            ApplicationContainer.build(
+                env_file="nonexistent.env", db_path=tmp_path / "container_calendar_err.db"
+            )

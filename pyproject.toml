@@ -1,6 +1,6 @@
 [project]
 name = "gold-production-bot"
-version = "0.12.0"
+version = "1.0.0rc1"
 description = "Event-driven algorithmic trading system for XAUUSD on MetaTrader 5."
 requires-python = ">=3.12"
 dependencies = [
@@ -27,7 +27,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["config*", "storage*", "broker*", "indicators*", "strategy*", "execution*", "risk*", "optimizer*", "backtester*", "analytics*", "news*"]
+include = ["config*", "storage*", "broker*", "indicators*", "strategy*", "execution*", "risk*", "optimizer*", "backtester*", "analytics*", "news*", "resilience*"]
 
 [tool.ruff]
 target-version = "py312"
@@ -63,7 +63,12 @@ module = "apscheduler.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# Phase 11e test-suite reorganization (docs/PRODUCTION_SPEC.md §7): the
+# standard/default pytest invocation covers only the fast unit +
+# integration suites. tests/chaos/ and tests/stress/ are deliberately
+# excluded from this default so the CI pipeline's feedback loop never
+# depends on them — run explicitly via `pytest tests/chaos tests/stress`.
+testpaths = ["tests/unit", "tests/integration"]
 
 [tool.coverage.run]
 source = [
@@ -76,8 +81,9 @@ source = [
     "risk",
     "optimizer",
     "news",
+    "resilience",
 ]
-omit = ["*/__init__.py"]
+omit = ["*/__init__.py", "tests/chaos/*", "tests/stress/*"]
 
 [tool.coverage.report]
 exclude_lines = [

@@ -34,6 +34,25 @@ No other module reads `os.environ` directly for a trading-relevant value.
   redact anything.
 - `.env.template` (repo root) — documents every required key with empty
   placeholder values; never populated with real credentials.
+- `calendar_config.py` (Phase 11b, `docs/PRODUCTION_SPEC.md` §2) —
+  `CalendarConfig.from_env()` loads the optional `CALENDAR_*` env vars
+  (`CALENDAR_PROVIDER_PRIORITY`, `CALENDAR_TIMEOUT_MS`,
+  `CALENDAR_RATE_LIMIT_PER_MIN`, `CALENDAR_<PROVIDER>_BASE_URL`,
+  `CALENDAR_OFFLINE_SNAPSHOT_PATH`). Defaults to a safe `offline_snapshot`-only
+  chain requiring no additional configuration; raises `ConfigurationError`
+  (the same fail-closed exception `ConfigManager` raises) if an unknown
+  provider name is listed, a network provider is listed without its base
+  URL, or a numeric field isn't a valid integer. Sole owner of the
+  `CALENDAR_*` variables, same rule as `config_manager.py`'s required keys.
+- `feature_flags.py` (Phase 11d, `docs/PRODUCTION_SPEC.md` §6) —
+  `FeatureFlags.from_env()` loads the optional `FLAG_*` env vars (today:
+  `FLAG_LIQUIDATE_ON_HARD_LOCK`, accepting `true`/`false`/`1`/`0`/`yes`/`no`/
+  `on`/`off` case-insensitively); an unrecognized value raises
+  `ConfigurationError`. Defaults `liquidate_on_hard_lock` to `False` — the
+  safer, capital-preserving choice when a deployer hasn't made an explicit
+  choice. `FeatureFlagManager` wraps a `FeatureFlags` snapshot as the
+  single place `risk.drawdown_fsm.decide_hard_lock_response()`'s caller
+  reads the flag from. Sole owner of the `FLAG_*` variables.
 
 ## Depends On
 
@@ -43,15 +62,23 @@ file (never committed).
 ## Depended On By
 
 `container.py`'s `ApplicationContainer` (config loading + secret redaction
-setup, Phase 11a), `broker/` (credentials, `ENVIRONMENT_MODE` for the
-RR-012 startup check), `news/` (calendar provider API key).
+setup, Phase 11a; `CalendarConfig.from_env()` feeding
+`news.calendar_provider.build_calendar_provider_chain()`, Phase 11b;
+`FeatureFlagManager` construction, Phase 11d), `broker/` (credentials,
+`ENVIRONMENT_MODE` for the RR-012 startup check), `news/` (calendar
+provider API key, and `calendar_config.py`'s `CalendarConfig` for
+`calendar_provider.py`'s provider chain), `main.py` (Phase 11d:
+`run_bar_close_cycle()` takes `container.feature_flags` and passes
+`.liquidate_on_hard_lock` to `risk.drawdown_fsm.decide_hard_lock_response()`).
 
 ## Governing Docs
 
-`docs/PRODUCTION_SPEC.md` §1 (secrets management & boot validation — the
-authority for this phase's additions). ADR references: none yet dedicated
-otherwise (cross-cutting). See `docs/RISK_REGISTER.md` RR-001 (secret
-hygiene) and RR-012 (wrong-account guard), `docs/DEPLOYMENT.md` §2–§3.
+`docs/PRODUCTION_SPEC.md` §1 (secrets management & boot validation), §2
+(`calendar_config.py`'s configuration matrix, Phase 11b), and §6
+(`feature_flags.py`'s `config.flags.liquidate_on_hard_lock`, Phase 11d).
+ADR references: none yet dedicated otherwise (cross-cutting). See
+`docs/RISK_REGISTER.md` RR-001 (secret hygiene) and RR-012 (wrong-account
+guard), `docs/DEPLOYMENT.md` §2–§3.
 
 ## Non-Goals (This Phase)
 
