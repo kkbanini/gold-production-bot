@@ -63,9 +63,24 @@ Sole owner of MetaTrader 5 integration. No other module (except
     construction inside `broker/` — `execution/position_manager.py`
     never imports `MetaTrader5` itself (ADR-0002/RQ-001).
 
-The remaining `docs/API_SPEC.md` §3 `BrokerGateway` methods (`submit_order`,
-`cancel_order`, `get_account_state`, `get_latest_tick`/`get_bars`) are not
-implemented yet.
+- `get_account_state()` (Phase 10) — snapshots `mt5.account_info()`
+  (balance/equity/margin) into an `AccountState`, the input `main.py`'s
+  drawdown-breaker checks are computed from. Raises `BrokerConnectionError`
+  if unavailable.
+- `get_bars(timeframe, count)` (Phase 10) — fetches the last `count` closed
+  bars via `mt5.copy_rates_from_pos()`, returning a `BarSeries` of numpy
+  arrays ready for `indicators/`/`strategy/` consumption directly (no
+  per-bar object overhead). `TIMEFRAME_D1`/`TIMEFRAME_H4`/`TIMEFRAME_H1`/
+  `TIMEFRAME_M5` are re-exported from this module so callers (`main.py`)
+  never need to import `MetaTrader5` themselves. Raises
+  `BrokerConnectionError` if no data is returned.
+- `submit_market_order(side, volume, stop_loss, take_profit, comment)`
+  (Phase 10) — opens a *new* position: reads the current bid/ask, submits
+  a `TRADE_ACTION_DEAL` market order, and returns a `BrokerPosition`. This
+  does **not** perform a pre-trade risk gate, slippage guard, or
+  duplicate-submission idempotency check (RQ-009/RQ-010, RR-007) — those
+  remain the caller's (`main.py`'s) responsibility and are still an open
+  gap, see `docs/ARCHITECTURE_SUMMARY.md` §5.
 
 ## Verification note (no live terminal in this environment)
 
@@ -84,7 +99,9 @@ success and failure paths for each function. Phase 6's
 `submit_position_action()` request-building (BUY-position-close vs.
 SELL-position-close order-type/price mapping, the modify-SLTP request
 shape, and both the missing-position and non-DONE-retcode rejection
-paths) was verified the same way.
+paths) was verified the same way. Phase 10's `get_account_state()`,
+`get_bars()`, and `submit_market_order()` were verified the same way too,
+now as formal `tests/test_integration.py::TestBrokerAccountAndBars` cases.
 
 ## Depends On
 
@@ -96,9 +113,9 @@ locally-running MT5 terminal process.
 
 ## Depended On By
 
-The eventual FSM orchestration loop (`main.py`, connection lifecycle +
-startup position reconciliation), `strategy/` (bar history, future phase),
-`execution/` (order submission, position queries, future phase).
+`main.py` (Phase 10): connection lifecycle, startup position
+reconciliation, bar/account fetching, and order submission for the master
+FSM orchestration loop.
 
 ## Governing Docs
 
@@ -110,11 +127,11 @@ connection). `docs/RESEARCH.md` §2 (Time & Session Normalization).
 
 ## Non-Goals (This Phase)
 
-No automated `tests/broker/` suite yet — verification this phase was ad hoc
-against a fake `MetaTrader5` substitute (see `CHANGELOG.md` §0.4.0 and
-§0.7.0), consistent with the project's plan to introduce the full
-automated test harness in a dedicated later phase. Full order submission
-(`submit_order` for new entries, not just partial closes of existing
-positions), `cancel_order`, `get_account_state`, `get_latest_tick`/`get_bars`
-for `strategy/` consumption, and the account allowlist cross-check
-referenced in `docs/RISK_REGISTER.md` RR-012 are not yet implemented.
+`cancel_order` (canceling a pending, not-yet-filled order — this system
+only ever uses market orders, so no pending-order type exists to cancel)
+and the account allowlist cross-check referenced in
+`docs/RISK_REGISTER.md` RR-012 (`ENVIRONMENT_MODE` is validated by
+`config/` but never cross-checked against the actually-connected account's
+real demo/live status) are still not implemented — see
+`docs/ARCHITECTURE_SUMMARY.md` §5 for the full list of gaps to close
+before live use.

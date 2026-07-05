@@ -189,6 +189,136 @@ class TestOrderActionSubmission:
 
 
 # ---------------------------------------------------------------------------
+# broker/mt5_gateway.py's Phase 10 additions: account state, bar fetching,
+# and new-position market order submission.
+# ---------------------------------------------------------------------------
+
+
+class TestBrokerAccountAndBars:
+    def test_get_account_state(self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.account.balance = 9_500.0
+        fake_mt5.account.equity = 9_800.0
+        fake_mt5.account.margin = 100.0
+        fake_mt5.account.margin_free = 9_700.0
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        state = gateway.get_account_state()
+        assert state.balance == 9_500.0
+        assert state.equity == 9_800.0
+        assert state.margin_used == 100.0
+        assert state.margin_free == 9_700.0
+
+    def test_get_account_state_raises_when_unavailable(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        monkeypatch.setattr(fake_mt5, "account_info", lambda: None)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        with pytest.raises(gw.BrokerConnectionError):
+            gateway.get_account_state()
+
+    def test_get_bars_returns_typed_arrays(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        fake_mt5.rates[gw.TIMEFRAME_H1] = [
+            {
+                "open": 2000.0,
+                "high": 2005.0,
+                "low": 1995.0,
+                "close": 2002.0,
+                "tick_volume": 100.0,
+                "time": 1720000000,
+            },
+            {
+                "open": 2002.0,
+                "high": 2010.0,
+                "low": 2000.0,
+                "close": 2008.0,
+                "tick_volume": 150.0,
+                "time": 1720000300,
+            },
+        ]
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        bars = gateway.get_bars(gw.TIMEFRAME_H1, 2)
+        assert list(bars.close) == [2002.0, 2008.0]
+        assert list(bars.tick_volume) == [100.0, 150.0]
+        assert len(bars.time_utc) == 2
+
+    def test_get_bars_raises_when_no_data(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        with pytest.raises(gw.BrokerConnectionError):
+            gateway.get_bars(gw.TIMEFRAME_H1, 10)
+
+    def test_submit_market_order_buy_at_ask(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1, bid=2009.5, ask=2010.0)
+        fake_mt5.next_order_ticket = 4242
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        position = gateway.submit_market_order(
+            side="BUY", volume=0.05, stop_loss=2000.0, take_profit=None, comment="co-1"
+        )
+        assert position.ticket == 4242
+        assert position.side == "BUY"
+        assert position.price_open == 2010.0
+        request = fake_mt5.last_request
+        assert request is not None
+        assert request["type"] == fake_mt5.ORDER_TYPE_BUY
+        assert request["sl"] == 2000.0
+        assert "tp" not in request
+
+    def test_submit_market_order_sell_at_bid(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1, bid=2009.5, ask=2010.0)
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        position = gateway.submit_market_order(
+            side="SELL", volume=0.05, stop_loss=2020.0, take_profit=1990.0, comment="co-2"
+        )
+        assert position.side == "SELL"
+        assert position.price_open == 2009.5
+        request = fake_mt5.last_request
+        assert request is not None
+        assert request["type"] == fake_mt5.ORDER_TYPE_SELL
+        assert request["tp"] == 1990.0
+
+    def test_submit_market_order_rejected_raises(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1, bid=2009.5, ask=2010.0)
+        fake_mt5.next_retcode = 10013
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        with pytest.raises(gw.BrokerOrderRejectedError):
+            gateway.submit_market_order(
+                side="BUY", volume=0.05, stop_loss=2000.0, take_profit=None, comment="co-3"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Simulated socket/HTTP disconnections (news/news_engine.py)
 # ---------------------------------------------------------------------------
 

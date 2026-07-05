@@ -73,8 +73,23 @@ class FakePosition:
 
 
 class FakeOrderResult:
-    def __init__(self, retcode: int) -> None:
+    def __init__(self, retcode: int, order: int = 0) -> None:
         self.retcode = retcode
+        self.order = order
+
+
+class FakeAccountInfo:
+    def __init__(
+        self,
+        balance: float = 10_000.0,
+        equity: float = 10_000.0,
+        margin: float = 0.0,
+        margin_free: float = 10_000.0,
+    ) -> None:
+        self.balance = balance
+        self.equity = equity
+        self.margin = margin
+        self.margin_free = margin_free
 
 
 class FakeMT5:
@@ -102,6 +117,9 @@ class FakeMT5:
         self.last_error_value: tuple[int, str] = (0, "no error")
         self.last_request: dict[str, Any] | None = None
         self.next_retcode: int = 10009
+        self.next_order_ticket: int = 0
+        self.account: FakeAccountInfo = FakeAccountInfo()
+        self.rates: dict[int, list[dict[str, float]]] = {}
 
     def symbol_info(self, name: str) -> FakeSymbolInfo | None:
         return self.symbols.get(name)
@@ -137,7 +155,15 @@ class FakeMT5:
 
     def order_send(self, request: dict[str, Any]) -> FakeOrderResult:
         self.last_request = request
-        return FakeOrderResult(self.next_retcode)
+        return FakeOrderResult(self.next_retcode, order=self.next_order_ticket)
+
+    def account_info(self) -> FakeAccountInfo | None:
+        return self.account
+
+    def copy_rates_from_pos(
+        self, symbol: str, timeframe: int, start: int, count: int
+    ) -> tuple[dict[str, float], ...] | None:
+        return tuple(self.rates.get(timeframe, ()))
 
 
 @pytest.fixture

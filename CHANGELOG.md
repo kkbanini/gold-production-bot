@@ -23,9 +23,79 @@ may contain breaking changes if, and only if, the ADR introducing the change is 
 
 ## [Unreleased]
 
-Nothing yet. Phase 10 will introduce `main.py` (the master FSM
-orchestration loop), the 200ms processing-cap metric, and the
-5%/10%/20% daily/weekly/monthly drawdown hard locks.
+Nothing scheduled. This was the final phase of the original 10-phase
+roadmap — see `docs/ARCHITECTURE_SUMMARY.md` for the consolidated list of
+what remains before a live/demo run.
+
+## [0.11.0] - 2026-07-05
+
+### Added — Phase 10: Final Integration & Main FSM Orchestration Loop
+
+- `main.py` — the master FSM orchestration loop:
+  - `run_bar_close_cycle()` — pure decision function (no I/O): checks the
+    200ms processing cap (logs, doesn't halt), the 5%/10%/20%
+    daily/weekly/monthly drawdown hard locks (halts new entries, never
+    auto-resumes), the news blackout, and either proposes a sized new
+    entry or evaluates partial-close/breakeven/trailing-stop actions for
+    an existing position.
+  - `decide_entry_signal()` — combines the master trend filter with the
+    three independent entry triggers (breakout/pullback/wick-fill) into
+    one `BUY`/`SELL`/`NONE` decision, requiring trend confirmation, no
+    news lock, and at least one trigger agreeing with the trend direction.
+  - `seconds_until_next_bar_close()`, `evaluate_processing_time()`,
+    `check_drawdown_breach()` — the individually-testable pieces above.
+  - `bootstrap_system()`/`main()` — the impure I/O layer: boot sequence
+    (config → storage → broker connect + position audit), then loop
+    forever, acting once per M5 bar close. Reviewed but **not executed**
+    in this environment — no live MT5 credentials exist here, and
+    connecting to even a demo account requires the user's real-time
+    presence, not an autonomous turn (see `docs/ARCHITECTURE_SUMMARY.md`
+    §7).
+- `broker/mt5_gateway.py` additions needed to make the loop real:
+  `AccountState`/`get_account_state()` (the drawdown checks' input),
+  `BarSeries`/`get_bars()` (D1/H4/H1 bar fetching, with `TIMEFRAME_*`
+  constants re-exported so `main.py` never imports `MetaTrader5` itself),
+  and `submit_market_order()` (opens new positions — does **not**
+  implement the pre-trade risk gate or slippage guard, RQ-009/RQ-010,
+  still an open gap).
+- `docs/ARCHITECTURE_SUMMARY.md` — capstone document consolidating every
+  phase's flagged design choices, the full list of known gaps (no risk
+  gate, no backtester, equity-baseline rollover not wired, news feed not
+  connected in the live loop, no `ENVIRONMENT_MODE` broker-side
+  cross-check), and a concrete checklist before a first live/demo run.
+- `tests/test_unit.py`/`tests/test_integration.py` extended with 34 new
+  tests covering `main.py`'s pure logic and the three new broker methods.
+
+### Fixed — a real bug caught in this phase's own wiring
+
+`_fetch_market_snapshot()`'s first draft passed `h1_bars.close` as both
+the price array and the pullback trigger's `reference_level` — since
+`detect_pullback()`'s bullish condition requires `level < close` and both
+were the same array, this comparison (`close[-1] < close[-1]`) could never
+be `True`, silently disabling the pullback signal in live operation
+(breakout/wick-fill would still work). Caught by re-reading the wiring
+against `strategy/trend_filter.py`'s own logic — no test exercised this,
+since it's in the untested impure I/O layer. Fixed by computing the H1
+EMA(40) directly (`indicators.math_engine.ema`) and passing that as the
+reference level, matching what `trend_filter` itself evaluates alignment
+against. Documented in `docs/ARCHITECTURE_SUMMARY.md` §4 as a cautionary
+note about that layer's test coverage.
+
+### Verified
+
+- `ruff check .` and `ruff format --check .` — all checks passed (27 files).
+- `mypy --strict .` — no issues found in 27 source files (mypy 2.1.0
+  locally, per the Phase 4 toolchain note).
+- `pytest --cov=. --cov-report=term-missing --cov-fail-under=90` — **131
+  tests pass, 95.68% total coverage**. `main.py` itself sits at 78%
+  coverage — the uncovered lines are exactly `bootstrap_system()`,
+  `_fetch_market_snapshot()`, and `main()`'s loop body, i.e. precisely the
+  impure I/O layer intentionally not executed in this environment; every
+  pure decision-logic branch in `run_bar_close_cycle()` and
+  `decide_entry_signal()` is covered, including the drawdown-halt
+  transition, the halted-stays-halted invariant, both the partial-close
+  and trailing-stop position-management branches, and the
+  processing-cap-breach log line.
 
 ## [0.10.0] - 2026-07-05
 

@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 import broker.mt5_gateway as gw
+import main as orchestrator
 from config.config_manager import ConfigManager, ConfigurationError
 from execution.position_manager import (
     PositionState,
@@ -40,11 +41,14 @@ from risk.risk_manager import calculate_compounded_lot_size, clamp_lot_size
 from storage.db_engine import checkpoint_wal, connect, initialize_schema
 from storage.state_manager import TradeLedgerEntry
 from strategy.execution_triggers import (
+    BreakoutSignal,
+    PullbackSignal,
+    WickFillResult,
     analyze_wick_fill,
     detect_breakout,
     detect_pullback,
 )
-from strategy.trend_filter import evaluate_master_trend
+from strategy.trend_filter import TrendAlignment, evaluate_master_trend
 from tests.conftest import FakeMT5, FakeSymbolInfo
 
 # ---------------------------------------------------------------------------
@@ -940,3 +944,372 @@ class TestSelfLearningPureLogic:
     def test_bootstrap_default_iteration_count(self) -> None:
         result = run_monte_carlo_bootstrap([1.0, 2.0], rng=random.Random(1))
         assert result.iterations == 1000
+
+
+# ---------------------------------------------------------------------------
+# main.py (Phase 10 orchestration: bar-close cadence, processing cap,
+# drawdown breakers, entry-signal combination)
+# ---------------------------------------------------------------------------
+
+
+class TestBarCloseCadence:
+    def test_seconds_until_next_m5_close(self) -> None:
+        now = datetime(2026, 7, 4, 12, 3, 30, tzinfo=timezone.utc)
+        assert orchestrator.seconds_until_next_bar_close(now, 5) == 90.0
+
+    def test_exactly_on_boundary_returns_zero(self) -> None:
+        now = datetime(2026, 7, 4, 12, 5, 0, tzinfo=timezone.utc)
+        assert orchestrator.seconds_until_next_bar_close(now, 5) == 0.0
+
+    def test_naive_datetime_raises(self) -> None:
+        with pytest.raises(ValueError, match="timezone-aware"):
+            orchestrator.seconds_until_next_bar_close(datetime(2026, 7, 4, 12, 3, 30))
+
+
+class TestProcessingCap:
+    def test_under_cap(self) -> None:
+        result = orchestrator.evaluate_processing_time(0.05)
+        assert result.duration_ms == 50.0
+        assert result.exceeded_cap is False
+
+    def test_over_cap(self) -> None:
+        result = orchestrator.evaluate_processing_time(0.25)
+        assert result.duration_ms == 250.0
+        assert result.exceeded_cap is True
+
+    def test_negative_duration_raises(self) -> None:
+        with pytest.raises(ValueError, match="must be >= 0"):
+            orchestrator.evaluate_processing_time(-0.01)
+
+
+class TestDrawdownBreach:
+    @pytest.fixture
+    def baselines(self) -> orchestrator.EquityBaselines:
+        return orchestrator.EquityBaselines(
+            daily_start_equity=10_000.0,
+            weekly_start_equity=10_000.0,
+            monthly_start_equity=10_000.0,
+        )
+
+    def test_no_breach(self, baselines: orchestrator.EquityBaselines) -> None:
+        result = orchestrator.check_drawdown_breach(9_800.0, baselines)  # 2% down
+        assert result.breached == ()
+        assert result.is_halted is False
+
+    def test_daily_breach(self, baselines: orchestrator.EquityBaselines) -> None:
+        result = orchestrator.check_drawdown_breach(9_500.0, baselines)  # 5% down
+        assert orchestrator.DrawdownBreaker.DAILY in result.breached
+        assert result.is_halted is True
+
+    def test_weekly_breach(self, baselines: orchestrator.EquityBaselines) -> None:
+        result = orchestrator.check_drawdown_breach(9_000.0, baselines)  # 10% down
+        assert orchestrator.DrawdownBreaker.WEEKLY in result.breached
+
+    def test_monthly_breach(self, baselines: orchestrator.EquityBaselines) -> None:
+        result = orchestrator.check_drawdown_breach(8_000.0, baselines)  # 20% down
+        assert orchestrator.DrawdownBreaker.MONTHLY in result.breached
+
+    def test_invalid_baseline_raises(self) -> None:
+        bad_baselines = orchestrator.EquityBaselines(0.0, 10_000.0, 10_000.0)
+        with pytest.raises(ValueError, match="daily_start_equity"):
+            orchestrator.check_drawdown_breach(9_000.0, bad_baselines)
+
+    def test_negative_equity_raises(self, baselines: orchestrator.EquityBaselines) -> None:
+        with pytest.raises(ValueError, match="current_equity"):
+            orchestrator.check_drawdown_breach(-1.0, baselines)
+
+
+class TestEntryDecision:
+    def _trend(self, direction: str, adx_confirmed: bool = True) -> TrendAlignment:
+        return TrendAlignment(
+            direction=direction,  # type: ignore[arg-type]
+            d1_bullish=direction == "BULLISH",
+            h4_bullish=direction == "BULLISH",
+            h1_bullish=direction == "BULLISH",
+            adx_value=30.0 if adx_confirmed else 10.0,
+            adx_confirmed=adx_confirmed,
+        )
+
+    def _no_signal(self) -> tuple[BreakoutSignal, PullbackSignal, WickFillResult]:
+        breakout = BreakoutSignal("NONE", 0.0, False)
+        pullback = PullbackSignal("NONE", 0.0)
+        wick_fill = WickFillResult(0.0, 0.0, "NONE")
+        return breakout, pullback, wick_fill
+
+    def test_news_locked_blocks_entry(self) -> None:
+        breakout, pullback, wick_fill = self._no_signal()
+        decision = orchestrator.decide_entry_signal(
+            self._trend("BULLISH"), breakout, pullback, wick_fill, news_locked=True
+        )
+        assert decision.direction == "NONE"
+        assert "news" in decision.reason
+
+    def test_invalid_trend_blocks_entry(self) -> None:
+        breakout, pullback, wick_fill = self._no_signal()
+        decision = orchestrator.decide_entry_signal(
+            self._trend("BULLISH", adx_confirmed=False),
+            breakout,
+            pullback,
+            wick_fill,
+            news_locked=False,
+        )
+        assert decision.direction == "NONE"
+
+    def test_breakout_confirms_bullish_trend(self) -> None:
+        breakout = BreakoutSignal("BUY", 60.0, True)
+        _, pullback, wick_fill = self._no_signal()
+        decision = orchestrator.decide_entry_signal(
+            self._trend("BULLISH"), breakout, pullback, wick_fill, news_locked=False
+        )
+        assert decision.direction == "BUY"
+        assert "breakout" in decision.reason
+
+    def test_pullback_confirms_bearish_trend(self) -> None:
+        pullback = PullbackSignal("SELL", 2000.0)
+        breakout, _, wick_fill = self._no_signal()
+        decision = orchestrator.decide_entry_signal(
+            self._trend("BEARISH"), breakout, pullback, wick_fill, news_locked=False
+        )
+        assert decision.direction == "SELL"
+        assert "pullback" in decision.reason
+
+    def test_wick_fill_confirms_bullish_trend(self) -> None:
+        wick_fill = WickFillResult(0.1, 0.8, "BUY")
+        breakout, pullback, _ = self._no_signal()
+        decision = orchestrator.decide_entry_signal(
+            self._trend("BULLISH"), breakout, pullback, wick_fill, news_locked=False
+        )
+        assert decision.direction == "BUY"
+        assert "wick-fill" in decision.reason
+
+    def test_no_agreeing_trigger_blocks_entry(self) -> None:
+        breakout, pullback, wick_fill = self._no_signal()
+        decision = orchestrator.decide_entry_signal(
+            self._trend("BULLISH"), breakout, pullback, wick_fill, news_locked=False
+        )
+        assert decision.direction == "NONE"
+
+    def test_conflicting_signal_direction_ignored(self) -> None:
+        # A SELL breakout while the trend is BULLISH must not trigger an entry.
+        breakout = BreakoutSignal("SELL", 60.0, True)
+        _, pullback, wick_fill = self._no_signal()
+        decision = orchestrator.decide_entry_signal(
+            self._trend("BULLISH"), breakout, pullback, wick_fill, news_locked=False
+        )
+        assert decision.direction == "NONE"
+
+
+class TestBarCloseCycle:
+    @pytest.fixture
+    def baselines(self) -> orchestrator.EquityBaselines:
+        return orchestrator.EquityBaselines(10_000.0, 10_000.0, 10_000.0)
+
+    @pytest.fixture
+    def constraints(self) -> orchestrator.SymbolConstraints:
+        return orchestrator.SymbolConstraints(
+            point=0.01, volume_min=0.01, volume_max=100.0, volume_step=0.01, magic_number=555
+        )
+
+    def _account_state(self, equity: float) -> gw.AccountState:
+        return gw.AccountState(
+            balance=equity,
+            equity=equity,
+            margin_used=0.0,
+            margin_free=equity,
+            as_of_utc=datetime(2026, 7, 4, 12, 5, tzinfo=timezone.utc),
+        )
+
+    def _snapshot(
+        self,
+        equity: float = 10_000.0,
+        trend_direction: str = "BULLISH",
+        current_price: float | None = 2010.0,
+    ) -> orchestrator.MarketSnapshot:
+        breakout = BreakoutSignal("BUY", 60.0, True)
+        pullback = PullbackSignal("NONE", 0.0)
+        wick_fill = WickFillResult(0.0, 0.0, "NONE")
+        trend = TrendAlignment(
+            direction=trend_direction,  # type: ignore[arg-type]
+            d1_bullish=True,
+            h4_bullish=True,
+            h1_bullish=True,
+            adx_value=30.0,
+            adx_confirmed=True,
+        )
+        return orchestrator.MarketSnapshot(
+            now_utc=datetime(2026, 7, 4, 12, 5, tzinfo=timezone.utc),
+            account_state=self._account_state(equity),
+            current_price=current_price,
+            atr_value=5.0,
+            trend=trend,
+            breakout=breakout,
+            pullback=pullback,
+            wick_fill=wick_fill,
+            news_events=[],
+        )
+
+    def test_drawdown_breach_halts_and_blocks_entry(
+        self,
+        baselines: orchestrator.EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+    ) -> None:
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IDLE, position=None, halt_reason=None
+        )
+        snapshot = self._snapshot(equity=9_000.0)  # 10% down -> weekly breach
+        result = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, cycle_duration_seconds=0.05
+        )
+        assert result.context.state == orchestrator.TradingState.HALTED
+        assert result.context.halt_reason is not None
+        assert result.entry_decision is None
+
+    def test_halted_state_stays_halted_regardless_of_recovery(
+        self,
+        baselines: orchestrator.EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+    ) -> None:
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.HALTED, position=None, halt_reason="prior breach"
+        )
+        snapshot = self._snapshot(equity=10_000.0)  # fully recovered
+        result = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, cycle_duration_seconds=0.05
+        )
+        assert result.context.state == orchestrator.TradingState.HALTED
+
+    def test_idle_with_confirmed_entry_proposes_order(
+        self,
+        baselines: orchestrator.EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+    ) -> None:
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IDLE, position=None, halt_reason=None
+        )
+        snapshot = self._snapshot()
+        result = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, cycle_duration_seconds=0.05
+        )
+        assert result.entry_decision is not None
+        assert result.entry_decision.direction == "BUY"
+        assert result.entry_stop_loss is not None
+        assert result.entry_stop_loss < snapshot.current_price  # type: ignore[operator]
+        assert result.entry_volume is not None
+        assert result.position_actions == ()
+
+    def test_in_position_triggers_partial_close_at_base_tp(
+        self,
+        baselines: orchestrator.EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+    ) -> None:
+        position = PositionState(
+            ticket=1,
+            symbol="XAUUSD",
+            side="BUY",
+            volume=0.10,
+            entry_price=2000.0,
+            stop_loss=1990.0,
+            magic_number=555,
+            partial_closed=False,
+            breakeven_set=False,
+        )
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IN_POSITION, position=position, halt_reason=None
+        )
+        # Base_TP = 2000 + 5*2 = 2010, current_price=2010 in the snapshot -> triggers.
+        snapshot = self._snapshot(current_price=2010.0)
+        result = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, cycle_duration_seconds=0.05
+        )
+        assert len(result.position_actions) == 2
+        assert result.position_actions[0].action == "TRADE_ACTION_DEAL"
+        assert result.entry_decision is None
+
+    def test_in_position_after_breakeven_trails_stop(
+        self,
+        baselines: orchestrator.EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+    ) -> None:
+        # Already partial-closed + breakeven-set, so evaluate_partial_close_and_breakeven
+        # returns no actions and calculate_trailing_stop's fallback branch fires.
+        position = PositionState(
+            ticket=1,
+            symbol="XAUUSD",
+            side="BUY",
+            volume=0.05,
+            entry_price=2000.0,
+            stop_loss=2000.0,
+            magic_number=555,
+            partial_closed=True,
+            breakeven_set=True,
+        )
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IN_POSITION, position=position, halt_reason=None
+        )
+        # price rallied to 2020, ATR=5 -> candidate SL = 2020 - 1.5*5 = 2012.5 > 2000.
+        snapshot = self._snapshot(current_price=2020.0)
+        result = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, cycle_duration_seconds=0.05
+        )
+        assert len(result.position_actions) == 1
+        assert result.position_actions[0].action == "TRADE_ACTION_SLTP"
+        assert result.position_actions[0].stop_loss == 2012.5
+
+    def test_no_current_price_yields_no_action_while_in_position(
+        self,
+        baselines: orchestrator.EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+    ) -> None:
+        position = PositionState(
+            ticket=1,
+            symbol="XAUUSD",
+            side="BUY",
+            volume=0.10,
+            entry_price=2000.0,
+            stop_loss=1990.0,
+            magic_number=555,
+            partial_closed=True,
+            breakeven_set=True,
+        )
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IN_POSITION, position=position, halt_reason=None
+        )
+        snapshot = self._snapshot(current_price=None)
+        result = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, cycle_duration_seconds=0.05
+        )
+        assert result.position_actions == ()
+
+    def test_processing_cap_breach_is_logged(
+        self,
+        baselines: orchestrator.EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IDLE, position=None, halt_reason=None
+        )
+        snapshot = self._snapshot()
+        with caplog.at_level("WARNING"):
+            result = orchestrator.run_bar_close_cycle(
+                context, snapshot, baselines, constraints, cycle_duration_seconds=0.25
+            )
+        assert result.processing.exceeded_cap is True
+        assert "200ms" in caplog.text
+
+    def test_idle_signal_fires_but_no_price_yields_no_order_sizing(
+        self,
+        baselines: orchestrator.EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+    ) -> None:
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IDLE, position=None, halt_reason=None
+        )
+        snapshot = self._snapshot(current_price=None)
+        result = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, cycle_duration_seconds=0.05
+        )
+        assert result.entry_decision is not None
+        assert result.entry_decision.direction == "BUY"  # signal fires...
+        assert result.entry_stop_loss is None  # ...but no current_price to size against
+        assert result.entry_volume is None

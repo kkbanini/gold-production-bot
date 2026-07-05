@@ -11,12 +11,21 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 import MetaTrader5 as mt5
+import numpy as np
 
 from execution.position_manager import OrderActionPayload
+from indicators.math_engine import FloatArray
 from storage.state_manager import TradeLedgerEntry
+
+# Re-exported MT5 timeframe constants, so callers (e.g. main.py) never need
+# to import MetaTrader5 directly (ADR-0002/RQ-001: only broker/ may).
+TIMEFRAME_D1 = mt5.TIMEFRAME_D1
+TIMEFRAME_H4 = mt5.TIMEFRAME_H4
+TIMEFRAME_H1 = mt5.TIMEFRAME_H1
+TIMEFRAME_M5 = mt5.TIMEFRAME_M5
 
 GOLD_SYMBOL_CANDIDATES: tuple[str, ...] = (
     "XAUUSD",
@@ -101,6 +110,30 @@ class PositionAuditReport:
     @property
     def is_clean(self) -> bool:
         return not self.broker_only_positions and not self.ledger_only_entries
+
+
+@dataclass(frozen=True, slots=True)
+class AccountState:
+    """A snapshot of the connected account's balance/equity/margin."""
+
+    balance: float
+    equity: float
+    margin_used: float
+    margin_free: float
+    as_of_utc: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class BarSeries:
+    """A batch of closed bars for one timeframe, as numpy arrays ready for
+    `indicators/`/`strategy/` consumption — no `Bar`-per-element overhead."""
+
+    open: FloatArray
+    high: FloatArray
+    low: FloatArray
+    close: FloatArray
+    tick_volume: FloatArray
+    time_utc: tuple[datetime, ...]
 
 
 def resolve_gold_symbol(candidates: tuple[str, ...] = GOLD_SYMBOL_CANDIDATES) -> SymbolSpec:
@@ -357,3 +390,101 @@ class MT5Gateway:
         if payload.take_profit is not None:
             request["tp"] = payload.take_profit
         return request
+
+    def get_account_state(self) -> AccountState:
+        """Snapshot the connected account's balance/equity/margin — the
+        input `main.py`'s drawdown-breaker checks are computed from."""
+        info: Any = mt5.account_info()
+        if info is None:
+            raise BrokerConnectionError(
+                f"account_info() returned None; last_error={mt5.last_error()!r}"
+            )
+        return AccountState(
+            balance=info.balance,
+            equity=info.equity,
+            margin_used=info.margin,
+            margin_free=info.margin_free,
+            as_of_utc=datetime.now(timezone.utc),
+        )
+
+    def get_bars(self, timeframe: int, count: int) -> BarSeries:
+        """Fetch the last `count` closed bars for `timeframe` (one of the
+        `TIMEFRAME_*` constants re-exported by this module) on the resolved
+        Gold symbol."""
+        rates: Any = mt5.copy_rates_from_pos(self.symbol_spec.name, timeframe, 0, count)
+        if rates is None or len(rates) == 0:
+            raise BrokerConnectionError(
+                f"copy_rates_from_pos returned no data for {self.symbol_spec.name!r} "
+                f"(timeframe={timeframe}, count={count}); last_error={mt5.last_error()!r}"
+            )
+        return BarSeries(
+            open=np.array([bar["open"] for bar in rates], dtype=np.float64),
+            high=np.array([bar["high"] for bar in rates], dtype=np.float64),
+            low=np.array([bar["low"] for bar in rates], dtype=np.float64),
+            close=np.array([bar["close"] for bar in rates], dtype=np.float64),
+            tick_volume=np.array([bar["tick_volume"] for bar in rates], dtype=np.float64),
+            time_utc=tuple(datetime.fromtimestamp(bar["time"], tz=timezone.utc) for bar in rates),
+        )
+
+    def submit_market_order(
+        self,
+        side: Literal["BUY", "SELL"],
+        volume: float,
+        stop_loss: float,
+        take_profit: float | None,
+        comment: str,
+    ) -> BrokerPosition:
+        """Submit a new market order to open a position.
+
+        This opens a *new* position (docs/API_SPEC.md's `submit_order`);
+        it does not perform the pre-trade risk gate, slippage guard, or
+        duplicate-submission idempotency check (RQ-009/RQ-010, RR-007) —
+        those remain the caller's responsibility (`main.py`), and are not
+        yet a dedicated `execution/` risk gate module (still an open gap,
+        see `docs/TRACEABILITY_MATRIX.md`).
+        """
+        tick = mt5.symbol_info_tick(self.symbol_spec.name)
+        if tick is None:
+            raise BrokerOrderRejectedError(
+                f"cannot open position: no tick available for {self.symbol_spec.name!r}"
+            )
+        order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+        price = tick.ask if side == "BUY" else tick.bid
+
+        request: dict[str, Any] = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol_spec.name,
+            "volume": volume,
+            "type": order_type,
+            "price": price,
+            "sl": stop_loss,
+            "deviation": CLOSE_DEVIATION_POINTS,
+            "magic": self._magic_number,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        if take_profit is not None:
+            request["tp"] = take_profit
+
+        result: Any = mt5.order_send(request)
+        retcode = getattr(result, "retcode", None)
+        if result is None or retcode != mt5.TRADE_RETCODE_DONE:
+            raise BrokerOrderRejectedError(
+                f"order_send failed opening a new {side} position: "
+                f"retcode={retcode!r}, last_error={mt5.last_error()!r}"
+            )
+
+        return BrokerPosition(
+            ticket=result.order,
+            symbol=self.symbol_spec.name,
+            side=side,
+            volume=volume,
+            price_open=price,
+            price_current=price,
+            stop_loss=stop_loss,
+            take_profit=take_profit if take_profit is not None else 0.0,
+            profit=0.0,
+            magic=self._magic_number,
+            opened_at_utc=datetime.now(timezone.utc),
+        )
