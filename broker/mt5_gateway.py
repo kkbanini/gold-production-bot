@@ -531,10 +531,19 @@ class MT5Gateway:
         )
 
     def get_bars(self, timeframe: int, count: int) -> BarSeries:
-        """Fetch the last `count` closed bars for `timeframe` (one of the
+        """Fetch the last `count` *closed* bars for `timeframe` (one of the
         `TIMEFRAME_*` constants re-exported by this module) on the resolved
-        Gold symbol."""
-        rates: Any = mt5.copy_rates_from_pos(self.symbol_spec.name, timeframe, 0, count)
+        Gold symbol.
+
+        Starts at position 1, not 0: MT5's position 0 is the currently
+        *forming* bar, and including it silently violated this docstring's
+        closed-bars contract — every signal consumer (`strategy/`'s
+        2-candle breakout "on the latest two closed bars", the wick-fill
+        ratios, ATR) was evaluating a partially-formed bar as if it were
+        final. Live price for entry-stop/trailing math comes from
+        `get_current_price()` (the latest tick), never from a forming
+        bar's close."""
+        rates: Any = mt5.copy_rates_from_pos(self.symbol_spec.name, timeframe, 1, count)
         if rates is None or len(rates) == 0:
             raise BrokerConnectionError(
                 f"copy_rates_from_pos returned no data for {self.symbol_spec.name!r} "
@@ -548,6 +557,20 @@ class MT5Gateway:
             tick_volume=np.array([bar["tick_volume"] for bar in rates], dtype=np.float64),
             time_utc=tuple(datetime.fromtimestamp(bar["time"], tz=timezone.utc) for bar in rates),
         )
+
+    def get_current_price(self) -> float:
+        """The resolved Gold symbol's latest bid — the live price reference
+        `main.py` uses for entry-stop and trailing-stop math. Bid, not ask
+        or mid, because MT5 bars are bid-built, so this stays on the same
+        price basis as every bar-derived indicator (ATR/EMA) it's combined
+        with."""
+        tick = mt5.symbol_info_tick(self.symbol_spec.name)
+        if tick is None:
+            raise BrokerConnectionError(
+                f"symbol_info_tick returned no tick for {self.symbol_spec.name!r}; "
+                f"last_error={mt5.last_error()!r}"
+            )
+        return float(tick.bid)
 
     def submit_market_order(
         self,

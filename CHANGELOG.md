@@ -33,6 +33,27 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Fixed — Closed-Bar Signal Evaluation
+
+- `broker/mt5_gateway.py` — `get_bars()` now fetches from MT5 position 1
+  instead of 0: position 0 is the currently *forming* bar, so every
+  signal consumer (the 2-candle breakout `docs/RESEARCH.md` §8.1 defines
+  "on the latest two closed bars", the wick-fill ratios, ATR, each
+  timeframe's EMA-vs-close trend check) was silently evaluating a
+  partially-formed bar as if it were final — the documented strategy was
+  never actually the one running. New `get_current_price()` (latest tick
+  bid — bid, not ask/mid, because MT5 bars are bid-built, keeping the
+  live price on the same basis as every bar-derived indicator) supplies
+  the live price that `h1_bars.close[-1]` previously leaked from the
+  forming bar.
+- `main.py` — `_fetch_market_snapshot()`'s `current_price` now comes from
+  `gateway.get_current_price()`, since the latest *closed* H1 bar's close
+  can be up to an hour old — stale for entry-stop/trailing math.
+- `tests/conftest.py` — `FakeMT5.copy_rates_from_pos` now honors the
+  `start` argument with real MT5 semantics (position 0 = the last seeded
+  element, i.e. the forming bar) instead of ignoring it, so the
+  closed-bars contract is actually pinned by tests.
+
 ### Fixed — Equity Baseline Rollover
 
 - `risk/drawdown_fsm.py` — `seed_equity_baselines()`/

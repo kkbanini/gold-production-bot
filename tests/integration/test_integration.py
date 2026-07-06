@@ -175,7 +175,7 @@ class TestBrokerAccountAndBars:
         with pytest.raises(gw.BrokerConnectionError):
             gateway.get_account_state()
 
-    def test_get_bars_returns_typed_arrays(
+    def test_get_bars_returns_typed_arrays_excluding_forming_bar(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(gw, "mt5", fake_mt5)
@@ -198,6 +198,16 @@ class TestBrokerAccountAndBars:
                 "tick_volume": 150.0,
                 "time": 1720000300,
             },
+            # The currently-forming bar (MT5 position 0) — must NOT appear
+            # in get_bars()' closed-bars result.
+            {
+                "open": 2008.0,
+                "high": 2012.0,
+                "low": 2007.0,
+                "close": 2011.0,
+                "tick_volume": 30.0,
+                "time": 1720000600,
+            },
         ]
 
         gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
@@ -206,6 +216,28 @@ class TestBrokerAccountAndBars:
         assert list(bars.close) == [2002.0, 2008.0]
         assert list(bars.tick_volume) == [100.0, 150.0]
         assert len(bars.time_utc) == 2
+
+    def test_get_current_price_returns_latest_bid(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1, bid=2009.5, ask=2010.0)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        assert gateway.get_current_price() == 2009.5
+
+    def test_get_current_price_raises_when_no_tick(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        del fake_mt5.ticks["XAUUSD"]
+        with pytest.raises(gw.BrokerConnectionError):
+            gateway.get_current_price()
 
     def test_get_bars_raises_when_no_data(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch

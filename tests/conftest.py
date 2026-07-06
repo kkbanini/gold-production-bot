@@ -163,7 +163,14 @@ class FakeMT5:
     def copy_rates_from_pos(
         self, symbol: str, timeframe: int, start: int, count: int
     ) -> tuple[dict[str, float], ...] | None:
-        return tuple(self.rates.get(timeframe, ()))
+        # Mirrors real MT5 semantics: the seeded list is oldest-first with
+        # the *last* element at position 0 (the currently-forming bar);
+        # `start` counts back from it, so start=1 skips the forming bar.
+        series = self.rates.get(timeframe, ())
+        end = len(series) - start
+        if end <= 0:
+            return tuple()
+        return tuple(series[max(0, end - count) : end])
 
 
 @pytest.fixture

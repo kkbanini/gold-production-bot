@@ -606,7 +606,10 @@ def _fetch_market_snapshot(
     )
     wick_fill = analyze_wick_fill(h1_bars.open, h1_bars.high, h1_bars.low, h1_bars.close)
     account_state = gateway.get_account_state()
-    tick_price = float(h1_bars.close[-1])
+    # Live tick, NOT h1_bars.close[-1]: get_bars() now returns closed bars
+    # only, so the latest bar close can be up to an hour old — stale for
+    # entry-stop/trailing math.
+    tick_price = gateway.get_current_price()
 
     return MarketSnapshot(
         now_utc=datetime.now(timezone.utc),
