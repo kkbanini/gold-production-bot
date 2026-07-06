@@ -33,6 +33,24 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Fixed — Order Comments Clamped to the MT5 Wrapper's Real Length Limit
+
+- `broker/mt5_gateway.py` — every order-request builder now clamps the
+  `comment` field to `MAX_ORDER_COMMENT_LENGTH` (25). The MetaTrader5
+  Python wrapper rejects long comments outright (`order_send()` returns
+  `None`, `last_error` `(-2, 'Invalid "comment" argument')`) before
+  anything reaches the broker, and `main.py` passes a UUIDv4
+  `client_order_id` (36 chars) as the comment on every real entry — so
+  the first-ever live entry (a short-term one) crashed the process, and
+  the regular entry path carried the same latent bug (it had simply
+  never fired live before). The real limit was empirically bisected
+  against `MetaTrader5==5.0.4500` on a live demo connection: 29 chars
+  accepted, 30+ rejected — NOT the 31 MT5's own docs suggest — hence 25
+  with margin. The full client_order_id is still recorded in the Event
+  Store; the broker-side comment is informational only. Verified live:
+  a full-UUID-comment order opened (SL/TP intact, short-term magic) and
+  closed cleanly.
+
 ### Added — Short-Term (Scalp) Trading Mode
 
 - New `TRADING_MODE` env var (`WAIT_FOR_CONDITIONS`/`SHORT_TERM`/`BOTH`,

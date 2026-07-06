@@ -329,6 +329,27 @@ class TestBrokerAccountAndBars:
         assert position.magic == 999
         assert position.take_profit == 2020.0
 
+    def test_submit_market_order_clamps_uuid_comment_to_mt5_limit(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # main.py passes a UUIDv4 client_order_id (36 chars) as the broker
+        # comment; MT5 rejects comments over 31 chars with
+        # (-2, 'Invalid "comment" argument') before sending anything.
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1, bid=2009.5, ask=2010.0)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        uuid_comment = "4818d303-ee8a-4f59-aa82-8b6d7add4a14"
+        assert len(uuid_comment) > gw.MAX_ORDER_COMMENT_LENGTH
+        gateway.submit_market_order(
+            side="BUY", volume=0.05, stop_loss=2000.0, take_profit=None, comment=uuid_comment
+        )
+        assert fake_mt5.last_request is not None
+        sent_comment = fake_mt5.last_request["comment"]
+        assert len(sent_comment) == gw.MAX_ORDER_COMMENT_LENGTH
+        assert sent_comment == uuid_comment[: gw.MAX_ORDER_COMMENT_LENGTH]
+
     def test_submit_market_order_sell_at_bid(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -57,6 +57,21 @@ WEEKEND_REOPEN_HOUR_UTC = 22
 # (RQ-010, RR-006) is a later-phase concern.
 CLOSE_DEVIATION_POINTS = 20
 
+# The MetaTrader5 Python wrapper rejects long order comments outright —
+# order_send()/order_check() return None with last_error
+# (-2, 'Invalid "comment" argument') before anything reaches the broker.
+# Empirically bisected against MetaTrader5==5.0.4500 on a live demo
+# connection: 29 chars accepted, 30+ rejected — NOT the 31 chars MT5's
+# own docs suggest, so this clamps to 25 for margin rather than riding
+# the exact observed boundary. main.py passes a UUIDv4 client_order_id
+# (36 chars) as the comment; the full id is always preserved in the
+# storage/ Event Store — the broker-side comment is informational only.
+MAX_ORDER_COMMENT_LENGTH = 25
+
+
+def _clamp_comment(comment: str) -> str:
+    return comment[:MAX_ORDER_COMMENT_LENGTH]
+
 
 class BrokerConnectionError(Exception):
     """Raised when connecting to the MT5 terminal fails after backoff is exhausted."""
@@ -505,7 +520,7 @@ class MT5Gateway:
             "price": closing_price,
             "deviation": CLOSE_DEVIATION_POINTS,
             "magic": payload.magic,
-            "comment": payload.comment,
+            "comment": _clamp_comment(payload.comment),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
@@ -516,7 +531,7 @@ class MT5Gateway:
             "position": payload.position_ticket,
             "symbol": payload.symbol,
             "magic": payload.magic,
-            "comment": payload.comment,
+            "comment": _clamp_comment(payload.comment),
         }
         if payload.stop_loss is not None:
             request["sl"] = payload.stop_loss
@@ -624,7 +639,7 @@ class MT5Gateway:
             "sl": stop_loss,
             "deviation": CLOSE_DEVIATION_POINTS,
             "magic": target_magic,
-            "comment": comment,
+            "comment": _clamp_comment(comment),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
