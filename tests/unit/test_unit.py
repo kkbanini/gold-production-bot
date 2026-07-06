@@ -32,6 +32,7 @@ from execution.position_manager import (
     EMERGENCY_LIQUIDATION_COMMENT,
     PositionState,
     build_emergency_liquidation_action,
+    build_short_term_liquidation_action,
     calculate_base_take_profit,
     calculate_trailing_stop,
     evaluate_partial_close_and_breakeven,
@@ -84,7 +85,12 @@ from strategy.execution_triggers import (
     detect_breakout,
     detect_pullback,
 )
-from strategy.trend_filter import TrendAlignment, evaluate_master_trend
+from strategy.trend_filter import (
+    ShortTermTrendAlignment,
+    TrendAlignment,
+    evaluate_master_trend,
+    evaluate_short_term_trend,
+)
 from tests.conftest import FakeMT5, FakePosition, FakeSymbolInfo, FakeTick
 
 # ---------------------------------------------------------------------------
@@ -100,6 +106,8 @@ class TestConfigManager:
         "ECONOMIC_CALENDAR_API_KEY": "abc123",
         "STRATEGY_MAGIC_NUMBER": "987654",
         "ENVIRONMENT_MODE": "DEMO",
+        "TRADING_MODE": "WAIT_FOR_CONDITIONS",
+        "SHORT_TERM_MAGIC_NUMBER": "987655",
     }
 
     def _clear_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -127,6 +135,36 @@ class TestConfigManager:
         assert cfg.mt5_login == 12345
         assert cfg.strategy_magic_number == 987654
         assert cfg.environment_mode == "DEMO"
+        assert cfg.trading_mode == "WAIT_FOR_CONDITIONS"
+        assert cfg.short_term_magic_number == 987655
+
+    def test_invalid_trading_mode_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("TRADING_MODE", "TURBO")
+        with pytest.raises(ConfigurationError, match="TRADING_MODE"):
+            ConfigManager.load(env_file="nonexistent.env")
+
+    def test_short_term_magic_number_equal_to_strategy_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._clear_env(monkeypatch)
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("SHORT_TERM_MAGIC_NUMBER", "987654")
+        with pytest.raises(ConfigurationError, match="SHORT_TERM_MAGIC_NUMBER"):
+            ConfigManager.load(env_file="nonexistent.env")
+
+    def test_non_integer_short_term_magic_number_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._clear_env(monkeypatch)
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("SHORT_TERM_MAGIC_NUMBER", "not-a-number")
+        with pytest.raises(ConfigurationError, match="SHORT_TERM_MAGIC_NUMBER"):
+            ConfigManager.load(env_file="nonexistent.env")
 
     def test_non_integer_mt5_login_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._clear_env(monkeypatch)
@@ -182,12 +220,36 @@ class TestConfigValidator:
         "ECONOMIC_CALENDAR_API_KEY": "abc123",
         "STRATEGY_MAGIC_NUMBER": "555",
         "ENVIRONMENT_MODE": "LIVE",
+        "TRADING_MODE": "BOTH",
+        "SHORT_TERM_MAGIC_NUMBER": "556",
     }
 
     def test_validate_returns_typed_tuple(self) -> None:
         validator = ConfigValidator()
-        mt5_login, magic_number, mode = validator.validate(self.VALID_ENV)
-        assert (mt5_login, magic_number, mode) == (1, 555, "LIVE")
+        mt5_login, magic_number, mode, trading_mode, short_term_magic = validator.validate(
+            self.VALID_ENV
+        )
+        assert (mt5_login, magic_number, mode, trading_mode, short_term_magic) == (
+            1,
+            555,
+            "LIVE",
+            "BOTH",
+            556,
+        )
+
+    def test_check_trading_mode_valid_passes(self) -> None:
+        assert ConfigValidator().check_trading_mode(self.VALID_ENV) == "BOTH"
+
+    def test_check_trading_mode_invalid_raises(self) -> None:
+        with pytest.raises(ConfigurationError, match="TRADING_MODE"):
+            ConfigValidator().check_trading_mode({**self.VALID_ENV, "TRADING_MODE": "TURBO"})
+
+    def test_check_magic_numbers_distinct_passes_when_different(self) -> None:
+        ConfigValidator().check_magic_numbers_distinct(555, 556)
+
+    def test_check_magic_numbers_distinct_raises_when_equal(self) -> None:
+        with pytest.raises(ConfigurationError, match="SHORT_TERM_MAGIC_NUMBER"):
+            ConfigValidator().check_magic_numbers_distinct(555, 555)
 
     def test_check_presence_passes_silently_when_complete(self) -> None:
         ConfigValidator().check_presence(self.VALID_ENV)
@@ -808,6 +870,39 @@ class TestTrendFilter:
             evaluate_master_trend(
                 d1_close[:50], h4_high, h4_low, h4_close, h1_high, h1_low, h1_close
             )
+
+
+class TestShortTermTrendFilter:
+    """`evaluate_short_term_trend()` — the short-term mode's relaxed,
+    H1-only trend check (no D1/H4 alignment requirement, lower ADX bar)."""
+
+    def test_bullish_h1_only_is_valid(self) -> None:
+        h1_high, h1_low, h1_close = _uptrend(67, 1800, 2.0, 3)
+        result = evaluate_short_term_trend(h1_high, h1_low, h1_close)
+        assert result.direction == "BULLISH"
+        assert result.h1_bullish is True
+        assert result.adx_confirmed is True
+        assert result.is_valid is True
+
+    def test_bearish_h1_only_is_valid(self) -> None:
+        h1_high, h1_low, h1_close = _downtrend(67, 2200, 2.0, 6)
+        result = evaluate_short_term_trend(h1_high, h1_low, h1_close)
+        assert result.direction == "BEARISH"
+        assert result.h1_bearish is True
+        assert result.is_valid is True
+
+    def test_choppy_market_not_adx_confirmed(self) -> None:
+        h1_high, h1_low, h1_close = _choppy(67, 1950, 12)
+        result = evaluate_short_term_trend(h1_high, h1_low, h1_close)
+        assert result.adx_confirmed is False
+        assert result.is_valid is False
+
+    def test_does_not_require_d1_or_h4_data(self) -> None:
+        # Only 3 positional args (H1 series) — this would be a TypeError
+        # if the function silently required higher-timeframe data too.
+        h1_high, h1_low, h1_close = _uptrend(67, 1800, 2.0, 3)
+        result = evaluate_short_term_trend(h1_high, h1_low, h1_close)
+        assert isinstance(result, ShortTermTrendAlignment)
 
 
 # ---------------------------------------------------------------------------
@@ -2300,6 +2395,19 @@ class TestBuildEmergencyLiquidationAction:
         assert action.comment == EMERGENCY_LIQUIDATION_COMMENT
 
 
+class TestBuildShortTermLiquidationAction:
+    def test_full_volume_close_deal_from_scalar_fields(self) -> None:
+        action = build_short_term_liquidation_action(
+            ticket=99, symbol="XAUUSD", magic_number=777, volume=0.01
+        )
+        assert action.action == "TRADE_ACTION_DEAL"
+        assert action.position_ticket == 99
+        assert action.symbol == "XAUUSD"
+        assert action.magic == 777
+        assert action.volume == 0.01
+        assert action.comment == EMERGENCY_LIQUIDATION_COMMENT
+
+
 class TestEntryDecision:
     def _trend(self, direction: str, adx_confirmed: bool = True) -> TrendAlignment:
         return TrendAlignment(
@@ -2380,7 +2488,86 @@ class TestEntryDecision:
         assert decision.direction == "NONE"
 
 
-class TestBarCloseCycle:
+class TestShortTermEntrySignal:
+    """`decide_short_term_entry_signal()` — structurally identical to
+    `decide_entry_signal()` (same `_select_trigger_signal()` tail), gated
+    on `ShortTermTrendAlignment.is_valid` instead."""
+
+    def _short_trend(self, direction: str, adx_confirmed: bool = True) -> ShortTermTrendAlignment:
+        return ShortTermTrendAlignment(
+            direction=direction,  # type: ignore[arg-type]
+            h1_bullish=direction == "BULLISH",
+            h1_bearish=direction == "BEARISH",
+            adx_value=20.0 if adx_confirmed else 5.0,
+            adx_confirmed=adx_confirmed,
+        )
+
+    def _no_signal(self) -> tuple[BreakoutSignal, PullbackSignal, WickFillResult]:
+        breakout = BreakoutSignal("NONE", 0.0, False)
+        pullback = PullbackSignal("NONE", 0.0)
+        wick_fill = WickFillResult(0.0, 0.0, "NONE")
+        return breakout, pullback, wick_fill
+
+    def test_news_locked_blocks_entry(self) -> None:
+        breakout, pullback, wick_fill = self._no_signal()
+        decision = orchestrator.decide_short_term_entry_signal(
+            self._short_trend("BULLISH"), breakout, pullback, wick_fill, news_locked=True
+        )
+        assert decision.direction == "NONE"
+        assert "news" in decision.reason
+
+    def test_invalid_trend_blocks_entry(self) -> None:
+        breakout, pullback, wick_fill = self._no_signal()
+        decision = orchestrator.decide_short_term_entry_signal(
+            self._short_trend("BULLISH", adx_confirmed=False),
+            breakout,
+            pullback,
+            wick_fill,
+            news_locked=False,
+        )
+        assert decision.direction == "NONE"
+
+    def test_breakout_confirms_bullish_short_term_trend(self) -> None:
+        breakout = BreakoutSignal("BUY", 60.0, True)
+        _, pullback, wick_fill = self._no_signal()
+        decision = orchestrator.decide_short_term_entry_signal(
+            self._short_trend("BULLISH"), breakout, pullback, wick_fill, news_locked=False
+        )
+        assert decision.direction == "BUY"
+        assert "breakout" in decision.reason
+
+    def test_pullback_confirms_bearish_short_term_trend(self) -> None:
+        pullback = PullbackSignal("SELL", 2000.0)
+        breakout, _, wick_fill = self._no_signal()
+        decision = orchestrator.decide_short_term_entry_signal(
+            self._short_trend("BEARISH"), breakout, pullback, wick_fill, news_locked=False
+        )
+        assert decision.direction == "SELL"
+        assert "pullback" in decision.reason
+
+    def test_wick_fill_confirms_bullish_short_term_trend(self) -> None:
+        wick_fill = WickFillResult(0.1, 0.8, "BUY")
+        breakout, pullback, _ = self._no_signal()
+        decision = orchestrator.decide_short_term_entry_signal(
+            self._short_trend("BULLISH"), breakout, pullback, wick_fill, news_locked=False
+        )
+        assert decision.direction == "BUY"
+        assert "wick-fill" in decision.reason
+
+    def test_no_agreeing_trigger_blocks_entry(self) -> None:
+        breakout, pullback, wick_fill = self._no_signal()
+        decision = orchestrator.decide_short_term_entry_signal(
+            self._short_trend("BULLISH"), breakout, pullback, wick_fill, news_locked=False
+        )
+        assert decision.direction == "NONE"
+
+
+class _BarCloseCycleHelpers:
+    """Shared fixtures/helpers for `TestBarCloseCycle` and
+    `TestBarCloseCycleShortTermMode` — deliberately NOT `Test`-prefixed so
+    pytest doesn't collect it as its own (empty) test class, and neither
+    subclass re-runs the other's tests via inheritance."""
+
     @pytest.fixture
     def baselines(self) -> EquityBaselines:
         return EquityBaselines(10_000.0, 10_000.0, 10_000.0)
@@ -2442,6 +2629,7 @@ class TestBarCloseCycle:
         equity: float = 10_000.0,
         trend_direction: str = "BULLISH",
         current_price: float | None = 2010.0,
+        short_term_trend_direction: str | None = None,
     ) -> orchestrator.MarketSnapshot:
         breakout = BreakoutSignal("BUY", 60.0, True)
         pullback = PullbackSignal("NONE", 0.0)
@@ -2454,6 +2642,17 @@ class TestBarCloseCycle:
             adx_value=30.0,
             adx_confirmed=True,
         )
+        short_term_trend = None
+        short_term_pullback = None
+        if short_term_trend_direction is not None:
+            short_term_trend = ShortTermTrendAlignment(
+                direction=short_term_trend_direction,  # type: ignore[arg-type]
+                h1_bullish=short_term_trend_direction == "BULLISH",
+                h1_bearish=short_term_trend_direction == "BEARISH",
+                adx_value=20.0,
+                adx_confirmed=True,
+            )
+            short_term_pullback = PullbackSignal("NONE", 0.0)
         return orchestrator.MarketSnapshot(
             now_utc=datetime(2026, 7, 4, 12, 5, tzinfo=timezone.utc),
             account_state=self._account_state(equity),
@@ -2464,8 +2663,29 @@ class TestBarCloseCycle:
             pullback=pullback,
             wick_fill=wick_fill,
             news_events=[],
+            short_term_trend=short_term_trend,
+            short_term_pullback=short_term_pullback,
         )
 
+    def _broker_position(self, **overrides: object) -> gw.BrokerPosition:
+        defaults: dict[str, object] = dict(
+            ticket=99,
+            symbol="XAUUSD",
+            side="BUY",
+            volume=0.01,
+            price_open=2000.0,
+            price_current=2000.0,
+            stop_loss=1990.0,
+            take_profit=2010.0,
+            profit=0.0,
+            magic=777,
+            opened_at_utc=datetime(2026, 7, 4, 12, 0, tzinfo=timezone.utc),
+        )
+        defaults.update(overrides)
+        return gw.BrokerPosition(**defaults)  # type: ignore[arg-type]
+
+
+class TestBarCloseCycle(_BarCloseCycleHelpers):
     def test_soft_lock_blocks_new_entries_while_flat(
         self,
         baselines: EquityBaselines,
@@ -2730,3 +2950,211 @@ class TestBarCloseCycle:
         assert result.entry_decision.direction == "BUY"  # signal fires...
         assert result.entry_stop_loss is None  # ...but no current_price to size against
         assert result.entry_volume is None
+
+
+class TestBarCloseCycleShortTermMode(_BarCloseCycleHelpers):
+    """`trading_mode`/`short_term_position` — the short-term mode's entry
+    evaluation, orthogonal to the regular mode's `context.position`
+    branch. Shares `TestBarCloseCycle`'s fixtures/helpers via
+    `_BarCloseCycleHelpers`, not by subclassing it."""
+
+    def test_wait_for_conditions_mode_ignores_short_term_fields_even_with_valid_signal(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        # Default trading_mode; short_term_trend populated but must be
+        # ignored entirely — this is the "existing tests keep passing
+        # unmodified" regression this design depends on.
+        context = self._idle_context()
+        snapshot = self._snapshot(short_term_trend_direction="BULLISH")
+        result = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, feature_flags, cycle_duration_seconds=0.05
+        )
+        assert result.short_term_entry_decision is None
+        assert result.short_term_entry_stop_loss is None
+        assert result.short_term_entry_take_profit is None
+        assert result.short_term_entry_volume is None
+
+    def test_short_term_mode_proposes_entry_independent_of_regular_position(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        # Regular mode is IN_POSITION (mismatched trend so it proposes no
+        # new regular entry) while short-term mode is flat and has a
+        # valid signal — both must be evaluated independently.
+        position = self._position()
+        context = self._in_position_context(position)
+        snapshot = self._snapshot(trend_direction="BEARISH", short_term_trend_direction="BULLISH")
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="SHORT_TERM",
+        )
+        assert result.short_term_entry_decision is not None
+        assert result.short_term_entry_decision.direction == "BUY"
+        assert result.short_term_entry_stop_loss == pytest.approx(2010.0 - 5.0)
+        assert result.short_term_entry_take_profit == pytest.approx(2010.0 + 5.0)
+        assert result.short_term_entry_volume == constraints.volume_min
+
+    def test_both_mode_regular_in_position_short_term_flat_no_collision(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        position = self._position()
+        context = self._in_position_context(position)
+        snapshot = self._snapshot(short_term_trend_direction="BULLISH")
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="BOTH",
+        )
+        # Regular mode still manages its own position...
+        assert result.entry_decision is None
+        # ...while short-term independently proposes its own entry.
+        assert result.short_term_entry_decision is not None
+        assert result.short_term_entry_decision.direction == "BUY"
+
+    def test_both_mode_short_term_position_already_open_skips_new_entry(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        context = self._idle_context()
+        snapshot = self._snapshot(short_term_trend_direction="BULLISH")
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="BOTH",
+            short_term_position=self._broker_position(),
+        )
+        assert result.short_term_entry_decision is None
+
+    def test_soft_lock_blocks_short_term_new_entries_too(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        context = self._idle_context()
+        snapshot = self._snapshot(
+            equity=9_300.0, short_term_trend_direction="BULLISH"
+        )  # 7% down: SOFT_LOCK
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="BOTH",
+        )
+        assert result.context.drawdown_state == DrawdownState.SOFT_LOCK
+        assert result.short_term_entry_decision is None
+
+    def test_news_lock_blocks_short_term_entries(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        context = self._idle_context()
+        snapshot = self._snapshot(short_term_trend_direction="BULLISH")
+        news_event = EconomicEvent(
+            title="Non-Farm Payrolls",
+            country="US",
+            impact="HIGH",
+            scheduled_at_utc=datetime(2026, 7, 4, 12, 5, tzinfo=timezone.utc),
+        )
+        snapshot = orchestrator.MarketSnapshot(
+            now_utc=snapshot.now_utc,
+            account_state=snapshot.account_state,
+            current_price=snapshot.current_price,
+            atr_value=snapshot.atr_value,
+            trend=snapshot.trend,
+            breakout=snapshot.breakout,
+            pullback=snapshot.pullback,
+            wick_fill=snapshot.wick_fill,
+            news_events=[news_event],
+            short_term_trend=snapshot.short_term_trend,
+            short_term_pullback=snapshot.short_term_pullback,
+        )
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="SHORT_TERM",
+        )
+        assert result.short_term_entry_decision is not None
+        assert result.short_term_entry_decision.direction == "NONE"
+
+    def test_hard_lock_liquidates_both_positions_when_flag_true(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+    ) -> None:
+        feature_flags = FeatureFlagManager(FeatureFlags(liquidate_on_hard_lock=True))
+        position = self._position()
+        context = self._in_position_context(position)
+        snapshot = self._snapshot(equity=8_500.0)  # 15% down: HARD_LOCK
+        short_term_position = self._broker_position(ticket=888, magic=777, volume=0.02)
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="BOTH",
+            short_term_position=short_term_position,
+        )
+        assert result.context.drawdown_state == DrawdownState.HARD_LOCK
+        assert len(result.position_actions) == 2
+        tickets = {action.position_ticket for action in result.position_actions}
+        assert tickets == {position.ticket, short_term_position.ticket}
+        magics = {action.magic for action in result.position_actions}
+        assert magics == {position.magic_number, short_term_position.magic}
+
+    def test_hard_lock_freezes_both_positions_when_flag_false(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        position = self._position()
+        context = self._in_position_context(position)
+        snapshot = self._snapshot(equity=8_500.0)  # 15% down: HARD_LOCK
+        short_term_position = self._broker_position()
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,  # liquidate_on_hard_lock=False by default fixture
+            cycle_duration_seconds=0.05,
+            trading_mode="BOTH",
+            short_term_position=short_term_position,
+        )
+        assert result.context.drawdown_state == DrawdownState.HARD_LOCK
+        assert result.position_actions == ()

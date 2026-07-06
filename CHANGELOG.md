@@ -33,6 +33,73 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Added — Short-Term (Scalp) Trading Mode
+
+- New `TRADING_MODE` env var (`WAIT_FOR_CONDITIONS`/`SHORT_TERM`/`BOTH`,
+  `config/config_manager.py`, mirrors `ENVIRONMENT_MODE`'s validation
+  pattern) selects between the original D1+H4+H1-aligned strategy and a
+  second, independent short-term entry mode intended to trade more often
+  for smaller, quicker gains. A new required `SHORT_TERM_MAGIC_NUMBER`
+  (validated distinct from `STRATEGY_MAGIC_NUMBER`) tags its orders so the
+  two modes' positions never collide.
+- `strategy/trend_filter.py` — `ShortTermTrendAlignment`/
+  `evaluate_short_term_trend()`: H1 direction alone (no D1/H4 alignment
+  requirement) plus a lower ADX bar (`SHORT_TERM_ADX_THRESHOLD = 15.0` vs.
+  the regular `25.0`) — deliberately relaxed to fire more often. Fully
+  independent of `TrendAlignment`/`evaluate_master_trend()`, which are
+  untouched.
+- `main.py` — `decide_short_term_entry_signal()` (shares
+  `decide_entry_signal()`'s breakout/pullback/wick-fill trigger-selection
+  tail, extracted into `_select_trigger_signal()`), fixed minimum lot size
+  (`constraints.volume_min`, not equity-compounded), and a fixed 1:1
+  ATR-based TP/SL (`SHORT_TERM_TP_ATR_MULTIPLIER`/
+  `SHORT_TERM_SL_ATR_MULTIPLIER = 1.0`) that MT5 closes automatically — so,
+  unlike the regular position, a short-term position is never tracked in
+  `FSMContext` (stateless; `main()` re-queries it from the broker every
+  cycle via the distinct magic number) and needs no per-cycle
+  trailing/partial-close management. `run_bar_close_cycle()`'s new
+  `trading_mode`/`short_term_position` parameters both default to values
+  that reproduce the exact prior behavior, so every existing test and
+  call site is unaffected. A fresh `HARD_LOCK` liquidates (or freezes,
+  symmetrically) both positions together when both are open.
+- `broker/mt5_gateway.py` — `get_open_positions_by_magic()` and
+  `submit_market_order()` both gained an optional `magic_number`
+  parameter (default: the gateway's own), so the short-term mode's orders
+  can be queried/submitted under its own distinct magic number through
+  the same shared MT5 connection, without a second `MT5Gateway` instance.
+- `execution/position_manager.py` — `build_short_term_liquidation_action()`,
+  a sibling of `build_emergency_liquidation_action()` taking plain scalar
+  fields instead of a `PositionState` (short-term positions are never
+  tracked as one), avoiding a circular import with `broker/mt5_gateway.py`
+  (which already imports `OrderActionPayload` from this module).
+
+### Flagged
+
+- Short-term fills are **not** written to `trade_ledger` (unlike the
+  regular entry path) — `audit_open_positions()`/Disaster Recovery
+  reconciliation only ever covers the regular magic number, and nothing
+  in this codebase learns when MT5 closes a position via SL/TP outside
+  `main()`'s own submission path; a ledger row would sit `OPEN` forever
+  with no way to ever mark it `CLOSED`. The audit trail
+  (`submit_with_pre_flight_ledger`'s REQUESTED/SENT/FILLED events) is
+  still recorded. Consequence: short-term trades are invisible to
+  `optimizer/self_learning.py`'s analytics. A real close-tracking
+  mechanism for this mode is unscheduled.
+
+### Verified
+
+- `ruff check .`, `mypy .` — clean across all 43 source files.
+- `pytest -q` — 309 tests pass (30 new: config validation, gateway
+  magic-number overrides, `evaluate_short_term_trend()`,
+  `decide_short_term_entry_signal()`, `build_short_term_liquidation_action()`,
+  and `TestBarCloseCycleShortTermMode`'s mode/collision/HARD_LOCK cases).
+- Verified live against the real IC Markets demo account: with the
+  regular strategy's D1+H4+H1 trend mismatched (no entry), the short-term
+  path independently found H1 ADX (19.3) above its lower 15.0 threshold
+  and proposed a real BUY entry on a pullback trigger — confirming the
+  relaxed condition fires exactly as intended where the original
+  wouldn't.
+
 ### Fixed — Closed-Bar Signal Evaluation
 
 - `broker/mt5_gateway.py` — `get_bars()` now fetches from MT5 position 1

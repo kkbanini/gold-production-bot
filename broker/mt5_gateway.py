@@ -372,15 +372,25 @@ class MT5Gateway:
         broker_time = datetime.fromtimestamp(tick.time, tz=timezone.utc)
         return broker_time - datetime.now(timezone.utc)
 
-    def get_open_positions_by_magic(self) -> list[BrokerPosition]:
-        """Return all open positions on the connected account matching this
-        gateway's magic number."""
+    def get_open_positions_by_magic(self, magic_number: int | None = None) -> list[BrokerPosition]:
+        """Return all open positions on the connected account matching
+        `magic_number` (defaults to this gateway's own magic number).
+
+        The override lets a second, distinct strategy — e.g. the
+        short-term mode's own magic number (`docs/ARCHITECTURE_SUMMARY.md`)
+        — query its own positions through the same shared MT5 terminal
+        connection, without needing a second `MT5Gateway` instance.
+        `audit_open_positions()`'s no-arg call is unaffected, so Disaster
+        Recovery reconciliation still only ever covers this gateway's own
+        magic number.
+        """
+        target_magic = self._magic_number if magic_number is None else magic_number
         positions: Any = mt5.positions_get()
         if not positions:
             return []
         matched: list[BrokerPosition] = []
         for position in positions:
-            if position.magic != self._magic_number:
+            if position.magic != target_magic:
                 continue
             side = "BUY" if position.type == mt5.POSITION_TYPE_BUY else "SELL"
             matched.append(
@@ -579,6 +589,8 @@ class MT5Gateway:
         stop_loss: float,
         take_profit: float | None,
         comment: str,
+        *,
+        magic_number: int | None = None,
     ) -> BrokerPosition:
         """Submit a new market order to open a position.
 
@@ -588,6 +600,11 @@ class MT5Gateway:
         those remain the caller's responsibility (`main.py`), and are not
         yet a dedicated `execution/` risk gate module (still an open gap,
         see `docs/TRACEABILITY_MATRIX.md`).
+
+        `magic_number` defaults to this gateway's own magic number; passing
+        an override (e.g. the short-term mode's distinct magic number,
+        `docs/ARCHITECTURE_SUMMARY.md`) submits under that value instead,
+        without needing a second `MT5Gateway` instance/connection.
         """
         tick = mt5.symbol_info_tick(self.symbol_spec.name)
         if tick is None:
@@ -596,6 +613,7 @@ class MT5Gateway:
             )
         order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
         price = tick.ask if side == "BUY" else tick.bid
+        target_magic = self._magic_number if magic_number is None else magic_number
 
         request: dict[str, Any] = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -605,7 +623,7 @@ class MT5Gateway:
             "price": price,
             "sl": stop_loss,
             "deviation": CLOSE_DEVIATION_POINTS,
-            "magic": self._magic_number,
+            "magic": target_magic,
             "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
@@ -631,6 +649,6 @@ class MT5Gateway:
             stop_loss=stop_loss,
             take_profit=take_profit if take_profit is not None else 0.0,
             profit=0.0,
-            magic=self._magic_number,
+            magic=target_magic,
             opened_at_utc=datetime.now(timezone.utc),
         )

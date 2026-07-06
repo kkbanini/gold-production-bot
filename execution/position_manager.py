@@ -192,3 +192,26 @@ def build_emergency_liquidation_action(position: PositionState) -> OrderActionPa
         comment=EMERGENCY_LIQUIDATION_COMMENT,
         volume=position.volume,
     )
+
+
+def build_short_term_liquidation_action(
+    *, ticket: int, symbol: str, magic_number: int, volume: float
+) -> OrderActionPayload:
+    """Full-volume market close for a short-term (scalp) position — same
+    shape as `build_emergency_liquidation_action()` but takes plain scalar
+    fields instead of a `PositionState`. Short-term positions are never
+    tracked as `PositionState` (they're stateless, fire-and-forget via a
+    fixed SL/TP MT5 manages itself; `docs/ARCHITECTURE_SUMMARY.md`) — the
+    caller (`main.py`) already holds the broker-reported ticket/symbol/
+    magic/volume directly, and this module deliberately does not import
+    `broker.mt5_gateway`'s `BrokerPosition` to avoid a circular import
+    (`broker/mt5_gateway.py` already imports `OrderActionPayload` from
+    this module)."""
+    return OrderActionPayload(
+        action="TRADE_ACTION_DEAL",
+        position_ticket=ticket,
+        symbol=symbol,
+        magic=magic_number,
+        comment=EMERGENCY_LIQUIDATION_COMMENT,
+        volume=volume,
+    )

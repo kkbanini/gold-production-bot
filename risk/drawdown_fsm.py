@@ -143,9 +143,7 @@ def roll_equity_baselines(
     new_epoch = _current_epoch(now_utc)
 
     daily_equity = (
-        current_equity
-        if new_epoch.daily_date != epoch.daily_date
-        else baselines.daily_start_equity
+        current_equity if new_epoch.daily_date != epoch.daily_date else baselines.daily_start_equity
     )
     weekly_equity = (
         current_equity

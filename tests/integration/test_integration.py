@@ -250,6 +250,26 @@ class TestBrokerAccountAndBars:
         with pytest.raises(gw.BrokerConnectionError):
             gateway.get_bars(gw.TIMEFRAME_H1, 10)
 
+    def test_get_open_positions_by_magic_defaults_to_own_magic(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.positions[100] = FakePosition(100, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555)
+        fake_mt5.positions[200] = FakePosition(200, "XAUUSD", fake_mt5.POSITION_TYPE_SELL, 999)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        positions = gateway.get_open_positions_by_magic()
+        assert [p.ticket for p in positions] == [100]
+
+    def test_get_open_positions_by_magic_with_override(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.positions[100] = FakePosition(100, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555)
+        fake_mt5.positions[200] = FakePosition(200, "XAUUSD", fake_mt5.POSITION_TYPE_SELL, 999)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        positions = gateway.get_open_positions_by_magic(magic_number=999)
+        assert [p.ticket for p in positions] == [200]
+
     def test_submit_market_order_buy_at_ask(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -271,6 +291,43 @@ class TestBrokerAccountAndBars:
         assert request["type"] == fake_mt5.ORDER_TYPE_BUY
         assert request["sl"] == 2000.0
         assert "tp" not in request
+
+    def test_submit_market_order_defaults_to_own_magic_number(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1, bid=2009.5, ask=2010.0)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        position = gateway.submit_market_order(
+            side="BUY", volume=0.05, stop_loss=2000.0, take_profit=None, comment="co-1"
+        )
+        assert fake_mt5.last_request is not None
+        assert fake_mt5.last_request["magic"] == 555
+        assert position.magic == 555
+
+    def test_submit_market_order_with_magic_number_override(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1, bid=2009.5, ask=2010.0)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        position = gateway.submit_market_order(
+            side="BUY",
+            volume=0.01,
+            stop_loss=2000.0,
+            take_profit=2020.0,
+            comment="scalp-1",
+            magic_number=999,
+        )
+        assert fake_mt5.last_request is not None
+        assert fake_mt5.last_request["magic"] == 999
+        assert fake_mt5.last_request["tp"] == 2020.0
+        assert position.magic == 999
+        assert position.take_profit == 2020.0
 
     def test_submit_market_order_sell_at_bid(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
@@ -537,6 +594,8 @@ class TestApplicationContainer:
         "ECONOMIC_CALENDAR_API_KEY": "abc123",
         "STRATEGY_MAGIC_NUMBER": "555",
         "ENVIRONMENT_MODE": "DEMO",
+        "TRADING_MODE": "WAIT_FOR_CONDITIONS",
+        "SHORT_TERM_MAGIC_NUMBER": "556",
     }
 
     def test_build_wires_config_storage_and_broker(

@@ -19,6 +19,12 @@ H1_EMA_PERIOD = 40
 ADX_PERIOD = 14
 ADX_TREND_THRESHOLD = 25.0
 
+# Lower bar than ADX_TREND_THRESHOLD for the short-term (scalp) mode: it
+# deliberately trades on weaker trend strength to enter more often. No
+# spec reference — a made-up-but-documented default, same pattern as this
+# module's other numeric thresholds.
+SHORT_TERM_ADX_THRESHOLD = 15.0
+
 TrendDirection = Literal["BULLISH", "BEARISH", "NONE"]
 
 
@@ -96,4 +102,57 @@ def evaluate_master_trend(
         h1_bullish=h1_bullish,
         adx_value=adx_value,
         adx_confirmed=adx_value > ADX_TREND_THRESHOLD,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ShortTermTrendAlignment:
+    """The short-term (scalp) mode's own, deliberately relaxed trend
+    check: H1 direction alone (no D1/H4 alignment requirement) plus the
+    H1 ADX(14) gated against the lower `SHORT_TERM_ADX_THRESHOLD` —
+    independent of `TrendAlignment`/`evaluate_master_trend()`, which stay
+    untouched for the original strategy."""
+
+    direction: TrendDirection
+    h1_bullish: bool
+    h1_bearish: bool
+    adx_value: float
+    adx_confirmed: bool
+
+    @property
+    def is_valid(self) -> bool:
+        return self.direction != "NONE" and self.adx_confirmed
+
+
+def evaluate_short_term_trend(
+    h1_high: FloatArray, h1_low: FloatArray, h1_close: FloatArray
+) -> ShortTermTrendAlignment:
+    """Evaluate the short-term mode's relaxed trend condition from H1 bars
+    alone — no D1/H4 data needed, since the whole point of this mode is to
+    trade more often than `evaluate_master_trend()`'s stricter alignment
+    allows.
+    """
+    h1_ema = ema(h1_close, H1_EMA_PERIOD)
+    h1_adx = adx(h1_high, h1_low, h1_close, ADX_PERIOD)
+
+    h1_last_close, h1_last_ema = float(h1_close[-1]), float(h1_ema[-1])
+    adx_value = float(h1_adx[-1])
+
+    h1_bullish = h1_last_close > h1_last_ema
+    h1_bearish = h1_last_close < h1_last_ema
+
+    direction: TrendDirection
+    if h1_bullish:
+        direction = "BULLISH"
+    elif h1_bearish:
+        direction = "BEARISH"
+    else:
+        direction = "NONE"
+
+    return ShortTermTrendAlignment(
+        direction=direction,
+        h1_bullish=h1_bullish,
+        h1_bearish=h1_bearish,
+        adx_value=adx_value,
+        adx_confirmed=adx_value > SHORT_TERM_ADX_THRESHOLD,
     )

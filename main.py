@@ -51,6 +51,19 @@ Friday 22:00 UTC - Sunday 22:00 UTC), rechecking every `WEEKEND_RECHECK_SECONDS`
 instead of every 5-minute bar close. This is a separate axis from
 `is_within_execution_window()`'s daily GMT hour filter, which remains
 unwired (see docs/ARCHITECTURE_SUMMARY.md §5).
+
+`config.trading_mode` (`WAIT_FOR_CONDITIONS`/`SHORT_TERM`/`BOTH`) selects
+between the original D1+H4+H1-aligned strategy above and a second,
+independent short-term (scalp) mode (`decide_short_term_entry_signal()`,
+`strategy.trend_filter.evaluate_short_term_trend()`): relaxed to H1
+direction + a lower ADX bar, fixed minimum lot, fixed ATR-based TP/SL that
+MT5 closes automatically — so, unlike the regular position, it is never
+tracked in `FSMContext` (stateless; `main()` re-queries it from the
+broker every cycle via `config.short_term_magic_number`, a distinct magic
+number so the two modes' positions never collide). Short-term fills are
+NOT written to `trade_ledger` (see `_evaluate_short_term_entry()`'s
+docstring) and are therefore invisible to `optimizer/self_learning.py`'s
+analytics — a deliberate, documented gap, not an oversight.
 """
 
 from __future__ import annotations
@@ -84,6 +97,7 @@ from execution.position_manager import (
     OrderActionPayload,
     PositionState,
     build_emergency_liquidation_action,
+    build_short_term_liquidation_action,
     calculate_trailing_stop,
     evaluate_partial_close_and_breakeven,
 )
@@ -113,7 +127,13 @@ from strategy.execution_triggers import (
     detect_breakout,
     detect_pullback,
 )
-from strategy.trend_filter import H1_EMA_PERIOD, TrendAlignment, evaluate_master_trend
+from strategy.trend_filter import (
+    H1_EMA_PERIOD,
+    ShortTermTrendAlignment,
+    TrendAlignment,
+    evaluate_master_trend,
+    evaluate_short_term_trend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +153,21 @@ WEEKEND_RECHECK_SECONDS = 900.0
 # stop-loss on a new entry. Mirrors position_manager's Base_TP multiplier
 # for symmetry; not independently specified anywhere, flagged for review.
 ENTRY_ATR_STOP_MULTIPLIER = BASE_TP_ATR_MULTIPLIER
+
+# Mirrors config.config_manager.VALID_TRADING_MODES exactly — kept as
+# plain string literals here (not re-exported constants) since
+# config/config_manager.py is the sole validator/owner of this value;
+# main.py only ever compares against it, never re-derives it.
+TRADING_MODE_WAIT_FOR_CONDITIONS = "WAIT_FOR_CONDITIONS"
+TRADING_MODE_SHORT_TERM = "SHORT_TERM"
+TRADING_MODE_BOTH = "BOTH"
+
+# Short-term (scalp) mode's fixed ATR-based TP/SL (risk:reward 1:1) — MT5
+# closes the position automatically at whichever is hit first, so no
+# per-cycle trailing/partial-close management like the regular position
+# gets. No spec reference — a made-up-but-documented default.
+SHORT_TERM_TP_ATR_MULTIPLIER = 1.0
+SHORT_TERM_SL_ATR_MULTIPLIER = 1.0
 
 D1_BAR_COUNT = 220
 H4_BAR_COUNT = 70
@@ -185,7 +220,15 @@ class FSMContext:
 @dataclass(frozen=True, slots=True)
 class MarketSnapshot:
     """Everything about the current market/account `run_bar_close_cycle`
-    needs, gathered by the (impure) caller before invoking it."""
+    needs, gathered by the (impure) caller before invoking it.
+
+    `short_term_trend`/`short_term_pullback` are the short-term mode's own
+    relaxed trend/pullback signals (default `None` when that mode isn't
+    enabled) — `short_term_pullback` is a SEPARATE computation from
+    `pullback` above, not a reuse of it, since `pullback` is computed
+    against the *regular* trend's direction, which can disagree with the
+    short-term trend's direction (that disagreement is the whole point of
+    relaxing the condition)."""
 
     now_utc: datetime
     account_state: AccountState
@@ -196,6 +239,8 @@ class MarketSnapshot:
     pullback: PullbackSignal
     wick_fill: WickFillResult
     news_events: list[EconomicEvent]
+    short_term_trend: ShortTermTrendAlignment | None = None
+    short_term_pullback: PullbackSignal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +267,10 @@ class BarCloseCycleResult:
     entry_stop_loss: float | None
     entry_volume: float | None
     position_actions: tuple[OrderActionPayload, ...]
+    short_term_entry_decision: EntryDecision | None = None
+    short_term_entry_stop_loss: float | None = None
+    short_term_entry_take_profit: float | None = None
+    short_term_entry_volume: float | None = None
 
 
 def seconds_until_next_bar_close(
@@ -252,6 +301,27 @@ def evaluate_processing_time(duration_seconds: float) -> ProcessingCapResult:
     )
 
 
+def _select_trigger_signal(
+    trend_direction: Direction,
+    breakout: BreakoutSignal,
+    pullback: PullbackSignal,
+    wick_fill: WickFillResult,
+) -> EntryDecision:
+    """Pick the first of breakout/pullback/wick-fill that agrees with
+    `trend_direction`, shared by both `decide_entry_signal()` and
+    `decide_short_term_entry_signal()` — the exact same selection
+    procedure, only the trend-validity gate upstream of it differs."""
+    if breakout.is_valid and breakout.direction == trend_direction:
+        return EntryDecision(trend_direction, f"breakout confirms {trend_direction} trend")
+    if pullback.is_valid and pullback.direction == trend_direction:
+        return EntryDecision(trend_direction, f"pullback confirms {trend_direction} trend")
+    if wick_fill.is_significant and wick_fill.rejection == trend_direction:
+        return EntryDecision(
+            trend_direction, f"wick-fill rejection confirms {trend_direction} trend"
+        )
+    return EntryDecision("NONE", "no entry trigger agrees with the confirmed trend direction")
+
+
 def decide_entry_signal(
     trend: TrendAlignment,
     breakout: BreakoutSignal,
@@ -275,16 +345,30 @@ def decide_entry_signal(
         return EntryDecision("NONE", "no confirmed master trend alignment")
 
     trend_direction: Direction = "BUY" if trend.direction == "BULLISH" else "SELL"
+    return _select_trigger_signal(trend_direction, breakout, pullback, wick_fill)
 
-    if breakout.is_valid and breakout.direction == trend_direction:
-        return EntryDecision(trend_direction, f"breakout confirms {trend_direction} trend")
-    if pullback.is_valid and pullback.direction == trend_direction:
-        return EntryDecision(trend_direction, f"pullback confirms {trend_direction} trend")
-    if wick_fill.is_significant and wick_fill.rejection == trend_direction:
-        return EntryDecision(
-            trend_direction, f"wick-fill rejection confirms {trend_direction} trend"
-        )
-    return EntryDecision("NONE", "no entry trigger agrees with the confirmed trend direction")
+
+def decide_short_term_entry_signal(
+    short_trend: ShortTermTrendAlignment,
+    breakout: BreakoutSignal,
+    short_term_pullback: PullbackSignal,
+    wick_fill: WickFillResult,
+    news_locked: bool,
+) -> EntryDecision:
+    """The short-term (scalp) mode's entry decision: identical shape to
+    `decide_entry_signal()`, but gated on `short_trend.is_valid` (H1
+    direction + a lower ADX bar, no D1/H4 alignment requirement) instead
+    of the full master trend. `short_term_pullback` must be computed
+    against `short_trend.direction`, not the regular trend's direction —
+    see `MarketSnapshot`'s docstring.
+    """
+    if news_locked:
+        return EntryDecision("NONE", "news blackout window active")
+    if not short_trend.is_valid:
+        return EntryDecision("NONE", "no confirmed short-term trend alignment")
+
+    trend_direction: Direction = "BUY" if short_trend.direction == "BULLISH" else "SELL"
+    return _select_trigger_signal(trend_direction, breakout, short_term_pullback, wick_fill)
 
 
 def _evaluate_drawdown_transition(
@@ -339,6 +423,7 @@ def _handle_hard_lock_response(
     classification: DrawdownClassification,
     processing: ProcessingCapResult,
     feature_flags: FeatureFlagManager,
+    short_term_position: BrokerPosition | None,
 ) -> BarCloseCycleResult | None:
     """Returns a terminal `BarCloseCycleResult` if `updated_context` is a
     fresh `HARD_LOCK` breach this cycle (either an emergency-liquidation
@@ -346,6 +431,10 @@ def _handle_hard_lock_response(
     response applies so `run_bar_close_cycle()` should continue its normal
     decision flow. Factored out for the same `max-complexity` reason as
     `_evaluate_drawdown_transition()`.
+
+    `short_term_position`, if open, is liquidated/frozen in lockstep with
+    `context.position` — `should_liquidate` gates both symmetrically
+    (never liquidate one while freezing the other in place).
     """
     hard_lock_response = decide_hard_lock_response(
         updated_context.drawdown_state, liquidate_on_hard_lock=feature_flags.liquidate_on_hard_lock
@@ -362,11 +451,26 @@ def _handle_hard_lock_response(
         entry_volume=None,
         position_actions=(),
     )
-    if not hard_lock_response.should_liquidate or context.position is None:
+    if not hard_lock_response.should_liquidate:
+        logger.critical("Absolute system freeze triggered: %s", hard_lock_response.reason)
+        return empty_result
+    if context.position is None and short_term_position is None:
         logger.critical("Absolute system freeze triggered: %s", hard_lock_response.reason)
         return empty_result
 
     logger.critical("Emergency liquidation triggered: %s", hard_lock_response.reason)
+    actions: list[OrderActionPayload] = []
+    if context.position is not None:
+        actions.append(build_emergency_liquidation_action(context.position))
+    if short_term_position is not None:
+        actions.append(
+            build_short_term_liquidation_action(
+                ticket=short_term_position.ticket,
+                symbol=short_term_position.symbol,
+                magic_number=short_term_position.magic,
+                volume=short_term_position.volume,
+            )
+        )
     return BarCloseCycleResult(
         context=updated_context,
         drawdown=classification,
@@ -374,8 +478,61 @@ def _handle_hard_lock_response(
         entry_decision=None,
         entry_stop_loss=None,
         entry_volume=None,
-        position_actions=(build_emergency_liquidation_action(context.position),),
+        position_actions=tuple(actions),
     )
+
+
+def _evaluate_short_term_entry(
+    trading_mode: str,
+    short_term_position: BrokerPosition | None,
+    new_drawdown_state: DrawdownState,
+    news_locked: bool,
+    snapshot: MarketSnapshot,
+    constraints: SymbolConstraints,
+) -> tuple[EntryDecision | None, float | None, float | None, float | None]:
+    """Independent short-term (scalp) entry evaluation — orthogonal to the
+    regular mode's `context.position is None` branch in
+    `run_bar_close_cycle()`, since a short-term position is never tracked
+    in `FSMContext` (stateless; MT5 manages its exit itself via a fixed
+    SL/TP, so no per-cycle trailing/partial-close is needed). Returns
+    `(entry_decision, stop_loss, take_profit, volume)`, all `None` when
+    short-term mode is disabled, a short-term position is already open,
+    new entries are currently blocked, or required snapshot data is
+    missing.
+
+    Deliberately does not write to `storage.state_manager`'s
+    `trade_ledger` (the caller does not call `record_trade()` for a
+    short-term fill) — see this module's docstring for why.
+    """
+    if trading_mode not in (TRADING_MODE_SHORT_TERM, TRADING_MODE_BOTH):
+        return None, None, None, None
+    if short_term_position is not None:
+        return None, None, None, None
+    if blocks_new_entries(new_drawdown_state):
+        return None, None, None, None
+    if snapshot.short_term_trend is None or snapshot.short_term_pullback is None:
+        return None, None, None, None
+
+    decision = decide_short_term_entry_signal(
+        snapshot.short_term_trend,
+        snapshot.breakout,
+        snapshot.short_term_pullback,
+        snapshot.wick_fill,
+        news_locked,
+    )
+    if decision.direction == "NONE" or snapshot.current_price is None:
+        return decision, None, None, None
+
+    stop_distance = SHORT_TERM_SL_ATR_MULTIPLIER * snapshot.atr_value
+    tp_distance = SHORT_TERM_TP_ATR_MULTIPLIER * snapshot.atr_value
+    if decision.direction == "BUY":
+        stop_loss = snapshot.current_price - stop_distance
+        take_profit = snapshot.current_price + tp_distance
+    else:
+        stop_loss = snapshot.current_price + stop_distance
+        take_profit = snapshot.current_price - tp_distance
+
+    return decision, stop_loss, take_profit, constraints.volume_min
 
 
 def run_bar_close_cycle(
@@ -387,6 +544,8 @@ def run_bar_close_cycle(
     *,
     cycle_duration_seconds: float,
     manual_reset_confirmed: bool = False,
+    trading_mode: str = TRADING_MODE_WAIT_FOR_CONDITIONS,
+    short_term_position: BrokerPosition | None = None,
 ) -> BarCloseCycleResult:
     """Pure decision function for a single M5 bar-close cycle: no I/O,
     entirely deterministic given its inputs. `main()` fetches the inputs
@@ -400,6 +559,13 @@ def run_bar_close_cycle(
     `main()` has no live control channel (API/CLI/admin signal) for an
     operator to actually set it yet; this is an open gap, see
     `docs/ARCHITECTURE_SUMMARY.md` §5.
+
+    `trading_mode`/`short_term_position` drive the short-term (scalp)
+    mode's entry evaluation (`_evaluate_short_term_entry()`), independent
+    of — and orthogonal to — the regular mode's `context.position is None`
+    branch below: either mode can hold a position while the other is
+    flat. Both default to values that make this function behave exactly
+    as before short-term mode existed.
     """
     processing = evaluate_processing_time(cycle_duration_seconds)
     if processing.exceeded_cap:
@@ -422,22 +588,46 @@ def run_bar_close_cycle(
     )
 
     hard_lock_result = _handle_hard_lock_response(
-        context, updated_context, classification, processing, feature_flags
+        context, updated_context, classification, processing, feature_flags, short_term_position
     )
     if hard_lock_result is not None:
         return hard_lock_result
 
     if blocks_position_management(new_drawdown_state):
         # MANUAL_RESET_REQUIRED (carried over from a prior cycle's
-        # HARD_LOCK): no operations at all until a human confirms a reset.
+        # HARD_LOCK): no operations at all until a human confirms a reset,
+        # for either mode.
         return no_action
 
     news_locked = is_trade_entry_locked(snapshot.now_utc, snapshot.news_events)
 
+    (
+        short_term_entry_decision,
+        short_term_entry_stop_loss,
+        short_term_entry_take_profit,
+        short_term_entry_volume,
+    ) = _evaluate_short_term_entry(
+        trading_mode, short_term_position, new_drawdown_state, news_locked, snapshot, constraints
+    )
+
     if context.position is None:
         if blocks_new_entries(new_drawdown_state):
-            # SOFT_LOCK, flat: nothing to manage and no new entries allowed.
-            return no_action
+            # SOFT_LOCK, flat: nothing to manage and no new *regular*
+            # entries allowed (short-term evaluation above already
+            # applied this same gate independently).
+            return BarCloseCycleResult(
+                context=updated_context,
+                drawdown=classification,
+                processing=processing,
+                entry_decision=None,
+                entry_stop_loss=None,
+                entry_volume=None,
+                position_actions=(),
+                short_term_entry_decision=short_term_entry_decision,
+                short_term_entry_stop_loss=short_term_entry_stop_loss,
+                short_term_entry_take_profit=short_term_entry_take_profit,
+                short_term_entry_volume=short_term_entry_volume,
+            )
 
         entry_decision = decide_entry_signal(
             snapshot.trend, snapshot.breakout, snapshot.pullback, snapshot.wick_fill, news_locked
@@ -451,6 +641,10 @@ def run_bar_close_cycle(
                 entry_stop_loss=None,
                 entry_volume=None,
                 position_actions=(),
+                short_term_entry_decision=short_term_entry_decision,
+                short_term_entry_stop_loss=short_term_entry_stop_loss,
+                short_term_entry_take_profit=short_term_entry_take_profit,
+                short_term_entry_volume=short_term_entry_volume,
             )
 
         stop_distance = ENTRY_ATR_STOP_MULTIPLIER * snapshot.atr_value
@@ -473,10 +667,26 @@ def run_bar_close_cycle(
             entry_stop_loss=entry_stop_loss,
             entry_volume=entry_volume,
             position_actions=(),
+            short_term_entry_decision=short_term_entry_decision,
+            short_term_entry_stop_loss=short_term_entry_stop_loss,
+            short_term_entry_take_profit=short_term_entry_take_profit,
+            short_term_entry_volume=short_term_entry_volume,
         )
 
     if snapshot.current_price is None:
-        return no_action
+        return BarCloseCycleResult(
+            context=updated_context,
+            drawdown=classification,
+            processing=processing,
+            entry_decision=None,
+            entry_stop_loss=None,
+            entry_volume=None,
+            position_actions=(),
+            short_term_entry_decision=short_term_entry_decision,
+            short_term_entry_stop_loss=short_term_entry_stop_loss,
+            short_term_entry_take_profit=short_term_entry_take_profit,
+            short_term_entry_volume=short_term_entry_volume,
+        )
 
     # SOFT_LOCK reaches here too (blocks_new_entries is True for it, but
     # that only gated the flat/no-position branch above): position
@@ -505,6 +715,10 @@ def run_bar_close_cycle(
         entry_stop_loss=None,
         entry_volume=None,
         position_actions=tuple(actions),
+        short_term_entry_decision=short_term_entry_decision,
+        short_term_entry_stop_loss=short_term_entry_stop_loss,
+        short_term_entry_take_profit=short_term_entry_take_profit,
+        short_term_entry_volume=short_term_entry_volume,
     )
 
 
@@ -611,6 +825,24 @@ def _fetch_market_snapshot(
     # entry-stop/trailing math.
     tick_price = gateway.get_current_price()
 
+    # Short-term mode's own relaxed trend + a SEPARATE pullback computed
+    # against ITS direction (not `trend_side` above) — they can legitimately
+    # disagree, since relaxing the D1+H4 requirement is the whole point.
+    short_term_trend = evaluate_short_term_trend(h1_bars.high, h1_bars.low, h1_bars.close)
+    if short_term_trend.direction == "BULLISH":
+        short_term_side: Direction = "BUY"
+    elif short_term_trend.direction == "BEARISH":
+        short_term_side = "SELL"
+    else:
+        short_term_side = "NONE"
+    short_term_pullback = detect_pullback(
+        h1_bars.high,
+        h1_bars.low,
+        h1_bars.close,
+        h1_ema,
+        short_term_side,
+    )
+
     return MarketSnapshot(
         now_utc=datetime.now(timezone.utc),
         account_state=account_state,
@@ -621,6 +853,8 @@ def _fetch_market_snapshot(
         pullback=pullback,
         wick_fill=wick_fill,
         news_events=news_events,
+        short_term_trend=short_term_trend,
+        short_term_pullback=short_term_pullback,
     )
 
 
@@ -670,6 +904,80 @@ def _seed_initial_fsm_context(container: ApplicationContainer) -> FSMContext:
     )
 
 
+def _fetch_short_term_position(
+    container: ApplicationContainer, previous_short_term_position: BrokerPosition | None
+) -> BrokerPosition | None:
+    """Query the broker for the short-term mode's currently open position
+    (if any), under its own distinct magic number — `None` when
+    `trading_mode` doesn't enable short-term mode at all. Logs once when a
+    previously-open short-term position has disappeared (closed by MT5's
+    own SL/TP, never by `main()` itself — see this module's docstring).
+    """
+    if container.config.trading_mode not in (TRADING_MODE_SHORT_TERM, TRADING_MODE_BOTH):
+        return None
+    positions = container.gateway.get_open_positions_by_magic(
+        container.config.short_term_magic_number
+    )
+    short_term_position = positions[0] if positions else None
+    if previous_short_term_position is not None and short_term_position is None:
+        logger.info(
+            "Short-term position closed (SL/TP hit, broker-managed): ticket=%s",
+            previous_short_term_position.ticket,
+        )
+    return short_term_position
+
+
+def _submit_short_term_entry_if_any(
+    container: ApplicationContainer, result: BarCloseCycleResult
+) -> None:
+    """Submit `result`'s short-term entry (if any) via the same pre-flight
+    idempotency wrapper the regular entry path uses. Deliberately does NOT
+    call `state_manager.record_trade()` or touch `FSMContext` — the
+    short-term position is never tracked there (see this module's
+    docstring and `_evaluate_short_term_entry()`'s).
+    """
+    if (
+        result.short_term_entry_decision is None
+        or result.short_term_entry_decision.direction == "NONE"
+        or result.short_term_entry_stop_loss is None
+        or result.short_term_entry_take_profit is None
+        or result.short_term_entry_volume is None
+    ):
+        return
+
+    side = result.short_term_entry_decision.direction
+    stop_loss = result.short_term_entry_stop_loss
+    take_profit = result.short_term_entry_take_profit
+    volume = result.short_term_entry_volume
+    metadata: dict[str, Any] = {
+        "symbol": container.gateway.symbol_spec.name,
+        "side": side,
+        "volume": volume,
+        "magic_number": container.config.short_term_magic_number,
+    }
+
+    def _submit(
+        cid: str,
+        *,
+        bound_side: Literal["BUY", "SELL"] = side,
+        bound_volume: float = volume,
+        bound_stop_loss: float = stop_loss,
+        bound_take_profit: float = take_profit,
+    ) -> BrokerPosition:
+        return container.gateway.submit_market_order(
+            side=bound_side,
+            volume=bound_volume,
+            stop_loss=bound_stop_loss,
+            take_profit=bound_take_profit,
+            comment=cid,
+            magic_number=container.config.short_term_magic_number,
+        )
+
+    submit_with_pre_flight_ledger(
+        container.state_manager, _submit, metadata, OrderLifecycleState.FILLED
+    )
+
+
 def main() -> None:
     """Entry point: bootstrap, then loop forever, acting once per new M5
     bar close. Not executed in this environment (no live MT5 credentials);
@@ -682,6 +990,7 @@ def main() -> None:
     context = _seed_initial_fsm_context(container)
     baselines: EquityBaselines | None = None
     baseline_epoch: BaselineEpoch | None = None
+    previous_short_term_position: BrokerPosition | None = None
     constraints = SymbolConstraints(
         point=container.gateway.symbol_spec.point,
         volume_min=container.gateway.symbol_spec.volume_min,
@@ -714,6 +1023,8 @@ def main() -> None:
 
         started = time.perf_counter()
         account_state = container.gateway.get_account_state()
+        short_term_position = _fetch_short_term_position(container, previous_short_term_position)
+        previous_short_term_position = short_term_position
         server_now = container.clock_provider.get_server_time(container.gateway.symbol_spec.name)
         if baselines is None or baseline_epoch is None:
             # First cycle: seed all three baselines from current equity,
@@ -738,6 +1049,8 @@ def main() -> None:
             constraints,
             container.feature_flags,
             cycle_duration_seconds=ended - started,
+            trading_mode=container.config.trading_mode,
+            short_term_position=short_term_position,
         )
         context = result.context
 
@@ -848,6 +1161,8 @@ def main() -> None:
                 drawdown_state=context.drawdown_state,
                 drawdown_reason=context.drawdown_reason,
             )
+
+        _submit_short_term_entry_if_any(container, result)
 
 
 if __name__ == "__main__":
