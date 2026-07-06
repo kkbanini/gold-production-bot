@@ -371,20 +371,21 @@ wiring between them is correct too.
   `_fetch_market_snapshot(handles.gateway, constraints.magic_number, [])`
   — the empty list is a hardcoded placeholder, not real news events — and
   still calls `datetime.now(timezone.utc)` directly for
-  `run_bar_close_cycle()`'s `now_utc` and the next-bar-close sleep.
-  `ClockProvider.get_server_time()` is now consumed, but only for the
-  equity-baseline rollover decision (see the fixed gap above) — the rest
-  of the loop's timing still reads the host machine clock. The
-  NFP/CPI/FOMC blackout and the News-API-down fail-safe (Phase 7) are both
-  fully implemented and tested in isolation; `container.py`'s
-  `ApplicationContainer` holds a fully-wired `calendar_provider`
-  (`CalendarProviderChain`, defaulting to a network-independent
-  `offline_snapshot` provider), but nothing in `main.py` calls it yet.
-  Wiring the network calendar providers to real endpoints additionally
-  requires a real `tradingeconomics`/`finnhub` API contract, which this
-  codebase has never verified (Phase 7 flagged that no provider was ever
-  named; `CALENDAR_TRADINGECONOMICS_BASE_URL`/`CALENDAR_FINNHUB_BASE_URL`
-  must be supplied by a deployer, never guessed).
+  `run_bar_close_cycle()`'s `now_utc`, the weekend-closure check, and the
+  next-bar-close sleep. `ClockProvider.get_server_time()` is now consumed,
+  but only for the equity-baseline rollover decision (see the fixed gap
+  above) — the rest of the loop's timing still reads the host machine
+  clock. The NFP/CPI/FOMC blackout and the News-API-down fail-safe
+  (Phase 7) are both fully implemented and tested in isolation;
+  `container.py`'s `ApplicationContainer` holds a fully-wired
+  `calendar_provider` (`CalendarProviderChain`, defaulting to a
+  network-independent `offline_snapshot` provider), but nothing in
+  `main.py` calls it yet. Wiring the network calendar providers to real
+  endpoints additionally requires a real `tradingeconomics`/`finnhub` API
+  contract, which this codebase has never verified (Phase 7 flagged that
+  no provider was ever named; `CALENDAR_TRADINGECONOMICS_BASE_URL`/
+  `CALENDAR_FINNHUB_BASE_URL` must be supplied by a deployer, never
+  guessed).
 - **`ENVIRONMENT_MODE`'s broker-side cross-check never landed.** `config/`
   validates `ENVIRONMENT_MODE` is `DEMO`/`LIVE`, but `broker/mt5_gateway.py`
   never cross-checks that value against the actually-connected account's
@@ -451,10 +452,11 @@ real capital risk.
    into `ApplicationContainer`** (§5) — `main()` still passes a hardcoded
    empty event list, so the NFP/CPI/FOMC blackout logic is inert.
    `clock_provider` is now consumed for equity-baseline rollover, but the
-   rest of the loop's timing still reads the host machine clock directly.
-   Enabling the network calendar providers (`tradingeconomics`/`finnhub`)
-   additionally requires supplying a real, verified base URL for each via
-   `CALENDAR_<PROVIDER>_BASE_URL` — none is guessed or defaulted.
+   weekend-closure check and bar-close-wait cadence still read the host
+   machine clock directly. Enabling the network calendar providers
+   (`tradingeconomics`/`finnhub`) additionally requires supplying a real,
+   verified base URL for each via `CALENDAR_<PROVIDER>_BASE_URL` — none is
+   guessed or defaulted.
 4. **Add the broker-side `ENVIRONMENT_MODE` cross-check** (RR-012, §5)
    before trusting the demo/live guard.
 5. **Review every flagged design choice in §3** — especially the entry

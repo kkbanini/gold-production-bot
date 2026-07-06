@@ -42,6 +42,16 @@ GOLD_SYMBOL_CANDIDATES: tuple[str, ...] = (
 GMT_SESSION_START_HOUR = 7
 GMT_SESSION_END_HOUR = 22
 
+# Weekly forex/CFD market closure: Friday 22:00 UTC through Sunday 22:00
+# UTC — a common broker convention, not a universal, per-broker-verified
+# fact (some brokers use 21:00 UTC instead, depending on daylight saving).
+# Made-up-but-documented, same as this project's other invented-but-
+# flagged numeric defaults (risk/README.md's compounding tiers, etc.).
+WEEKEND_CLOSE_WEEKDAY = 4  # Friday (datetime.weekday(): Monday=0 ... Sunday=6)
+WEEKEND_CLOSE_HOUR_UTC = 22
+WEEKEND_REOPEN_WEEKDAY = 6  # Sunday
+WEEKEND_REOPEN_HOUR_UTC = 22
+
 # Slippage tolerance for partial-close deals, in broker points. A
 # placeholder default, not a policy decision — the full slippage guard
 # (RQ-010, RR-006) is a later-phase concern.
@@ -258,6 +268,30 @@ def is_within_execution_window(now_utc: datetime) -> bool:
         raise ValueError("now_utc must be timezone-aware")
     hour = now_utc.astimezone(timezone.utc).hour
     return GMT_SESSION_START_HOUR <= hour < GMT_SESSION_END_HOUR
+
+
+def is_weekend_market_closed(now_utc: datetime) -> bool:
+    """True if `now_utc` falls within the weekly forex/CFD market closure:
+    Friday 22:00 UTC through Sunday 22:00 UTC.
+
+    This is a separate axis from `is_within_execution_window()`'s daily
+    07:00-22:00 GMT filter — that one repeats every day; this one is the
+    once-a-week closure. Neither is currently wired into `main.py`'s live
+    loop on its own; `main()` calls this one directly to skip a cycle
+    entirely during weekend closure (docs/ARCHITECTURE_SUMMARY.md §5 still
+    lists `is_within_execution_window()` as unwired).
+    """
+    if now_utc.tzinfo is None:
+        raise ValueError("now_utc must be timezone-aware")
+    aware = now_utc.astimezone(timezone.utc)
+    weekday = aware.weekday()
+    hour = aware.hour
+
+    if weekday == WEEKEND_CLOSE_WEEKDAY:
+        return hour >= WEEKEND_CLOSE_HOUR_UTC
+    if weekday == WEEKEND_REOPEN_WEEKDAY:
+        return hour < WEEKEND_REOPEN_HOUR_UTC
+    return WEEKEND_CLOSE_WEEKDAY < weekday < WEEKEND_REOPEN_WEEKDAY
 
 
 class MT5Gateway:

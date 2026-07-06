@@ -49,14 +49,55 @@ Phase 11a.
   .get_server_time()` every cycle (broker server time, not the host
   machine clock) to seed/roll `EquityBaselines`, closing part of the
   previously-flagged "`clock_provider` built but never consumed" gap —
-  the bar-close-wait cadence still reads the host clock directly, a
-  narrower remaining gap.
+  the weekend-closure check and bar-close-wait cadence still read the
+  host clock directly, a narrower remaining gap.
 
 ### Verified
 
 - `pytest tests/unit tests/integration` — all tests pass, including 8 new
   `TestEquityBaselineRollover` cases covering same-period no-op, each
   tier's isolated boundary crossing, and the naive-datetime error path.
+
+## [1.0.0-RC2] - 2026-07-05
+
+### Added — Weekly Market Closure Gate
+
+- `broker/mt5_gateway.py` — `is_weekend_market_closed(now_utc)`: `True`
+  during the weekly forex/CFD market closure (Friday 22:00 UTC through
+  Sunday 22:00 UTC — a common broker convention, not a universal,
+  per-broker-verified fact; flagged the same way as this project's other
+  invented-but-documented numeric defaults). A separate axis from the
+  existing `is_within_execution_window()` (that one is a daily 07:00-22:00
+  GMT filter, repeating every day; this one is the once-a-week closure).
+- `main.py` — the bar-close loop now checks `is_weekend_market_closed()`
+  first and skips the cycle entirely (no MT5 calls at all) during
+  closure, rechecking every `WEEKEND_RECHECK_SECONDS` (900s/15min) instead
+  of every 5-minute bar close, since nothing changes for hours during a
+  weekend closure. Logs the skip at `INFO` level so it's visible in
+  operator-facing logs rather than silent.
+- `container.py` — two new boot-time `INFO` log lines (connection
+  success with server/symbol/magic, and container-build completion with
+  environment mode/drawdown state) so a successful boot is observable
+  without needing to infer it from the *absence* of a warning/critical
+  log line.
+
+### Flagged
+
+- `is_within_execution_window()` (the daily GMT-hour filter) remains
+  unwired into `main.py`'s live loop — this fix only addresses the
+  weekly closure, a distinct gap tracked separately in
+  `docs/ARCHITECTURE_SUMMARY.md` §5.
+
+### Verified
+
+- `ruff check .`, `ruff format --check .`, `mypy --strict .` — all pass.
+- `pytest --cov=. --cov-fail-under=90` — 270 tests pass, 96.48% total
+  coverage. `is_weekend_market_closed()` fully covered, including both
+  boundary conditions for Friday/Sunday and the naive-datetime error path.
+- Verified live against a real IC Markets demo account
+  (`ICMarketsSC-Demo`, `XAUUSD`) — confirmed successful connect, clean
+  Disaster Recovery reconciliation, and multiple healthy bar-close cycles
+  end-to-end via the new boot/loop log lines.
 
 ## [1.0.0-RC1] - 2026-07-05
 

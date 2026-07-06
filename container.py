@@ -11,8 +11,8 @@ Phase 11b added `calendar_provider`/`clock_provider` (`CalendarProvider`/
 consumes `clock_provider` for equity-baseline rollover (broker server time
 decides UTC-day/ISO-week/calendar-month boundaries, `risk/drawdown_fsm.py`'s
 `roll_equity_baselines()`); it still does not consume `calendar_provider`,
-nor does it source the bar-close-wait timing from `clock_provider` — see
-`docs/ARCHITECTURE_SUMMARY.md` §5.
+nor does it source the bar-close-wait/weekend-check timing from
+`clock_provider` — see `docs/ARCHITECTURE_SUMMARY.md` §5.
 Phase 11d added `feature_flags` (`FeatureFlagManager`,
 docs/PRODUCTION_SPEC.md §6), consumed by `main.py`'s `run_bar_close_cycle()`
 to decide `HARD_LOCK`'s liquidate-vs-freeze behavior. Phase 11e added
@@ -94,6 +94,12 @@ class ApplicationContainer:
             magic_number=config.strategy_magic_number,
         )
         gateway.connect()
+        logger.info(
+            "Connected to MT5: server=%s symbol=%s magic=%s",
+            config.mt5_server,
+            gateway.symbol_spec.name,
+            config.strategy_magic_number,
+        )
 
         audit = gateway.audit_open_positions(state_manager.get_open_trades())
         if not audit.is_clean:
@@ -135,6 +141,12 @@ class ApplicationContainer:
         clock_provider = MT5ClockProvider(gateway=gateway)
 
         feature_flags = FeatureFlagManager(FeatureFlags.from_env())
+
+        logger.info(
+            "ApplicationContainer built: environment_mode=%s drawdown_state=%s",
+            config.environment_mode,
+            initial_drawdown_state.value,
+        )
 
         return cls(
             config=config,

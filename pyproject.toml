@@ -1,6 +1,6 @@
 [project]
 name = "gold-production-bot"
-version = "1.0.0rc1"
+version = "1.0.0rc2"
 description = "Event-driven algorithmic trading system for XAUUSD on MetaTrader 5."
 requires-python = ">=3.12"
 dependencies = [

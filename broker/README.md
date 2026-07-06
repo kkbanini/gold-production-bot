@@ -20,7 +20,15 @@ Sole owner of MetaTrader 5 integration. No other module (except
     filter. Requires a timezone-aware `datetime` (raises `ValueError`
     otherwise); GMT and UTC share the same civil time year-round (GMT
     observes no DST), so no further conversion is applied
-    (`docs/RESEARCH.md` §2).
+    (`docs/RESEARCH.md` §2). **Not currently wired into `main.py`'s live
+    loop** — see `docs/ARCHITECTURE_SUMMARY.md` §5.
+  - `is_weekend_market_closed(now_utc)` (`1.0.0-RC2`) — `True` during the
+    weekly forex/CFD closure (Friday 22:00 UTC through Sunday 22:00 UTC —
+    a common broker convention, not per-broker-verified). A separate axis
+    from `is_within_execution_window()` (daily vs. weekly). **Is** wired
+    into `main.py`'s live loop: the bar-close loop checks this first and
+    skips the cycle entirely (no MT5 calls) during closure, rechecking
+    every 15 minutes instead of every 5-minute bar close.
   - `MT5Gateway` — connection lifecycle:
     - `connect()` retries `mt5.initialize()` with exponential backoff
       (delay doubles each attempt, capped at `max_delay_seconds`, up to
