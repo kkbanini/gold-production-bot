@@ -33,6 +33,27 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Changed — Short-Term Mode's Take-Profit Is Now a Fixed Dollar Target
+
+- `risk/risk_manager.py` — new `calculate_price_distance_for_target_profit()`
+  (pure, broker-agnostic like its siblings): converts a target dollar
+  profit into the price distance that realizes it at a given lot size,
+  using the broker's own `tick_value`/`tick_size`
+  (`broker.mt5_gateway.SymbolSpec`) — a fixed price distance means a
+  different dollar amount at 0.01 lots than at 0.1, so the conversion has
+  to go through the broker's real contract spec, not a fixed constant.
+- `main.py` — the short-term mode's take-profit is now `SHORT_TERM_TP_TARGET_USD`
+  ($5.00, a made-up-but-documented default) converted via the above,
+  replacing the previous 1x-ATR-based TP. The stop-loss is unchanged
+  (still 1x ATR, `SHORT_TERM_SL_ATR_MULTIPLIER`) — this only changes the
+  profit side, per explicit request ("close at $5 profit"), keeping the
+  loss side's existing risk behavior untouched. `SymbolConstraints`
+  gained `tick_value`/`tick_size` fields (sourced from
+  `container.gateway.symbol_spec`) to carry this through.
+- Verified live against the real IC Markets demo account: reverse-checking
+  the computed price distance against the real `tick_value`/`tick_size`
+  reproduces exactly $5.00 of profit at the fixed minimum lot size.
+
 ### Fixed — Order Comments Clamped to the MT5 Wrapper's Real Length Limit
 
 - `broker/mt5_gateway.py` — every order-request builder now clamps the
