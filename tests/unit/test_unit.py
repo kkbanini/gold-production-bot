@@ -67,11 +67,7 @@ from risk.drawdown_fsm import (
     seed_equity_baselines,
     transition_drawdown_state,
 )
-from risk.risk_manager import (
-    calculate_compounded_lot_size,
-    calculate_price_distance_for_target_profit,
-    clamp_lot_size,
-)
+from risk.risk_manager import calculate_compounded_lot_size, clamp_lot_size
 from storage.db_engine import DEFAULT_BUSY_TIMEOUT_MS, checkpoint_wal, connect, initialize_schema
 from storage.migrations import MIGRATIONS, apply_pending_migrations, get_applied_migrations
 from storage.state_manager import (
@@ -1069,37 +1065,6 @@ class TestRiskManager:
     def test_compounding_non_positive_equity_raises(self) -> None:
         with pytest.raises(ValueError, match="equity must be"):
             calculate_compounded_lot_size(0.0, 0.01, 100.0, 0.01)
-
-    def test_price_distance_for_target_profit_basic(self) -> None:
-        # tick_value=$1.00 per 0.01 tick per 1.0 lot, 0.01 lots, $5 target
-        # -> distance = 5 * 0.01 / (1.00 * 0.01) = 5.0 price units.
-        distance = calculate_price_distance_for_target_profit(5.0, 0.01, 1.0, 0.01)
-        assert distance == pytest.approx(5.0)
-
-    def test_price_distance_scales_inversely_with_volume(self) -> None:
-        # 10x the volume needs 1/10th the price distance for the same
-        # dollar target.
-        distance = calculate_price_distance_for_target_profit(5.0, 0.10, 1.0, 0.01)
-        assert distance == pytest.approx(0.5)
-
-    def test_price_distance_scales_with_tick_value(self) -> None:
-        # Doubling tick_value halves the required distance.
-        distance = calculate_price_distance_for_target_profit(5.0, 0.01, 2.0, 0.01)
-        assert distance == pytest.approx(2.5)
-
-    def test_price_distance_non_positive_target_raises(self) -> None:
-        with pytest.raises(ValueError, match="target_profit_usd must be"):
-            calculate_price_distance_for_target_profit(0.0, 0.01, 1.0, 0.01)
-
-    def test_price_distance_non_positive_volume_raises(self) -> None:
-        with pytest.raises(ValueError, match="volume must be"):
-            calculate_price_distance_for_target_profit(5.0, 0.0, 1.0, 0.01)
-
-    def test_price_distance_non_positive_tick_fields_raise(self) -> None:
-        with pytest.raises(ValueError, match="tick_value and tick_size"):
-            calculate_price_distance_for_target_profit(5.0, 0.01, 0.0, 0.01)
-        with pytest.raises(ValueError, match="tick_value and tick_size"):
-            calculate_price_distance_for_target_profit(5.0, 0.01, 1.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -2610,13 +2575,7 @@ class _BarCloseCycleHelpers:
     @pytest.fixture
     def constraints(self) -> orchestrator.SymbolConstraints:
         return orchestrator.SymbolConstraints(
-            point=0.01,
-            volume_min=0.01,
-            volume_max=100.0,
-            volume_step=0.01,
-            magic_number=555,
-            tick_value=1.0,
-            tick_size=0.01,
+            point=0.01, volume_min=0.01, volume_max=100.0, volume_step=0.01, magic_number=555
         )
 
     @pytest.fixture
@@ -3027,36 +2986,23 @@ class TestBarCloseCycleShortTermMode(_BarCloseCycleHelpers):
         # Regular mode is IN_POSITION (mismatched trend so it proposes no
         # new regular entry) while short-term mode is flat and has a
         # valid signal — both must be evaluated independently.
-        # tick_value=2.0 (not the fixture's default 1.0) deliberately makes
-        # the dollar-based TP distance (2.5) diverge from the ATR-based SL
-        # distance (5.0) — proving TP is genuinely profit-target-derived,
-        # not coincidentally equal to an ATR multiple.
         position = self._position()
         context = self._in_position_context(position)
         snapshot = self._snapshot(trend_direction="BEARISH", short_term_trend_direction="BULLISH")
-        custom_constraints = orchestrator.SymbolConstraints(
-            point=constraints.point,
-            volume_min=constraints.volume_min,
-            volume_max=constraints.volume_max,
-            volume_step=constraints.volume_step,
-            magic_number=constraints.magic_number,
-            tick_value=2.0,
-            tick_size=0.01,
-        )
         result = orchestrator.run_bar_close_cycle(
             context,
             snapshot,
             baselines,
-            custom_constraints,
+            constraints,
             feature_flags,
             cycle_duration_seconds=0.05,
             trading_mode="SHORT_TERM",
         )
         assert result.short_term_entry_decision is not None
         assert result.short_term_entry_decision.direction == "BUY"
-        assert result.short_term_entry_stop_loss == pytest.approx(2010.0 - 5.0)  # 1x ATR
-        assert result.short_term_entry_take_profit == pytest.approx(2010.0 + 2.5)  # $5 target
-        assert result.short_term_entry_volume == custom_constraints.volume_min
+        assert result.short_term_entry_stop_loss == pytest.approx(2010.0 - 5.0)
+        assert result.short_term_entry_take_profit == pytest.approx(2010.0 + 5.0)
+        assert result.short_term_entry_volume == constraints.volume_min
 
     def test_both_mode_regular_in_position_short_term_flat_no_collision(
         self,
