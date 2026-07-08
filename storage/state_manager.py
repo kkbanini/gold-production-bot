@@ -240,6 +240,21 @@ class StateManager:
         )
         return [_row_to_entry(row) for row in cursor.fetchall()]
 
+    def get_open_trade_by_ticket(self, broker_ticket: int) -> TradeLedgerEntry | None:
+        """The still-open ledger row for `broker_ticket`, or `None`.
+
+        `main.py` uses this to find the `client_order_id` a short-term
+        entry was recorded under, once it detects (via a fresh broker
+        query) that the position is no longer open — the ledger's own
+        `broker_ticket` column is the only link back to that id, since
+        the closed-position event itself carries only the ticket.
+        """
+        row = self._connection.execute(
+            "SELECT * FROM trade_ledger WHERE broker_ticket = ? AND closed_at_utc IS NULL",
+            (broker_ticket,),
+        ).fetchone()
+        return _row_to_entry(row) if row is not None else None
+
     def get_closed_trades(self) -> list[TradeLedgerEntry]:
         """Return all trade_ledger rows that have already been closed.
 
@@ -273,6 +288,24 @@ class StateManager:
                 """,
                 (parameter_name, old_value, new_value, reason, _utc_now_iso()),
             )
+
+    def get_latest_parameter_value(self, parameter_name: str) -> float | None:
+        """The most recent `new_value` ever recorded for `parameter_name`
+        in `parameter_history`, or `None` if it's never been shifted —
+        the read half of `record_parameter_change()`'s write, letting a
+        live caller (`main.py`) resolve "the currently-effective value"
+        instead of a hardcoded constant that never learns anything.
+        """
+        row = self._connection.execute(
+            """
+            SELECT new_value FROM parameter_history
+            WHERE parameter_name = ?
+            ORDER BY applied_at_utc DESC, id DESC
+            LIMIT 1
+            """,
+            (parameter_name,),
+        ).fetchone()
+        return float(row[0]) if row is not None else None
 
     # --- Order lifecycle event store (Phase 11c, docs/PRODUCTION_SPEC.md §4/§5) ---
 

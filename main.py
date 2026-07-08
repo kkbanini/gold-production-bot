@@ -94,6 +94,7 @@ from container import ApplicationContainer
 from execution.position_manager import (
     BASE_TP_ATR_MULTIPLIER,
     EMERGENCY_LIQUIDATION_COMMENT,
+    TRAILING_ATR_MULTIPLIER,
     OrderActionPayload,
     PositionState,
     build_emergency_liquidation_action,
@@ -103,6 +104,7 @@ from execution.position_manager import (
 )
 from indicators.math_engine import atr, ema
 from news.news_engine import EconomicEvent, is_trade_entry_locked
+from optimizer.self_learning import get_effective_parameter_value
 from risk.drawdown_fsm import (
     BaselineEpoch,
     DrawdownClassification,
@@ -128,6 +130,7 @@ from strategy.execution_triggers import (
     detect_pullback,
 )
 from strategy.trend_filter import (
+    ADX_TREND_THRESHOLD,
     H1_EMA_PERIOD,
     ShortTermTrendAlignment,
     TrendAlignment,
@@ -168,6 +171,19 @@ TRADING_MODE_BOTH = "BOTH"
 # gets. No spec reference — a made-up-but-documented default.
 SHORT_TERM_TP_ATR_MULTIPLIER = 1.0
 SHORT_TERM_SL_ATR_MULTIPLIER = 1.0
+
+# The profit-peak lock's retracement trigger: once a short-term position
+# has been in profit and price retraces from its best-favorable point by
+# this many ATR, close immediately rather than riding it back down to the
+# fixed SL or waiting for the fixed TP. No spec reference — a made-up-
+# but-documented default, independent of the fixed TP/SL above.
+SHORT_TERM_PROFIT_LOCK_RETRACEMENT_ATR_MULTIPLIER = 0.5
+
+# Distinct from EMERGENCY_LIQUIDATION_COMMENT: main()'s existing
+# `if action.comment == EMERGENCY_LIQUIDATION_COMMENT` check clears the
+# *regular* position's FSMContext, which must never happen for a
+# short-term-only profit-lock close unrelated to a real HARD_LOCK.
+SHORT_TERM_PROFIT_LOCK_COMMENT = "short_term_profit_lock"
 
 D1_BAR_COUNT = 220
 H4_BAR_COUNT = 70
@@ -271,6 +287,7 @@ class BarCloseCycleResult:
     short_term_entry_stop_loss: float | None = None
     short_term_entry_take_profit: float | None = None
     short_term_entry_volume: float | None = None
+    short_term_peak_price: float | None = None
 
 
 def seconds_until_next_bar_close(
@@ -499,10 +516,6 @@ def _evaluate_short_term_entry(
     short-term mode is disabled, a short-term position is already open,
     new entries are currently blocked, or required snapshot data is
     missing.
-
-    Deliberately does not write to `storage.state_manager`'s
-    `trade_ledger` (the caller does not call `record_trade()` for a
-    short-term fill) — see this module's docstring for why.
     """
     if trading_mode not in (TRADING_MODE_SHORT_TERM, TRADING_MODE_BOTH):
         return None, None, None, None
@@ -535,6 +548,86 @@ def _evaluate_short_term_entry(
     return decision, stop_loss, take_profit, constraints.volume_min
 
 
+def _update_short_term_peak_price(
+    position: BrokerPosition | None, previous_peak_price: float | None
+) -> float | None:
+    """Track the best favorable price reached while the short-term
+    mode's own `position` is open. Resets to `None` whenever flat;
+    initializes fresh the first cycle a position is seen open (a `None`
+    `previous_peak_price` while `position is not None` unambiguously
+    means "just started tracking", since this is always reset to `None`
+    the moment a position closes — short-term mode never holds more than
+    one position at a time, so there's no scenario where a *different*
+    position could be mistaken for a continuing one); otherwise extends
+    the running max (`BUY`) / min (`SELL`) with `price_current`. Pure —
+    `run_bar_close_cycle()`'s caller threads the return value back in as
+    next cycle's `previous_peak_price`.
+    """
+    if position is None:
+        return None
+    if previous_peak_price is None:
+        return position.price_current
+    if position.side == "BUY":
+        return max(previous_peak_price, position.price_current)
+    return min(previous_peak_price, position.price_current)
+
+
+def decide_short_term_profit_lock(
+    position: BrokerPosition,
+    current_price: float,
+    atr_value: float,
+    peak_price: float,
+    *,
+    retracement_atr_multiplier: float = SHORT_TERM_PROFIT_LOCK_RETRACEMENT_ATR_MULTIPLIER,
+) -> bool:
+    """`True` iff `position` is still in profit but price has retraced
+    from `peak_price` (the best favorable price reached so far) by at
+    least `retracement_atr_multiplier * atr_value` — locks in whatever
+    profit remains rather than riding the retracement back down to the
+    fixed SL, or waiting for a fixed TP that may now be further away than
+    the peak ever got.
+    """
+    if position.side == "BUY":
+        in_profit = current_price > position.price_open
+        retracement = peak_price - current_price
+    else:
+        in_profit = current_price < position.price_open
+        retracement = current_price - peak_price
+    if not in_profit:
+        return False
+    return retracement >= retracement_atr_multiplier * atr_value
+
+
+def _evaluate_short_term_position_management(
+    short_term_position: BrokerPosition | None,
+    previous_peak_price: float | None,
+    atr_value: float,
+) -> tuple[float | None, OrderActionPayload | None]:
+    """The short-term mode's "already open" complement to
+    `_evaluate_short_term_entry()`'s "flat" case — independent of the
+    regular mode's own position management, runs whenever a short-term
+    position is open regardless of what the regular mode is doing this
+    cycle. Returns `(new_peak_price, close_action)`: `close_action` is
+    non-`None` only when `decide_short_term_profit_lock()` fires.
+    """
+    new_peak_price = _update_short_term_peak_price(short_term_position, previous_peak_price)
+    if short_term_position is None or new_peak_price is None:
+        return new_peak_price, None
+
+    if decide_short_term_profit_lock(
+        short_term_position, short_term_position.price_current, atr_value, new_peak_price
+    ):
+        action = build_short_term_liquidation_action(
+            ticket=short_term_position.ticket,
+            symbol=short_term_position.symbol,
+            magic_number=short_term_position.magic,
+            volume=short_term_position.volume,
+            comment=SHORT_TERM_PROFIT_LOCK_COMMENT,
+        )
+        return new_peak_price, action
+    return new_peak_price, None
+
+
 def run_bar_close_cycle(
     context: FSMContext,
     snapshot: MarketSnapshot,
@@ -546,6 +639,8 @@ def run_bar_close_cycle(
     manual_reset_confirmed: bool = False,
     trading_mode: str = TRADING_MODE_WAIT_FOR_CONDITIONS,
     short_term_position: BrokerPosition | None = None,
+    trailing_atr_multiplier: float = TRAILING_ATR_MULTIPLIER,
+    short_term_peak_price: float | None = None,
 ) -> BarCloseCycleResult:
     """Pure decision function for a single M5 bar-close cycle: no I/O,
     entirely deterministic given its inputs. `main()` fetches the inputs
@@ -564,8 +659,13 @@ def run_bar_close_cycle(
     mode's entry evaluation (`_evaluate_short_term_entry()`), independent
     of — and orthogonal to — the regular mode's `context.position is None`
     branch below: either mode can hold a position while the other is
-    flat. Both default to values that make this function behave exactly
-    as before short-term mode existed.
+    flat. `short_term_peak_price` drives that same mode's *position*
+    management (`_evaluate_short_term_position_management()`, the profit-
+    peak lock) — the caller persists the returned
+    `BarCloseCycleResult.short_term_peak_price` and passes it back in as
+    this same argument next cycle. All new parameters default to values
+    that make this function behave exactly as before short-term mode
+    existed.
     """
     processing = evaluate_processing_time(cycle_duration_seconds)
     if processing.exceeded_cap:
@@ -610,6 +710,18 @@ def run_bar_close_cycle(
         trading_mode, short_term_position, new_drawdown_state, news_locked, snapshot, constraints
     )
 
+    # Independent of the flat-vs-in-position branch below: a short-term
+    # position (if any) is managed every cycle regardless of what the
+    # regular mode does this cycle — mutually exclusive with the entry
+    # evaluation above by construction (one requires flat, the other
+    # requires open).
+    new_short_term_peak_price, short_term_close_action = _evaluate_short_term_position_management(
+        short_term_position, short_term_peak_price, snapshot.atr_value
+    )
+    short_term_actions: tuple[OrderActionPayload, ...] = (
+        (short_term_close_action,) if short_term_close_action is not None else ()
+    )
+
     if context.position is None:
         if blocks_new_entries(new_drawdown_state):
             # SOFT_LOCK, flat: nothing to manage and no new *regular*
@@ -622,11 +734,12 @@ def run_bar_close_cycle(
                 entry_decision=None,
                 entry_stop_loss=None,
                 entry_volume=None,
-                position_actions=(),
+                position_actions=short_term_actions,
                 short_term_entry_decision=short_term_entry_decision,
                 short_term_entry_stop_loss=short_term_entry_stop_loss,
                 short_term_entry_take_profit=short_term_entry_take_profit,
                 short_term_entry_volume=short_term_entry_volume,
+                short_term_peak_price=new_short_term_peak_price,
             )
 
         entry_decision = decide_entry_signal(
@@ -640,11 +753,12 @@ def run_bar_close_cycle(
                 entry_decision=entry_decision,
                 entry_stop_loss=None,
                 entry_volume=None,
-                position_actions=(),
+                position_actions=short_term_actions,
                 short_term_entry_decision=short_term_entry_decision,
                 short_term_entry_stop_loss=short_term_entry_stop_loss,
                 short_term_entry_take_profit=short_term_entry_take_profit,
                 short_term_entry_volume=short_term_entry_volume,
+                short_term_peak_price=new_short_term_peak_price,
             )
 
         stop_distance = ENTRY_ATR_STOP_MULTIPLIER * snapshot.atr_value
@@ -666,11 +780,12 @@ def run_bar_close_cycle(
             entry_decision=entry_decision,
             entry_stop_loss=entry_stop_loss,
             entry_volume=entry_volume,
-            position_actions=(),
+            position_actions=short_term_actions,
             short_term_entry_decision=short_term_entry_decision,
             short_term_entry_stop_loss=short_term_entry_stop_loss,
             short_term_entry_take_profit=short_term_entry_take_profit,
             short_term_entry_volume=short_term_entry_volume,
+            short_term_peak_price=new_short_term_peak_price,
         )
 
     if snapshot.current_price is None:
@@ -681,11 +796,12 @@ def run_bar_close_cycle(
             entry_decision=None,
             entry_stop_loss=None,
             entry_volume=None,
-            position_actions=(),
+            position_actions=short_term_actions,
             short_term_entry_decision=short_term_entry_decision,
             short_term_entry_stop_loss=short_term_entry_stop_loss,
             short_term_entry_take_profit=short_term_entry_take_profit,
             short_term_entry_volume=short_term_entry_volume,
+            short_term_peak_price=new_short_term_peak_price,
         )
 
     # SOFT_LOCK reaches here too (blocks_new_entries is True for it, but
@@ -702,7 +818,10 @@ def run_bar_close_cycle(
     )
     if not actions:
         trailing_action = calculate_trailing_stop(
-            context.position, snapshot.current_price, snapshot.atr_value
+            context.position,
+            snapshot.current_price,
+            snapshot.atr_value,
+            trailing_atr_multiplier=trailing_atr_multiplier,
         )
         if trailing_action is not None:
             actions = [trailing_action]
@@ -714,11 +833,12 @@ def run_bar_close_cycle(
         entry_decision=None,
         entry_stop_loss=None,
         entry_volume=None,
-        position_actions=tuple(actions),
+        position_actions=tuple(actions) + short_term_actions,
         short_term_entry_decision=short_term_entry_decision,
         short_term_entry_stop_loss=short_term_entry_stop_loss,
         short_term_entry_take_profit=short_term_entry_take_profit,
         short_term_entry_volume=short_term_entry_volume,
+        short_term_peak_price=new_short_term_peak_price,
     )
 
 
@@ -775,11 +895,21 @@ def submit_with_pre_flight_ledger(
 
 
 def _fetch_market_snapshot(
-    gateway: MT5Gateway, magic_number: int, news_events: list[EconomicEvent]
+    gateway: MT5Gateway,
+    magic_number: int,
+    news_events: list[EconomicEvent],
+    *,
+    adx_trend_threshold: float = ADX_TREND_THRESHOLD,
 ) -> MarketSnapshot:
     """Fetch bars/account state and evaluate the trend filter and entry
     triggers on the H1 timeframe (the finest granularity trend_filter
-    already evaluates ADX on)."""
+    already evaluates ADX on).
+
+    `adx_trend_threshold` defaults to the module constant but is meant to
+    be overridden with the self-learning optimizer's latest applied value
+    (`optimizer.self_learning.get_effective_parameter_value()`), resolved
+    fresh by `main()` every cycle.
+    """
     d1_bars = gateway.get_bars(TIMEFRAME_D1, D1_BAR_COUNT)
     h4_bars = gateway.get_bars(TIMEFRAME_H4, H4_BAR_COUNT)
     h1_bars = gateway.get_bars(TIMEFRAME_H1, H1_BAR_COUNT)
@@ -792,6 +922,7 @@ def _fetch_market_snapshot(
         h1_bars.high,
         h1_bars.low,
         h1_bars.close,
+        adx_trend_threshold=adx_trend_threshold,
     )
     atr_value = float(atr(h1_bars.high, h1_bars.low, h1_bars.close, 14)[-1])
     breakout = detect_breakout(
@@ -904,14 +1035,55 @@ def _seed_initial_fsm_context(container: ApplicationContainer) -> FSMContext:
     )
 
 
+def _record_short_term_close(container: ApplicationContainer, closed_ticket: int) -> None:
+    """Reconcile a short-term position's real outcome into `trade_ledger`
+    once `_fetch_short_term_position()` detects it's no longer open.
+
+    Looks up the closing deal (`MT5Gateway.get_closing_deal()`) and the
+    still-`OPEN` ledger row this ticket was recorded under
+    (`StateManager.get_open_trade_by_ticket()`); if both are found,
+    re-records the same `client_order_id` with `status="CLOSED"` and the
+    real `close_price`/`profit` (`record_trade()`'s upsert-by-id turns the
+    existing row `CLOSED` in place). Silently does nothing if either
+    lookup comes back empty — MT5's 24h deal-history lookback comfortably
+    covers this loop's 5-minute detection cadence, so a miss here would
+    indicate the position was never recorded in the first place (e.g. it
+    predates this feature) rather than a real error to raise on.
+    """
+    closed_deal = container.gateway.get_closing_deal(closed_ticket)
+    ledger_entry = container.state_manager.get_open_trade_by_ticket(closed_ticket)
+    if closed_deal is None or ledger_entry is None:
+        return
+    container.state_manager.record_trade(
+        TradeLedgerEntry(
+            client_order_id=ledger_entry.client_order_id,
+            symbol=ledger_entry.symbol,
+            side=ledger_entry.side,
+            volume_lots=ledger_entry.volume_lots,
+            status="CLOSED",
+            opened_at_utc=ledger_entry.opened_at_utc,
+            open_price=ledger_entry.open_price,
+            close_price=closed_deal.close_price,
+            stop_loss_price=ledger_entry.stop_loss_price,
+            take_profit_price=ledger_entry.take_profit_price,
+            profit=closed_deal.profit,
+            magic_number=ledger_entry.magic_number,
+            broker_ticket=ledger_entry.broker_ticket,
+            closed_at_utc=closed_deal.closed_at_utc.isoformat(),
+        )
+    )
+
+
 def _fetch_short_term_position(
     container: ApplicationContainer, previous_short_term_position: BrokerPosition | None
 ) -> BrokerPosition | None:
     """Query the broker for the short-term mode's currently open position
     (if any), under its own distinct magic number — `None` when
-    `trading_mode` doesn't enable short-term mode at all. Logs once when a
+    `trading_mode` doesn't enable short-term mode at all. When a
     previously-open short-term position has disappeared (closed by MT5's
-    own SL/TP, never by `main()` itself — see this module's docstring).
+    own SL/TP, never by `main()` itself — see this module's docstring),
+    logs it and reconciles the real outcome into `trade_ledger` via
+    `_record_short_term_close()`.
     """
     if container.config.trading_mode not in (TRADING_MODE_SHORT_TERM, TRADING_MODE_BOTH):
         return None
@@ -924,6 +1096,7 @@ def _fetch_short_term_position(
             "Short-term position closed (SL/TP hit, broker-managed): ticket=%s",
             previous_short_term_position.ticket,
         )
+        _record_short_term_close(container, previous_short_term_position.ticket)
     return short_term_position
 
 
@@ -931,10 +1104,14 @@ def _submit_short_term_entry_if_any(
     container: ApplicationContainer, result: BarCloseCycleResult
 ) -> None:
     """Submit `result`'s short-term entry (if any) via the same pre-flight
-    idempotency wrapper the regular entry path uses. Deliberately does NOT
-    call `state_manager.record_trade()` or touch `FSMContext` — the
-    short-term position is never tracked there (see this module's
-    docstring and `_evaluate_short_term_entry()`'s).
+    idempotency wrapper the regular entry path uses, then record the fill
+    as an `OPEN` `trade_ledger` row (`broker_ticket` set, so
+    `_record_short_term_close()` can find and close it later) — the same
+    OPEN-then-CLOSED lifecycle the regular entry path already has, closing
+    the previously-flagged gap where short-term fills were invisible to
+    `optimizer/self_learning.py`'s analytics. Deliberately does NOT touch
+    `FSMContext` — the short-term position is never tracked there (see
+    this module's docstring and `_evaluate_short_term_entry()`'s).
     """
     if (
         result.short_term_entry_decision is None
@@ -973,8 +1150,23 @@ def _submit_short_term_entry_if_any(
             magic_number=container.config.short_term_magic_number,
         )
 
-    submit_with_pre_flight_ledger(
+    client_order_id, broker_position = submit_with_pre_flight_ledger(
         container.state_manager, _submit, metadata, OrderLifecycleState.FILLED
+    )
+    container.state_manager.record_trade(
+        TradeLedgerEntry(
+            client_order_id=client_order_id,
+            symbol=broker_position.symbol,
+            side=broker_position.side,
+            volume_lots=broker_position.volume,
+            status="OPEN",
+            opened_at_utc=broker_position.opened_at_utc.isoformat(),
+            open_price=broker_position.price_open,
+            stop_loss_price=broker_position.stop_loss,
+            take_profit_price=broker_position.take_profit,
+            magic_number=broker_position.magic,
+            broker_ticket=broker_position.ticket,
+        )
     )
 
 
@@ -991,6 +1183,7 @@ def main() -> None:
     baselines: EquityBaselines | None = None
     baseline_epoch: BaselineEpoch | None = None
     previous_short_term_position: BrokerPosition | None = None
+    short_term_peak_price: float | None = None
     constraints = SymbolConstraints(
         point=container.gateway.symbol_spec.point,
         volume_min=container.gateway.symbol_spec.volume_min,
@@ -1039,7 +1232,22 @@ def main() -> None:
                 baselines, baseline_epoch, account_state.equity, server_now
             )
 
-        snapshot = _fetch_market_snapshot(container.gateway, constraints.magic_number, [])
+        # Resolve the self-learning optimizer's latest applied values fresh
+        # every cycle (not just at boot) — a Saturday shift takes effect
+        # starting the very next cycle, no restart needed.
+        effective_adx_threshold = get_effective_parameter_value(
+            container.state_manager, "ADX_TREND_THRESHOLD", ADX_TREND_THRESHOLD
+        )
+        effective_trailing_multiplier = get_effective_parameter_value(
+            container.state_manager, "TRAILING_ATR_MULTIPLIER", TRAILING_ATR_MULTIPLIER
+        )
+
+        snapshot = _fetch_market_snapshot(
+            container.gateway,
+            constraints.magic_number,
+            [],
+            adx_trend_threshold=effective_adx_threshold,
+        )
         ended = time.perf_counter()
 
         result = run_bar_close_cycle(
@@ -1051,8 +1259,11 @@ def main() -> None:
             cycle_duration_seconds=ended - started,
             trading_mode=container.config.trading_mode,
             short_term_position=short_term_position,
+            trailing_atr_multiplier=effective_trailing_multiplier,
+            short_term_peak_price=short_term_peak_price,
         )
         context = result.context
+        short_term_peak_price = result.short_term_peak_price
 
         for action in result.position_actions:
             action_metadata: dict[str, Any] = {

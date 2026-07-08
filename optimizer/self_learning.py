@@ -91,6 +91,25 @@ class WeeklyOptimizationCycleResult:
     bootstrap_result: BootstrapResult | None
 
 
+def get_effective_parameter_value(
+    state_manager: StateManager, parameter_name: str, default_value: float
+) -> float:
+    """The value the live strategy should actually use for `parameter_name`
+    right now: the most recent shift `decide_parameter_shift()` applied
+    (`state_manager.get_latest_parameter_value()`), or `default_value` if
+    it's never been shifted.
+
+    The single shared resolution point between the weekly job (which
+    seeds each `TunableParameter.value` from here before deciding the
+    *next* shift) and the live bar-close loop (which reads the same
+    value every cycle to actually change behavior) — without this, a
+    recorded shift would sit in `parameter_history` forever with nothing
+    ever reading it back.
+    """
+    latest = state_manager.get_latest_parameter_value(parameter_name)
+    return latest if latest is not None else default_value
+
+
 def is_market_closed_for_optimization(now_utc: datetime) -> bool:
     """True only on Saturday (UTC) — the day the Gold market is fully
     closed all day (closes ~Friday 22:00 GMT, reopens ~Sunday 22:00 GMT).

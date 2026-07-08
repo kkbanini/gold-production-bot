@@ -195,7 +195,12 @@ def build_emergency_liquidation_action(position: PositionState) -> OrderActionPa
 
 
 def build_short_term_liquidation_action(
-    *, ticket: int, symbol: str, magic_number: int, volume: float
+    *,
+    ticket: int,
+    symbol: str,
+    magic_number: int,
+    volume: float,
+    comment: str = EMERGENCY_LIQUIDATION_COMMENT,
 ) -> OrderActionPayload:
     """Full-volume market close for a short-term (scalp) position — same
     shape as `build_emergency_liquidation_action()` but takes plain scalar
@@ -206,12 +211,20 @@ def build_short_term_liquidation_action(
     magic/volume directly, and this module deliberately does not import
     `broker.mt5_gateway`'s `BrokerPosition` to avoid a circular import
     (`broker/mt5_gateway.py` already imports `OrderActionPayload` from
-    this module)."""
+    this module).
+
+    `comment` defaults to `EMERGENCY_LIQUIDATION_COMMENT` (the existing
+    `HARD_LOCK` call site) but the profit-peak lock passes a distinct
+    comment instead — `main()`'s existing `if action.comment ==
+    EMERGENCY_LIQUIDATION_COMMENT` check (which clears the *regular*
+    position's `FSMContext`) must never fire for a short-term-only
+    close unrelated to a real `HARD_LOCK`.
+    """
     return OrderActionPayload(
         action="TRADE_ACTION_DEAL",
         position_ticket=ticket,
         symbol=symbol,
         magic=magic_number,
-        comment=EMERGENCY_LIQUIDATION_COMMENT,
+        comment=comment,
         volume=volume,
     )

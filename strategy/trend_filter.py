@@ -55,11 +55,13 @@ def evaluate_master_trend(
     h1_high: FloatArray,
     h1_low: FloatArray,
     h1_close: FloatArray,
+    *,
+    adx_trend_threshold: float = ADX_TREND_THRESHOLD,
 ) -> TrendAlignment:
     """Validate master trend alignment: the latest close on D1, H4, and H1
     must all sit on the same side of that timeframe's own EMA (D1 EMA(200),
     H4 EMA(50), H1 EMA(40)), and the H1 ADX(14) must exceed
-    ADX_TREND_THRESHOLD, or the alignment is not tradeable.
+    `adx_trend_threshold`, or the alignment is not tradeable.
 
     Each timeframe's close is compared against its own EMA rather than a
     single cross-timeframe price, since each timeframe's close is only
@@ -68,6 +70,12 @@ def evaluate_master_trend(
     of H1 bars (whichever indicator needs the most warm-up); insufficient
     history raises ValueError via indicators.math_engine rather than
     silently producing a NaN-derived result.
+
+    `adx_trend_threshold` defaults to the module constant but is
+    overridable so `main.py` can pass the self-learning optimizer's
+    latest applied value (`optimizer.self_learning.get_effective_parameter_value()`)
+    instead — mirrors `execution.position_manager.calculate_trailing_stop()`'s
+    existing override pattern for its own tunable multiplier.
     """
     d1_ema = ema(d1_close, D1_EMA_PERIOD)
     h4_ema = ema(h4_close, H4_EMA_PERIOD)
@@ -101,7 +109,7 @@ def evaluate_master_trend(
         h4_bullish=h4_bullish,
         h1_bullish=h1_bullish,
         adx_value=adx_value,
-        adx_confirmed=adx_value > ADX_TREND_THRESHOLD,
+        adx_confirmed=adx_value > adx_trend_threshold,
     )
 
 

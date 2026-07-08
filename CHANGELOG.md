@@ -33,6 +33,81 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Added — Self-Learning Optimizer Wired Live + Short-Term Profit-Peak Lock
+
+- **The weekend self-learning optimizer now actually runs.**
+  `optimizer/self_learning.py`'s `create_weekend_optimizer_scheduler()`
+  was fully built and tested (Phase 8) but never started anywhere —
+  `optimizer/README.md`'s own "Depended On By" section flagged this exact
+  wiring as missing. `container.py`'s `ApplicationContainer.build()` now
+  constructs the weekly job (`_build_weekly_optimization_job()`) and
+  starts it (new `optimizer_scheduler: BackgroundScheduler` field).
+- **Its shifts now actually change live behavior.** Previously,
+  `decide_parameter_shift()`'s output was only ever recorded to
+  `parameter_history` — nothing read it back, so a Saturday shift was a
+  no-op forever after. New `StateManager.get_latest_parameter_value()`
+  (read) + `optimizer.self_learning.get_effective_parameter_value()` (the
+  shared "latest shift, or the hardcoded default" resolution point) close
+  this: `strategy/trend_filter.py`'s `evaluate_master_trend()` gained an
+  `adx_trend_threshold` override param (mirroring
+  `execution/position_manager.py`'s existing `calculate_trailing_stop()`
+  pattern), and `main.py` resolves both `ADX_TREND_THRESHOLD` and
+  `TRAILING_ATR_MULTIPLIER` fresh every cycle — a Saturday shift takes
+  effect the very next cycle, no restart needed.
+- **Short-term trades now feed the optimizer real data.** Previously
+  documented as a deliberate gap (no mechanism existed to detect an
+  MT5-side SL/TP close), short-term entries are now recorded to
+  `trade_ledger` as `OPEN` (`broker_ticket` set), and
+  `broker/mt5_gateway.py`'s new `get_closing_deal()` (queries MT5 deal
+  history by `position_id`/`DEAL_ENTRY_OUT`) plus
+  `StateManager.get_open_trade_by_ticket()` let `main.py` reconcile the
+  real close outcome once `_fetch_short_term_position()` detects the
+  position is gone — turning the same row `CLOSED` with the real
+  `close_price`/`profit`. Short-term trades are no longer invisible to
+  `optimizer/self_learning.py`'s analytics.
+- **New: a profit-peak trailing lock, short-term mode only.** Tracks the
+  best favorable price reached while a short-term position is open
+  (`main.py`'s `_update_short_term_peak_price()`); if price retraces from
+  that peak by `SHORT_TERM_PROFIT_LOCK_RETRACEMENT_ATR_MULTIPLIER` (0.5x
+  ATR, made-up-but-documented) while still in profit
+  (`decide_short_term_profit_lock()`), closes immediately rather than
+  riding it back down to the fixed SL or waiting for the fixed TP.
+  Independent of, and orthogonal to, the regular position's own
+  management — uses a distinct `SHORT_TERM_PROFIT_LOCK_COMMENT` (not
+  `EMERGENCY_LIQUIDATION_COMMENT`) so it never touches the regular
+  position's `FSMContext`.
+  `execution/position_manager.py`'s `build_short_term_liquidation_action()`
+  gained an optional `comment` override to support this (default
+  preserves the existing `HARD_LOCK` call site unchanged).
+
+### Flagged
+
+- If a `HARD_LOCK` freezes (rather than liquidates) a short-term position
+  that's mid-profit-peak-tracking, the tracked peak resets to `None`
+  while frozen (`run_bar_close_cycle()`'s `blocks_position_management`
+  gate returns before the profit-lock ever runs). If a human later clears
+  `MANUAL_RESET_REQUIRED` with that same position still open, peak
+  tracking restarts fresh from the current price rather than resuming the
+  true historical peak — the same class of limitation already documented
+  for the regular position's partial-close/breakeven state after a crash
+  restart.
+
+### Verified
+
+- `ruff check .` / `ruff format --check .` / `mypy .` — clean across all
+  43 source files.
+- `pytest --cov=. --cov-fail-under=90` — 342 tests pass (32 new),
+  96.03% total coverage; `container.py` at 100%.
+- Verified live against the real IC Markets demo account: the scheduler
+  starts with the exact intended `CronTrigger(day_of_week='sat',
+  hour='3')`; `get_effective_parameter_value()` correctly falls back to
+  the hardcoded default with an empty `parameter_history`;
+  `get_closing_deal()` correctly reproduced the real `close_price`/
+  `profit` for three actual historical short-term closes on this
+  account (two TP hits, one SL hit, one from earlier today) by
+  `position_id`, confirming the deal-lookup logic against real MT5 data,
+  not just the fake test double.
+
 ### Fixed — Order Comments Clamped to the MT5 Wrapper's Real Length Limit
 
 - `broker/mt5_gateway.py` — every order-request builder now clamps the

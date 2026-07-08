@@ -22,13 +22,25 @@ boot and computes whether the FSM may start `ACTIVE` or must start
 `MANUAL_RESET_REQUIRED`, consumed by `main()` when it seeds its first
 `FSMContext`. Later sub-phases extend this same container rather than
 introducing their own ad hoc wiring.
+
+`optimizer_scheduler` starts `optimizer/self_learning.py`'s weekly
+self-learning job (`create_weekend_optimizer_scheduler()`) — previously
+built and fully tested but never actually started anywhere, an open gap
+`optimizer/README.md` documented explicitly. `main()`'s live loop resolves
+the same job's applied parameter shifts every cycle via
+`optimizer.self_learning.get_effective_parameter_value()`, so a Saturday
+shift changes live behavior starting the next cycle, not just a
+`parameter_history` row nothing reads back.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from broker.clock_provider import MT5ClockProvider
 from broker.mt5_gateway import MT5Gateway, resolve_position_audit
@@ -36,11 +48,65 @@ from config.calendar_config import CalendarConfig
 from config.config_manager import ConfigManager
 from config.feature_flags import FeatureFlagManager, FeatureFlags
 from config.secret_redaction import SecretRedactingFilter
+from execution.position_manager import TRAILING_ATR_MULTIPLIER
 from news.calendar_provider import CalendarProviderChain, build_calendar_provider_chain
+from optimizer.self_learning import (
+    TunableParameter,
+    WeeklyOptimizationCycleResult,
+    create_weekend_optimizer_scheduler,
+    get_effective_parameter_value,
+    run_weekly_optimization_cycle,
+)
 from risk.drawdown_fsm import DrawdownState
 from storage.state_manager import AuditActionType, StateManager
+from strategy.trend_filter import ADX_TREND_THRESHOLD
 
 logger = logging.getLogger(__name__)
+
+# Bounds each self-learning-tunable parameter may move within, and the
+# per-step size `decide_parameter_shift()` moves by — not independently
+# derived from any spec, matches the bounds this module's own test suite
+# already exercises (tests/unit/test_unit.py::TestSelfLearning).
+ADX_TREND_THRESHOLD_BOUNDS = (20.0, 35.0, 1.0)
+TRAILING_ATR_MULTIPLIER_BOUNDS = (1.0, 3.0, 0.25)
+
+
+def _build_weekly_optimization_job(
+    state_manager: StateManager,
+) -> Callable[[], WeeklyOptimizationCycleResult]:
+    """Construct the callable `create_weekend_optimizer_scheduler()` runs
+    every Saturday: seeds each `TunableParameter`'s current `value` fresh
+    from `get_effective_parameter_value()` (the latest applied shift, or
+    the hardcoded default if never shifted) so this week's decision
+    builds on last week's, not always the original constant.
+    """
+
+    def job() -> WeeklyOptimizationCycleResult:
+        adx_min, adx_max, adx_step = ADX_TREND_THRESHOLD_BOUNDS
+        trail_min, trail_max, trail_step = TRAILING_ATR_MULTIPLIER_BOUNDS
+        tunable_parameters = {
+            "ADX_TREND_THRESHOLD": TunableParameter(
+                "ADX_TREND_THRESHOLD",
+                get_effective_parameter_value(
+                    state_manager, "ADX_TREND_THRESHOLD", ADX_TREND_THRESHOLD
+                ),
+                adx_min,
+                adx_max,
+                adx_step,
+            ),
+            "TRAILING_ATR_MULTIPLIER": TunableParameter(
+                "TRAILING_ATR_MULTIPLIER",
+                get_effective_parameter_value(
+                    state_manager, "TRAILING_ATR_MULTIPLIER", TRAILING_ATR_MULTIPLIER
+                ),
+                trail_min,
+                trail_max,
+                trail_step,
+            ),
+        }
+        return run_weekly_optimization_cycle(state_manager, tunable_parameters)
+
+    return job
 
 
 @dataclass
@@ -59,6 +125,7 @@ class ApplicationContainer:
     clock_provider: MT5ClockProvider
     feature_flags: FeatureFlagManager
     initial_drawdown_state: DrawdownState
+    optimizer_scheduler: BackgroundScheduler
 
     @classmethod
     def build(
@@ -142,6 +209,17 @@ class ApplicationContainer:
 
         feature_flags = FeatureFlagManager(FeatureFlags.from_env())
 
+        # Self-learning optimizer (optimizer/self_learning.py, previously
+        # built but never started anywhere — optimizer/README.md's
+        # "Depended On By" section flagged this exact wiring as missing).
+        # BackgroundScheduler runs the job in its own thread; no explicit
+        # shutdown path, matching this process's existing no-graceful-
+        # shutdown posture elsewhere.
+        optimizer_scheduler = create_weekend_optimizer_scheduler(
+            _build_weekly_optimization_job(state_manager)
+        )
+        optimizer_scheduler.start()
+
         logger.info(
             "ApplicationContainer built: environment_mode=%s drawdown_state=%s",
             config.environment_mode,
@@ -156,4 +234,5 @@ class ApplicationContainer:
             clock_provider=clock_provider,
             feature_flags=feature_flags,
             initial_drawdown_state=initial_drawdown_state,
+            optimizer_scheduler=optimizer_scheduler,
         )

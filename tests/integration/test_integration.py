@@ -21,15 +21,17 @@ from pathlib import Path
 import pytest
 
 import broker.mt5_gateway as gw
+import container as container_module
 import main as orchestrator
 import optimizer.self_learning as sl
+import strategy.trend_filter as trend_filter
 from broker.clock_provider import MT5ClockProvider
 from container import ApplicationContainer
 from execution.position_manager import OrderActionPayload
 from news.calendar_provider import OfflineSnapshotCalendarProvider
 from risk.drawdown_fsm import DrawdownState
 from storage.state_manager import StateManager, TradeLedgerEntry
-from tests.conftest import FakeMT5, FakePosition, FakeSymbolInfo, FakeTick
+from tests.conftest import FakeDeal, FakeMT5, FakePosition, FakeSymbolInfo, FakeTick
 
 # ---------------------------------------------------------------------------
 # Order/position-action request building against a simulated MT5 (also part
@@ -269,6 +271,63 @@ class TestBrokerAccountAndBars:
         gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
         positions = gateway.get_open_positions_by_magic(magic_number=999)
         assert [p.ticket for p in positions] == [200]
+
+    def test_get_closing_deal_finds_the_closing_entry(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.deals = [
+            FakeDeal(
+                1,
+                position_id=500,
+                entry=fake_mt5.DEAL_ENTRY_IN,
+                price=2000.0,
+                profit=0.0,
+                time_=1000,
+            ),
+            FakeDeal(
+                2,
+                position_id=500,
+                entry=fake_mt5.DEAL_ENTRY_OUT,
+                price=2010.0,
+                profit=10.0,
+                time_=2000,
+            ),
+            # A deal for a DIFFERENT position must never match.
+            FakeDeal(
+                3, position_id=999, entry=fake_mt5.DEAL_ENTRY_OUT, price=1.0, profit=1.0, time_=3000
+            ),
+        ]
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        result = gateway.get_closing_deal(500)
+        assert result is not None
+        assert result.close_price == 2010.0
+        assert result.profit == 10.0
+        assert result.closed_at_utc == datetime.fromtimestamp(2000, tz=timezone.utc)
+
+    def test_get_closing_deal_returns_none_when_not_closed(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.deals = [
+            FakeDeal(
+                1,
+                position_id=500,
+                entry=fake_mt5.DEAL_ENTRY_IN,
+                price=2000.0,
+                profit=0.0,
+                time_=1000,
+            ),
+        ]
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        assert gateway.get_closing_deal(500) is None
+
+    def test_get_closing_deal_returns_none_when_no_deals_at_all(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        assert gateway.get_closing_deal(500) is None
 
     def test_submit_market_order_buy_at_ask(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
@@ -598,6 +657,158 @@ class TestOptimizerIsolation:
             "SELECT COUNT(*) FROM parameter_history"
         ).fetchone()[0]
         assert param_history_count_after == 1
+
+
+class TestEffectiveParameterValue:
+    """`StateManager.get_latest_parameter_value()` and
+    `optimizer.self_learning.get_effective_parameter_value()` — the read
+    half of `record_parameter_change()`'s write, closing the gap where a
+    self-learning shift was recorded but nothing ever applied it live."""
+
+    def test_get_latest_parameter_value_none_when_never_shifted(
+        self, state_manager: StateManager
+    ) -> None:
+        assert state_manager.get_latest_parameter_value("ADX_TREND_THRESHOLD") is None
+
+    def test_get_latest_parameter_value_returns_most_recent(
+        self, state_manager: StateManager
+    ) -> None:
+        state_manager.record_parameter_change("ADX_TREND_THRESHOLD", 25.0, 26.0, "shift 1")
+        state_manager.record_parameter_change("ADX_TREND_THRESHOLD", 26.0, 27.0, "shift 2")
+        assert state_manager.get_latest_parameter_value("ADX_TREND_THRESHOLD") == 27.0
+
+    def test_get_latest_parameter_value_scoped_by_name(self, state_manager: StateManager) -> None:
+        state_manager.record_parameter_change("ADX_TREND_THRESHOLD", 25.0, 26.0, "shift")
+        assert state_manager.get_latest_parameter_value("TRAILING_ATR_MULTIPLIER") is None
+
+    def test_get_effective_parameter_value_falls_back_to_default(
+        self, state_manager: StateManager
+    ) -> None:
+        assert sl.get_effective_parameter_value(state_manager, "ADX_TREND_THRESHOLD", 25.0) == 25.0
+
+    def test_get_effective_parameter_value_returns_latest_shift(
+        self, state_manager: StateManager
+    ) -> None:
+        state_manager.record_parameter_change("ADX_TREND_THRESHOLD", 25.0, 26.0, "shift")
+        assert sl.get_effective_parameter_value(state_manager, "ADX_TREND_THRESHOLD", 25.0) == 26.0
+
+
+class TestGetOpenTradeByTicket:
+    def test_finds_open_row_by_ticket(self, state_manager: StateManager) -> None:
+        state_manager.record_trade(
+            TradeLedgerEntry(
+                client_order_id="co-1",
+                symbol="XAUUSD",
+                side="BUY",
+                volume_lots=0.01,
+                status="OPEN",
+                opened_at_utc="2026-07-06T00:00:00Z",
+                broker_ticket=777,
+            )
+        )
+        entry = state_manager.get_open_trade_by_ticket(777)
+        assert entry is not None
+        assert entry.client_order_id == "co-1"
+
+    def test_returns_none_for_unknown_ticket(self, state_manager: StateManager) -> None:
+        assert state_manager.get_open_trade_by_ticket(999999) is None
+
+    def test_returns_none_once_closed(self, state_manager: StateManager) -> None:
+        state_manager.record_trade(
+            TradeLedgerEntry(
+                client_order_id="co-2",
+                symbol="XAUUSD",
+                side="BUY",
+                volume_lots=0.01,
+                status="OPEN",
+                opened_at_utc="2026-07-06T00:00:00Z",
+                broker_ticket=778,
+            )
+        )
+        state_manager.record_trade(
+            TradeLedgerEntry(
+                client_order_id="co-2",
+                symbol="XAUUSD",
+                side="BUY",
+                volume_lots=0.01,
+                status="CLOSED",
+                opened_at_utc="2026-07-06T00:00:00Z",
+                closed_at_utc="2026-07-06T01:00:00Z",
+                broker_ticket=778,
+            )
+        )
+        assert state_manager.get_open_trade_by_ticket(778) is None
+
+
+class _FixedSaturdayDatetime(datetime):
+    """A `datetime` subclass whose `now()` always returns a fixed Saturday
+    — `container_module._build_weekly_optimization_job()`'s returned
+    `job()` takes no arguments (it must match `Callable[[], ...]` for
+    `create_weekend_optimizer_scheduler()`), so it always resolves "now"
+    via `datetime.now(timezone.utc)` internally; monkeypatching
+    `optimizer.self_learning`'s `datetime` name is the only way to test
+    its Saturday-gated behavior deterministically regardless of which day
+    the test suite actually runs on."""
+
+    @classmethod
+    def now(cls, tz: object = None) -> "_FixedSaturdayDatetime":
+        return cls(2026, 7, 4, 3, 0, tzinfo=timezone.utc)
+
+
+class TestWeeklyOptimizationJob:
+    """`container._build_weekly_optimization_job()` — the closure
+    `create_weekend_optimizer_scheduler()` runs every Saturday. Verifies
+    it seeds each `TunableParameter`'s starting value from
+    `get_effective_parameter_value()`, not always the hardcoded default,
+    so this week's decision builds on any prior shift."""
+
+    def _seed_losing_streak(self, state_manager: StateManager) -> None:
+        # Below LOW_WIN_RATE_THRESHOLD (0.40) with >= MIN_TRADES_FOR_ADJUSTMENT
+        # (10) closed trades: triggers an ADX_TREND_THRESHOLD tightening shift.
+        profits = [-10.0, -8.0, -12.0, 15.0, -6.0, -9.0, 20.0, -11.0, -7.0, -13.0, -14.0]
+        for i, profit in enumerate(profits):
+            state_manager.record_trade(
+                TradeLedgerEntry(
+                    client_order_id=f"job-closed-{i}",
+                    symbol="XAUUSD",
+                    side="BUY",
+                    volume_lots=0.10,
+                    status="CLOSED",
+                    opened_at_utc="2026-07-01T09:00:00Z",
+                    profit=profit,
+                    closed_at_utc="2026-07-01T10:00:00Z",
+                )
+            )
+
+    def test_job_seeds_starting_value_from_hardcoded_default(
+        self, state_manager: StateManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sl, "datetime", _FixedSaturdayDatetime)
+        self._seed_losing_streak(state_manager)
+        job = container_module._build_weekly_optimization_job(state_manager)
+
+        job_result = job()
+        assert job_result.ran is True
+        assert job_result.shift_decision is not None
+        assert job_result.shift_decision.parameter_name == "ADX_TREND_THRESHOLD"
+        assert job_result.shift_decision.old_value == trend_filter.ADX_TREND_THRESHOLD
+
+    def test_job_seeds_starting_value_from_prior_shift_not_default(
+        self, state_manager: StateManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sl, "datetime", _FixedSaturdayDatetime)
+        self._seed_losing_streak(state_manager)
+        # A prior shift already moved ADX_TREND_THRESHOLD away from the
+        # hardcoded default — the job must build on THIS value, not restart
+        # from strategy.trend_filter.ADX_TREND_THRESHOLD every time.
+        state_manager.record_parameter_change("ADX_TREND_THRESHOLD", 25.0, 30.0, "earlier shift")
+        job = container_module._build_weekly_optimization_job(state_manager)
+
+        job_result = job()
+        assert job_result.shift_decision is not None
+        assert job_result.shift_decision.parameter_name == "ADX_TREND_THRESHOLD"
+        assert job_result.shift_decision.old_value == 30.0
+        assert job_result.shift_decision.new_value == 31.0
 
 
 # ---------------------------------------------------------------------------

@@ -72,6 +72,29 @@ class FakePosition:
         self.time = time_
 
 
+class FakeDeal:
+    """Mirrors the real MT5 deal record's field structure (verified
+    against a live account), used by `get_closing_deal()`'s tests."""
+
+    def __init__(
+        self,
+        ticket: int,
+        position_id: int,
+        entry: int,
+        price: float,
+        profit: float,
+        time_: int,
+        symbol: str = "XAUUSD",
+    ) -> None:
+        self.ticket = ticket
+        self.position_id = position_id
+        self.entry = entry
+        self.price = price
+        self.profit = profit
+        self.time = time_
+        self.symbol = symbol
+
+
 class FakeOrderResult:
     def __init__(self, retcode: int, order: int = 0) -> None:
         self.retcode = retcode
@@ -106,6 +129,8 @@ class FakeMT5:
     ORDER_TIME_GTC = "GTC"
     ORDER_FILLING_IOC = "IOC"
     TRADE_RETCODE_DONE = 10009
+    DEAL_ENTRY_IN = 0
+    DEAL_ENTRY_OUT = 1
 
     def __init__(self) -> None:
         self.symbols: dict[str, FakeSymbolInfo] = {}
@@ -120,6 +145,10 @@ class FakeMT5:
         self.next_order_ticket: int = 0
         self.account: FakeAccountInfo = FakeAccountInfo()
         self.rates: dict[int, list[dict[str, float]]] = {}
+        self.deals: list[FakeDeal] = []
+
+    def history_deals_get(self, date_from: object, date_to: object) -> tuple[FakeDeal, ...]:
+        return tuple(self.deals)
 
     def symbol_info(self, name: str) -> FakeSymbolInfo | None:
         return self.symbols.get(name)

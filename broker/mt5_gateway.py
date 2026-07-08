@@ -119,6 +119,19 @@ class BrokerPosition:
 
 
 @dataclass(frozen=True, slots=True)
+class ClosedDealInfo:
+    """The realized outcome of the deal that closed a position —
+    `get_closing_deal()`'s result, used by `main.py` to write a short-term
+    trade's actual close back to `trade_ledger` once MT5 has closed it via
+    the fixed SL/TP (a close `main.py` never itself decided or submitted,
+    unlike the regular position's management actions)."""
+
+    close_price: float
+    profit: float
+    closed_at_utc: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class PositionAuditReport:
     """Result of reconciling broker-reported open positions (filtered by this
     gateway's magic number) against the locally persisted trade_ledger.
@@ -424,6 +437,38 @@ class MT5Gateway:
                 )
             )
         return matched
+
+    def get_closing_deal(
+        self, position_ticket: int, *, lookback: timedelta = timedelta(hours=24)
+    ) -> ClosedDealInfo | None:
+        """Find the deal that closed `position_ticket`, if any, within the
+        last `lookback` — the only way to learn a position's real outcome
+        once it's closed by something other than `main.py` itself (the
+        short-term mode's fixed SL/TP, which MT5 executes automatically
+        with no submission on this process's part to observe).
+
+        MT5 deal records carry `position_id` (the ticket of the position
+        the deal opened/closed) and `entry` (0 = `DEAL_ENTRY_IN`, opening;
+        1 = `DEAL_ENTRY_OUT`, closing) — verified against this project's
+        own live demo account's real deal history. `lookback` bounds the
+        search window since `history_deals_get` requires an explicit
+        time range; 24 hours comfortably covers a bar-close-cadence
+        (5-minute) detection loop checking every cycle, so a close is
+        always found well within its own lookback window before it ever
+        ages out.
+        """
+        now = datetime.now(timezone.utc)
+        deals: Any = mt5.history_deals_get(now - lookback, now + timedelta(minutes=5))
+        if not deals:
+            return None
+        for deal in deals:
+            if deal.position_id == position_ticket and deal.entry == mt5.DEAL_ENTRY_OUT:
+                return ClosedDealInfo(
+                    close_price=deal.price,
+                    profit=deal.profit,
+                    closed_at_utc=datetime.fromtimestamp(deal.time, tz=timezone.utc),
+                )
+        return None
 
     def is_ticket_still_open(self, ticket: int) -> bool:
         """Query the broker's live position cache for `ticket` — the

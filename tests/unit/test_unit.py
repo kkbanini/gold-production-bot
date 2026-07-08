@@ -840,6 +840,56 @@ class TestTrendFilter:
         assert result.direction == "BEARISH"
         assert result.is_valid is True
 
+    def test_adx_trend_threshold_override_can_reject_a_default_confirm(self) -> None:
+        # This alignment confirms at the default (25.0) threshold...
+        _, _, d1_close = _uptrend(220, 1800, 2.0, 1)
+        h4_high, h4_low, h4_close = _uptrend(70, 1800, 2.0, 2)
+        h1_high, h1_low, h1_close = _uptrend(67, 1800, 2.0, 3)
+        default_result = evaluate_master_trend(
+            d1_close, h4_high, h4_low, h4_close, h1_high, h1_low, h1_close
+        )
+        assert default_result.adx_confirmed is True
+
+        # ...but a stricter overridden threshold (above the real ADX value)
+        # must reject the exact same alignment — proving the self-learning
+        # optimizer's applied shift actually changes live behavior.
+        strict_result = evaluate_master_trend(
+            d1_close,
+            h4_high,
+            h4_low,
+            h4_close,
+            h1_high,
+            h1_low,
+            h1_close,
+            adx_trend_threshold=default_result.adx_value + 10.0,
+        )
+        assert strict_result.adx_confirmed is False
+        assert strict_result.is_valid is False
+
+    def test_adx_trend_threshold_override_can_accept_a_default_reject(self) -> None:
+        # This alignment fails ADX confirmation at the default threshold...
+        _, _, d1_close = _choppy(220, 1950, 10)
+        h4_high, h4_low, h4_close = _choppy(70, 1950, 11)
+        h1_high, h1_low, h1_close = _choppy(67, 1950, 12)
+        default_result = evaluate_master_trend(
+            d1_close, h4_high, h4_low, h4_close, h1_high, h1_low, h1_close
+        )
+        assert default_result.adx_confirmed is False
+
+        # ...but a looser overridden threshold (below the real ADX value)
+        # must confirm it.
+        loose_result = evaluate_master_trend(
+            d1_close,
+            h4_high,
+            h4_low,
+            h4_close,
+            h1_high,
+            h1_low,
+            h1_close,
+            adx_trend_threshold=0.5,
+        )
+        assert loose_result.adx_confirmed is True
+
     def test_mismatched_alignment_yields_none(self) -> None:
         _, _, d1_close = _uptrend(220, 1800, 2.0, 1)
         h4_high, h4_low, h4_close = _uptrend(70, 1800, 2.0, 2)
@@ -3157,4 +3207,233 @@ class TestBarCloseCycleShortTermMode(_BarCloseCycleHelpers):
             short_term_position=short_term_position,
         )
         assert result.context.drawdown_state == DrawdownState.HARD_LOCK
+        assert result.position_actions == ()
+
+
+class TestUpdateShortTermPeakPrice:
+    """`_update_short_term_peak_price()` — pure peak tracking behind the
+    short-term mode's profit-peak lock."""
+
+    def _position(self, side: str, price_current: float) -> gw.BrokerPosition:
+        return gw.BrokerPosition(
+            ticket=1,
+            symbol="XAUUSD",
+            side=side,
+            volume=0.01,
+            price_open=2000.0,
+            price_current=price_current,
+            stop_loss=1990.0,
+            take_profit=2010.0,
+            profit=0.0,
+            magic=777,
+            opened_at_utc=datetime(2026, 7, 4, 12, 0, tzinfo=timezone.utc),
+        )
+
+    def test_flat_position_resets_to_none(self) -> None:
+        assert orchestrator._update_short_term_peak_price(None, 2050.0) is None
+
+    def test_fresh_position_initializes_to_current_price(self) -> None:
+        position = self._position("BUY", 2005.0)
+        assert orchestrator._update_short_term_peak_price(position, None) == 2005.0
+
+    def test_buy_tracks_running_maximum(self) -> None:
+        position = self._position("BUY", 2010.0)
+        assert orchestrator._update_short_term_peak_price(position, 2005.0) == 2010.0
+
+    def test_buy_does_not_lower_peak_on_retracement(self) -> None:
+        position = self._position("BUY", 2003.0)
+        assert orchestrator._update_short_term_peak_price(position, 2010.0) == 2010.0
+
+    def test_sell_tracks_running_minimum(self) -> None:
+        position = self._position("SELL", 1990.0)
+        assert orchestrator._update_short_term_peak_price(position, 1995.0) == 1990.0
+
+    def test_sell_does_not_raise_peak_on_retracement(self) -> None:
+        position = self._position("SELL", 1998.0)
+        assert orchestrator._update_short_term_peak_price(position, 1990.0) == 1990.0
+
+
+class TestDecideShortTermProfitLock:
+    """`decide_short_term_profit_lock()` — the profit-peak retracement rule."""
+
+    def _position(self, side: str) -> gw.BrokerPosition:
+        return gw.BrokerPosition(
+            ticket=1,
+            symbol="XAUUSD",
+            side=side,
+            volume=0.01,
+            price_open=2000.0,
+            price_current=2000.0,
+            stop_loss=1990.0,
+            take_profit=2010.0,
+            profit=0.0,
+            magic=777,
+            opened_at_utc=datetime(2026, 7, 4, 12, 0, tzinfo=timezone.utc),
+        )
+
+    def test_buy_locks_when_retraced_past_threshold(self) -> None:
+        # Peak 2010, ATR 5.0, default multiplier 0.5 -> trigger at >= 2.5
+        # retracement. Current 2007.0 is 3.0 below peak: fires.
+        position = self._position("BUY")
+        assert (
+            orchestrator.decide_short_term_profit_lock(
+                position, current_price=2007.0, atr_value=5.0, peak_price=2010.0
+            )
+            is True
+        )
+
+    def test_buy_does_not_lock_within_threshold(self) -> None:
+        # Only 1.0 retraced from the peak: below the 2.5 trigger.
+        position = self._position("BUY")
+        assert (
+            orchestrator.decide_short_term_profit_lock(
+                position, current_price=2009.0, atr_value=5.0, peak_price=2010.0
+            )
+            is False
+        )
+
+    def test_buy_underwater_never_locks_even_with_large_retracement(self) -> None:
+        # current_price below entry: not "in profit" at all, regardless of
+        # how far it retraced from a peak that was itself barely above entry.
+        position = self._position("BUY")
+        assert (
+            orchestrator.decide_short_term_profit_lock(
+                position, current_price=1990.0, atr_value=1.0, peak_price=2001.0
+            )
+            is False
+        )
+
+    def test_sell_locks_when_retraced_past_threshold(self) -> None:
+        position = self._position("SELL")
+        assert (
+            orchestrator.decide_short_term_profit_lock(
+                position, current_price=1993.0, atr_value=5.0, peak_price=1990.0
+            )
+            is True
+        )
+
+    def test_sell_does_not_lock_within_threshold(self) -> None:
+        position = self._position("SELL")
+        assert (
+            orchestrator.decide_short_term_profit_lock(
+                position, current_price=1991.0, atr_value=5.0, peak_price=1990.0
+            )
+            is False
+        )
+
+
+class TestEvaluateShortTermPositionManagement:
+    """`_evaluate_short_term_position_management()` — the "already open"
+    complement to `_evaluate_short_term_entry()`."""
+
+    def _position(self, **overrides: object) -> gw.BrokerPosition:
+        defaults: dict[str, object] = dict(
+            ticket=42,
+            symbol="XAUUSD",
+            side="BUY",
+            volume=0.01,
+            price_open=2000.0,
+            price_current=2000.0,
+            stop_loss=1990.0,
+            take_profit=2010.0,
+            profit=0.0,
+            magic=777,
+            opened_at_utc=datetime(2026, 7, 4, 12, 0, tzinfo=timezone.utc),
+        )
+        defaults.update(overrides)
+        return gw.BrokerPosition(**defaults)  # type: ignore[arg-type]
+
+    def test_flat_yields_no_peak_and_no_action(self) -> None:
+        peak, action = orchestrator._evaluate_short_term_position_management(None, 2005.0, 5.0)
+        assert peak is None
+        assert action is None
+
+    def test_fresh_position_initializes_peak_without_closing(self) -> None:
+        position = self._position(price_current=2003.0)
+        peak, action = orchestrator._evaluate_short_term_position_management(position, None, 5.0)
+        assert peak == 2003.0
+        assert action is None
+
+    def test_retraced_position_closes_with_correct_payload(self) -> None:
+        position = self._position(ticket=555, volume=0.02, price_current=2007.0, magic=999)
+        peak, action = orchestrator._evaluate_short_term_position_management(position, 2010.0, 5.0)
+        assert peak == 2010.0  # retracement doesn't lower the tracked peak
+        assert action is not None
+        assert action.action == "TRADE_ACTION_DEAL"
+        assert action.position_ticket == 555
+        assert action.volume == 0.02
+        assert action.magic == 999
+        assert action.comment == orchestrator.SHORT_TERM_PROFIT_LOCK_COMMENT
+
+    def test_not_yet_retraced_continues_tracking_no_close(self) -> None:
+        position = self._position(price_current=2011.0)
+        peak, action = orchestrator._evaluate_short_term_position_management(position, 2010.0, 5.0)
+        assert peak == 2011.0  # new high, peak extends further
+        assert action is None
+
+
+class TestBarCloseCycleProfitLock(_BarCloseCycleHelpers):
+    """`run_bar_close_cycle()`'s end-to-end wiring of the short-term
+    profit-peak lock, including its isolation from the regular position's
+    `FSMContext` via a distinct action comment."""
+
+    def test_profit_lock_closes_short_term_without_touching_regular_position(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        # Regular mode holds its own, unrelated position this cycle.
+        regular_position = self._position()
+        context = self._in_position_context(regular_position)
+        snapshot = self._snapshot(current_price=2000.0)  # regular's own ATR/price context
+        short_term_position = self._broker_position(
+            ticket=888, side="BUY", price_open=2000.0, price_current=2007.0, volume=0.02
+        )
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="SHORT_TERM",
+            short_term_position=short_term_position,
+            # ATR is 5.0 in the fixture -> retraced 3.0 >= the 2.5 trigger.
+            short_term_peak_price=2010.0,
+        )
+        short_term_closes = [
+            a
+            for a in result.position_actions
+            if a.comment == orchestrator.SHORT_TERM_PROFIT_LOCK_COMMENT
+        ]
+        assert len(short_term_closes) == 1
+        assert short_term_closes[0].position_ticket == 888
+        assert result.short_term_peak_price == 2010.0
+        # The regular position's own management action (if any) never
+        # carries the profit-lock comment, and EMERGENCY_LIQUIDATION_COMMENT
+        # never appears at all — nothing here resembles a HARD_LOCK.
+        assert all(a.comment != EMERGENCY_LIQUIDATION_COMMENT for a in result.position_actions)
+
+    def test_peak_price_echoed_back_when_no_lock_triggered(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        context = self._idle_context()
+        snapshot = self._snapshot()
+        short_term_position = self._broker_position(price_current=2001.0)
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="SHORT_TERM",
+            short_term_position=short_term_position,
+            short_term_peak_price=None,
+        )
+        assert result.short_term_peak_price == 2001.0
         assert result.position_actions == ()

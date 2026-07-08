@@ -400,18 +400,35 @@ wiring between them is correct too.
   this bullet rather than including it — see §3's flagged note. There is
   currently no automated, structured signal for "is this system healthy
   right now" beyond the Python `logging` module.
-- **The short-term (scalp) trading mode's fills are never written to
-  `trade_ledger`.** `TRADING_MODE=SHORT_TERM`/`BOTH` (`main.py`,
-  `strategy/trend_filter.py`'s `evaluate_short_term_trend()`) trades under
-  a distinct magic number with a fixed ATR-based TP/SL that MT5 closes
-  automatically — but nothing in this codebase learns *when* that
-  happens, so a ledger row would sit `OPEN` forever with no path to
-  `CLOSED`. `submit_with_pre_flight_ledger`'s REQUESTED/SENT/FILLED audit
-  trail is still recorded for idempotency, but `state_manager.record_trade()`
-  is deliberately skipped for this mode's fills. Consequence: short-term
-  trades are invisible to `optimizer/self_learning.py`'s analytics
-  entirely. A real close-tracking mechanism (e.g. polling
-  `mt5.history_deals_get()`) is unscheduled.
+- ~~The short-term (scalp) trading mode's fills are never written to
+  `trade_ledger`.~~ **Fixed.** Short-term entries are now recorded `OPEN`
+  (with `broker_ticket` set); `broker/mt5_gateway.py`'s `get_closing_deal()`
+  (queries MT5 deal history by `position_id`/`DEAL_ENTRY_OUT`) plus
+  `StateManager.get_open_trade_by_ticket()` let `main.py` reconcile the
+  real outcome once `_fetch_short_term_position()` detects the position
+  is gone, turning the row `CLOSED` with the real `close_price`/`profit`.
+  Short-term trades now feed `optimizer/self_learning.py`'s analytics.
+- ~~The weekend self-learning optimizer (`optimizer/self_learning.py`)
+  was fully built and tested but never started anywhere, and even if
+  started, its shifts were only ever recorded to `parameter_history`
+  with nothing reading them back.~~ **Fixed.** `container.py` now starts
+  `create_weekend_optimizer_scheduler()` at boot; `main.py` resolves
+  `ADX_TREND_THRESHOLD`/`TRAILING_ATR_MULTIPLIER` fresh every cycle via
+  the new `optimizer.self_learning.get_effective_parameter_value()`
+  (latest applied shift, or the hardcoded default), so a Saturday shift
+  changes live behavior starting the very next cycle.
+- **A `HARD_LOCK` freeze (not liquidate) loses short-term profit-peak
+  tracking.** If the short-term mode's new profit-peak lock (tracks the
+  best favorable price reached; closes early if price retraces `0.5x
+  ATR` while still in profit) is mid-tracking when a `HARD_LOCK` freezes
+  rather than liquidates, the tracked peak resets to `None` while frozen
+  (`run_bar_close_cycle()`'s `blocks_position_management` gate returns
+  before the profit-lock ever runs). If a human later clears
+  `MANUAL_RESET_REQUIRED` with that position still open, tracking
+  restarts fresh from the current price rather than resuming the true
+  historical peak — the same class of limitation already documented
+  above for the regular position's partial-close/breakeven state after
+  a crash restart.
 
 ## 6. What is and isn't covered by the automated test suite
 
