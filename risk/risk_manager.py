@@ -79,3 +79,30 @@ def calculate_compounded_lot_size(
     tiers = math.floor(equity / equity_per_lot_increment)
     raw_lots = base_lot_size + tiers * lot_increment
     return clamp_lot_size(raw_lots, volume_min, volume_max, volume_step)
+
+
+def calculate_price_distance_for_target_profit(
+    target_profit_usd: float, volume: float, tick_value: float, tick_size: float
+) -> float:
+    """Convert a target dollar profit into the price distance that
+    realizes it at `volume` lots, given the broker's own
+    `tick_value`/`tick_size` (`broker.mt5_gateway.SymbolSpec` —
+    `tick_value` is the account-currency profit per `tick_size` price
+    move, per 1.0 lot; both broker-reported, not fixed constants, since a
+    fixed price distance means a different dollar amount at 0.01 lots
+    than at 0.1).
+
+    `target_profit_usd / (volume lots * tick_value per tick) * tick_size`
+    — e.g. tick_value=$1.00 per 0.01 tick per lot, volume=0.01 lots,
+    target=$5: distance = 5 / (0.01 * 1.00) * 0.01 = 5.0 price units.
+    """
+    if target_profit_usd <= 0:
+        raise ValueError(f"target_profit_usd must be > 0, got {target_profit_usd}")
+    if volume <= 0:
+        raise ValueError(f"volume must be > 0, got {volume}")
+    if tick_value <= 0 or tick_size <= 0:
+        raise ValueError(
+            f"tick_value and tick_size must both be > 0, got tick_value={tick_value}, "
+            f"tick_size={tick_size}"
+        )
+    return target_profit_usd * tick_size / (tick_value * volume)

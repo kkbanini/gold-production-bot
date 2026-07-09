@@ -56,14 +56,21 @@ unwired (see docs/ARCHITECTURE_SUMMARY.md §5).
 between the original D1+H4+H1-aligned strategy above and a second,
 independent short-term (scalp) mode (`decide_short_term_entry_signal()`,
 `strategy.trend_filter.evaluate_short_term_trend()`): relaxed to H1
-direction + a lower ADX bar, fixed minimum lot, fixed ATR-based TP/SL that
-MT5 closes automatically — so, unlike the regular position, it is never
-tracked in `FSMContext` (stateless; `main()` re-queries it from the
-broker every cycle via `config.short_term_magic_number`, a distinct magic
-number so the two modes' positions never collide). Short-term fills are
-NOT written to `trade_ledger` (see `_evaluate_short_term_entry()`'s
-docstring) and are therefore invisible to `optimizer/self_learning.py`'s
-analytics — a deliberate, documented gap, not an oversight.
+direction + a lower ADX bar, fixed minimum lot, an ATR-based SL and a
+fixed-dollar-profit TP (`SHORT_TERM_TP_TARGET_USD`, converted to a price
+distance via `risk.risk_manager.calculate_price_distance_for_target_profit()`)
+that MT5 closes automatically, or the profit-peak lock
+(`decide_short_term_profit_lock()`) closes early if price retraces from
+its best-favorable point while still in profit — so, unlike the regular
+position, it is never tracked in `FSMContext` (stateless; `main()`
+re-queries it from the broker every cycle via
+`config.short_term_magic_number`, a distinct magic number so the two
+modes' positions never collide). Short-term fills ARE written to
+`trade_ledger` (recorded `OPEN` at entry; reconciled `CLOSED` with the
+real outcome once `_fetch_short_term_position()` detects the close
+mid-loop, or `MT5Gateway.reconcile_short_term_closes()` catches it at the
+next boot if the process was stopped when it happened), feeding
+`optimizer/self_learning.py`'s analytics.
 """
 
 from __future__ import annotations
@@ -119,7 +126,10 @@ from risk.drawdown_fsm import (
     seed_equity_baselines,
     transition_drawdown_state,
 )
-from risk.risk_manager import calculate_compounded_lot_size
+from risk.risk_manager import (
+    calculate_compounded_lot_size,
+    calculate_price_distance_for_target_profit,
+)
 from storage.state_manager import OrderLifecycleState, StateManager, TradeLedgerEntry
 from strategy.execution_triggers import (
     BreakoutSignal,
@@ -165,12 +175,17 @@ TRADING_MODE_WAIT_FOR_CONDITIONS = "WAIT_FOR_CONDITIONS"
 TRADING_MODE_SHORT_TERM = "SHORT_TERM"
 TRADING_MODE_BOTH = "BOTH"
 
-# Short-term (scalp) mode's fixed ATR-based TP/SL (risk:reward 1:1) — MT5
-# closes the position automatically at whichever is hit first, so no
-# per-cycle trailing/partial-close management like the regular position
-# gets. No spec reference — a made-up-but-documented default.
-SHORT_TERM_TP_ATR_MULTIPLIER = 1.0
+# Short-term (scalp) mode's fixed SL (ATR-based) and TP (a fixed dollar
+# profit target, converted to a price distance via the broker's own
+# tick_value/tick_size — risk.risk_manager.calculate_price_distance_for_target_profit()
+# — so a fixed lot still means the SAME dollar outcome regardless of
+# instrument/broker, unlike a fixed ATR multiple). MT5 closes the
+# position automatically at whichever is hit first (or the profit-peak
+# lock below fires first), so no per-cycle trailing/partial-close
+# management like the regular position gets. No spec reference for
+# either — made-up-but-documented defaults.
 SHORT_TERM_SL_ATR_MULTIPLIER = 1.0
+SHORT_TERM_TP_TARGET_USD = 5.0
 
 # The profit-peak lock's retracement trigger: once a short-term position
 # has been in profit and price retraces from its best-favorable point by
@@ -266,6 +281,8 @@ class SymbolConstraints:
     volume_max: float
     volume_step: float
     magic_number: int
+    tick_value: float
+    tick_size: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,8 +553,11 @@ def _evaluate_short_term_entry(
     if decision.direction == "NONE" or snapshot.current_price is None:
         return decision, None, None, None
 
+    volume = constraints.volume_min
     stop_distance = SHORT_TERM_SL_ATR_MULTIPLIER * snapshot.atr_value
-    tp_distance = SHORT_TERM_TP_ATR_MULTIPLIER * snapshot.atr_value
+    tp_distance = calculate_price_distance_for_target_profit(
+        SHORT_TERM_TP_TARGET_USD, volume, constraints.tick_value, constraints.tick_size
+    )
     if decision.direction == "BUY":
         stop_loss = snapshot.current_price - stop_distance
         take_profit = snapshot.current_price + tp_distance
@@ -545,7 +565,7 @@ def _evaluate_short_term_entry(
         stop_loss = snapshot.current_price + stop_distance
         take_profit = snapshot.current_price - tp_distance
 
-    return decision, stop_loss, take_profit, constraints.volume_min
+    return decision, stop_loss, take_profit, volume
 
 
 def _update_short_term_peak_price(
@@ -1190,6 +1210,8 @@ def main() -> None:
         volume_max=container.gateway.symbol_spec.volume_max,
         volume_step=container.gateway.symbol_spec.volume_step,
         magic_number=container.config.strategy_magic_number,
+        tick_value=container.gateway.symbol_spec.tick_value,
+        tick_size=container.gateway.symbol_spec.tick_size,
     )
     logger.info(
         "Entering bar-close loop: state=%s position=%s drawdown_state=%s",
