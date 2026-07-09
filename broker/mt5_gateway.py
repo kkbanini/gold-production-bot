@@ -470,6 +470,51 @@ class MT5Gateway:
                 )
         return None
 
+    def reconcile_short_term_closes(
+        self, magic_number: int, ledger_open_trades: list[TradeLedgerEntry]
+    ) -> list[TradeLedgerEntry]:
+        """Boot-time catch-up for the short-term mode's ledger: for every
+        still-`OPEN` `ledger_open_trades` row under `magic_number` whose
+        `broker_ticket` is no longer among this magic's real open
+        positions, look up its closing deal (`get_closing_deal()`) and
+        return an updated `CLOSED` copy for the caller to
+        `state_manager.record_trade()`.
+
+        Unlike the regular position's Disaster Recovery reconciliation
+        (`audit_open_positions()`/`resolve_position_audit()`, which only
+        detects divergence — it never itself learns a position's real
+        profit), this closes the loop for the short-term mode's own gap:
+        `main.py`'s `_fetch_short_term_position()` only catches a close
+        while the bar-close loop is actively running cycle-to-cycle; a
+        close that happens while the process is stopped is never
+        detected once it restarts, unless this runs at boot too. A ticket
+        whose closing deal can't be found yet (rare — `get_closing_deal`'s
+        default 24h lookback should always cover it) is left `OPEN` for a
+        later attempt rather than guessed at.
+        """
+        open_tickets = {
+            position.ticket for position in self.get_open_positions_by_magic(magic_number)
+        }
+        updates: list[TradeLedgerEntry] = []
+        for entry in ledger_open_trades:
+            if entry.magic_number != magic_number or entry.broker_ticket is None:
+                continue
+            if entry.broker_ticket in open_tickets:
+                continue
+            closed_deal = self.get_closing_deal(entry.broker_ticket)
+            if closed_deal is None:
+                continue
+            updates.append(
+                dataclasses.replace(
+                    entry,
+                    status="CLOSED",
+                    close_price=closed_deal.close_price,
+                    profit=closed_deal.profit,
+                    closed_at_utc=closed_deal.closed_at_utc.isoformat(),
+                )
+            )
+        return updates
+
     def is_ticket_still_open(self, ticket: int) -> bool:
         """Query the broker's live position cache for `ticket` — the
         "query the server cache" half of the pre-flight idempotency audit

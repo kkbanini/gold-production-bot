@@ -201,6 +201,26 @@ class ApplicationContainer:
         else:
             initial_drawdown_state = DrawdownState.ACTIVE
 
+        # Short-term mode's own boot-time catch-up: unlike the regular
+        # position above, a short-term close is normally only detected
+        # while main()'s loop is actively cycling
+        # (`_fetch_short_term_position()`'s cycle-to-cycle comparison) —
+        # one that happens while the process is stopped would otherwise
+        # sit `OPEN` in trade_ledger forever. Doesn't affect
+        # initial_drawdown_state: the short-term position is stateless
+        # (never tracked in FSMContext), so this is ledger bookkeeping for
+        # optimizer/self_learning.py's analytics, not a safety gate.
+        short_term_updates = gateway.reconcile_short_term_closes(
+            config.short_term_magic_number, state_manager.get_open_trades()
+        )
+        for update in short_term_updates:
+            state_manager.record_trade(update)
+            logger.info(
+                "Reconciled short-term close at boot: ticket=%s profit=%s",
+                update.broker_ticket,
+                update.profit,
+            )
+
         calendar_config = CalendarConfig.from_env()
         calendar_provider = build_calendar_provider_chain(
             calendar_config, config.economic_calendar_api_key

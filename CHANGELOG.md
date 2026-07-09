@@ -33,6 +33,33 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Fixed — Short-Term Closes Missed While the Process Was Stopped
+
+- `main.py`'s `_fetch_short_term_position()` only detects a short-term
+  position's close by comparing broker state cycle-to-cycle — a close
+  that happens while the process is stopped (as opposed to mid-loop) was
+  never caught once the process restarted, leaving a stale `OPEN`
+  `trade_ledger` row forever (found via two real historical closes on
+  the demo account that should have reconciled but hadn't). Unlike the
+  regular position, which already gets this exact catch-up for free from
+  the existing Disaster Recovery reconciliation
+  (`audit_open_positions()`/`resolve_position_audit()`, both boot-time),
+  the short-term mode had no boot-time equivalent.
+- `broker/mt5_gateway.py`'s new `MT5Gateway.reconcile_short_term_closes()`
+  closes this: at boot, `container.py` now checks every still-`OPEN`
+  short-term-magic ledger row against the broker's real open positions,
+  and for any that closed while the process was down, looks up the real
+  outcome via the existing `get_closing_deal()` and records it `CLOSED`
+  — the same reconciliation `_fetch_short_term_position()` already does
+  mid-loop, just also run once at boot. Does not affect
+  `initial_drawdown_state` (the short-term position is stateless, never
+  tracked in `FSMContext` — this is ledger bookkeeping for
+  `optimizer/self_learning.py`'s analytics, not a safety gate).
+- Verified live: two stale `OPEN` rows on the real IC Markets demo
+  account (from real SL-hit closes that happened while the process
+  wasn't running) were manually reconciled using the same logic this fix
+  now runs automatically at every boot.
+
 ### Added — Self-Learning Optimizer Wired Live + Short-Term Profit-Peak Lock
 
 - **The weekend self-learning optimizer now actually runs.**

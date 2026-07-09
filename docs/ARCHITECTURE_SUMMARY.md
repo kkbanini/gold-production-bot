@@ -408,6 +408,11 @@ wiring between them is correct too.
   real outcome once `_fetch_short_term_position()` detects the position
   is gone, turning the row `CLOSED` with the real `close_price`/`profit`.
   Short-term trades now feed `optimizer/self_learning.py`'s analytics.
+  This mid-loop detection alone missed closes that happened while the
+  process was stopped (found via two real stale rows on the demo
+  account); `MT5Gateway.reconcile_short_term_closes()` now runs the same
+  catch-up at every boot too (`container.py`), mirroring the regular
+  position's existing Disaster Recovery reconciliation.
 - ~~The weekend self-learning optimizer (`optimizer/self_learning.py`)
   was fully built and tested but never started anywhere, and even if
   started, its shifts were only ever recorded to `parameter_history`

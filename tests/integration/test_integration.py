@@ -572,6 +572,103 @@ class TestPositionAuditReconciliation:
         assert report.is_clean is False
 
 
+class TestReconcileShortTermCloses:
+    """`MT5Gateway.reconcile_short_term_closes()` — the boot-time catch-up
+    for short-term positions that closed while the process wasn't
+    running to catch them cycle-to-cycle."""
+
+    def _ledger_entry(self, **overrides: object) -> TradeLedgerEntry:
+        defaults: dict[str, object] = dict(
+            client_order_id="co-1",
+            symbol="XAUUSD",
+            side="SELL",
+            volume_lots=0.01,
+            status="OPEN",
+            opened_at_utc="2026-07-08T15:45:00Z",
+            magic_number=777,
+            broker_ticket=500,
+        )
+        defaults.update(overrides)
+        return TradeLedgerEntry(**defaults)  # type: ignore[arg-type]
+
+    def test_still_open_position_is_left_alone(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.positions[500] = FakePosition(500, "XAUUSD", fake_mt5.POSITION_TYPE_SELL, 777)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        updates = gateway.reconcile_short_term_closes(777, [self._ledger_entry()])
+        assert updates == []
+
+    def test_closed_position_is_reconciled_with_real_outcome(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        # No FakePosition seeded for ticket 500: it's no longer open.
+        fake_mt5.deals = [
+            FakeDeal(
+                1,
+                position_id=500,
+                entry=fake_mt5.DEAL_ENTRY_IN,
+                price=2000.0,
+                profit=0.0,
+                time_=1000,
+            ),
+            FakeDeal(
+                2,
+                position_id=500,
+                entry=fake_mt5.DEAL_ENTRY_OUT,
+                price=1990.0,
+                profit=10.0,
+                time_=2000,
+            ),
+        ]
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        updates = gateway.reconcile_short_term_closes(777, [self._ledger_entry()])
+        assert len(updates) == 1
+        assert updates[0].client_order_id == "co-1"
+        assert updates[0].status == "CLOSED"
+        assert updates[0].close_price == 1990.0
+        assert updates[0].profit == 10.0
+        assert updates[0].closed_at_utc == datetime.fromtimestamp(2000, tz=timezone.utc).isoformat()
+
+    def test_closing_deal_not_found_leaves_entry_untouched(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        updates = gateway.reconcile_short_term_closes(777, [self._ledger_entry()])
+        assert updates == []
+
+    def test_ignores_entries_under_a_different_magic_number(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.deals = [
+            FakeDeal(
+                2,
+                position_id=500,
+                entry=fake_mt5.DEAL_ENTRY_OUT,
+                price=1990.0,
+                profit=10.0,
+                time_=2000,
+            ),
+        ]
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        other_magic_entry = self._ledger_entry(magic_number=999)
+        updates = gateway.reconcile_short_term_closes(777, [other_magic_entry])
+        assert updates == []
+
+    def test_ignores_entries_with_no_broker_ticket(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        entry = self._ledger_entry(broker_ticket=None)
+        updates = gateway.reconcile_short_term_closes(777, [entry])
+        assert updates == []
+
+
 class TestOptimizerIsolation:
     """The core safety property of Phase 8: the weekend self-learning
     optimizer must never touch active trading state."""
@@ -939,6 +1036,60 @@ class TestApplicationContainer:
             assert context.state == orchestrator.TradingState.IDLE
             assert context.position is None
             assert context.drawdown_state == DrawdownState.ACTIVE
+        finally:
+            app.state_manager.close()
+
+    def test_build_reconciles_stale_short_term_close_at_boot(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A short-term position that closed while the process wasn't
+        running (so `_fetch_short_term_position()` never caught the
+        cycle-to-cycle transition) must still get reconciled at the next
+        boot — the gap this test guards against."""
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        # No FakePosition for ticket 500 (short-term magic 556): it's closed.
+        fake_mt5.deals = [
+            FakeDeal(
+                1,
+                position_id=500,
+                entry=fake_mt5.DEAL_ENTRY_OUT,
+                price=1990.0,
+                profit=-5.0,
+                time_=2000,
+            ),
+        ]
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        db_path = tmp_path / "container_short_term_reconcile.db"
+        pre_seed = StateManager(db_path)
+        pre_seed.record_trade(
+            TradeLedgerEntry(
+                client_order_id="stale-short-term",
+                symbol="XAUUSD",
+                side="SELL",
+                volume_lots=0.01,
+                status="OPEN",
+                opened_at_utc="2026-07-08T15:45:00Z",
+                magic_number=556,
+                broker_ticket=500,
+            )
+        )
+        pre_seed.close()
+
+        app = ApplicationContainer.build(env_file="nonexistent.env", db_path=db_path)
+        try:
+            assert app.state_manager.get_open_trade_by_ticket(500) is None
+            closed = app.state_manager.get_closed_trades()
+            assert len(closed) == 1
+            assert closed[0].client_order_id == "stale-short-term"
+            assert closed[0].profit == -5.0
+            assert closed[0].close_price == 1990.0
         finally:
             app.state_manager.close()
 
