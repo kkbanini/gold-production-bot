@@ -110,6 +110,19 @@ class AuditEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class HeartbeatInfo:
+    """The bot's last-known liveness signal (`bot_heartbeat`'s pinned
+    singleton row). `last_heartbeat_utc` is kept as a raw ISO string (same
+    convention as `TradeLedgerEntry`'s timestamp fields) — parsing and
+    staleness interpretation belongs to the consumer
+    (`monitoring/telegram_bot.py`'s `format_status_message()`), not this
+    storage layer."""
+
+    trading_mode: str
+    last_heartbeat_utc: str
+
+
+@dataclass(frozen=True, slots=True)
 class TradeLedgerEntry:
     """A single row of the trade_ledger table."""
 
@@ -139,10 +152,18 @@ class StateManager:
     with no partial/torn state possible (docs/RUNBOOK.md §1 step 4).
     """
 
-    def __init__(self, db_path: Path | str = DEFAULT_DB_PATH) -> None:
-        self._connection: sqlite3.Connection = connect(db_path)
-        initialize_schema(self._connection)
-        apply_pending_migrations(self._connection)
+    def __init__(self, db_path: Path | str = DEFAULT_DB_PATH, *, read_only: bool = False) -> None:
+        """`read_only=True` opens the database in SQLite's native
+        query-only mode (ADR-0003: exactly one writer connection per
+        process/system; readers — e.g. `monitoring/telegram_bot.py`'s
+        separate process — may open concurrently without blocking the
+        writer). Schema initialization/migrations are DDL writes, so they
+        are skipped in read-only mode: the writer process (main.py) is
+        assumed to have already created the schema at least once."""
+        self._connection: sqlite3.Connection = connect(db_path, read_only=read_only)
+        if not read_only:
+            initialize_schema(self._connection)
+            apply_pending_migrations(self._connection)
 
     def close(self) -> None:
         self._connection.close()
@@ -186,6 +207,41 @@ class StateManager:
             return None
         state: dict[str, Any] = json.loads(row["fsm_state_json"])
         return state, int(row["last_sequence_id"])
+
+    # --- Liveness heartbeat (monitoring/) ---
+
+    def record_heartbeat(self, trading_mode: str) -> None:
+        """Upsert the bot's liveness signal + active `TRADING_MODE`.
+
+        Called once per `main.py` bar-close loop iteration (including the
+        weekend-skip branch, so the signal never looks stale purely
+        because the market is closed) — the only write
+        `monitoring/telegram_bot.py`'s `/check` command relies on to tell
+        "process alive and iterating" apart from "stopped/crashed".
+        """
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO bot_heartbeat (id, trading_mode, last_heartbeat_utc)
+                VALUES (1, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    trading_mode = excluded.trading_mode,
+                    last_heartbeat_utc = excluded.last_heartbeat_utc
+                """,
+                (trading_mode, _utc_now_iso()),
+            )
+
+    def get_heartbeat(self) -> HeartbeatInfo | None:
+        """The last-recorded heartbeat, or `None` if `main.py` has never
+        run against this database file."""
+        row = self._connection.execute(
+            "SELECT trading_mode, last_heartbeat_utc FROM bot_heartbeat WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return HeartbeatInfo(
+            trading_mode=row["trading_mode"], last_heartbeat_utc=row["last_heartbeat_utc"]
+        )
 
     # --- Trade ledger ---
 
@@ -265,6 +321,21 @@ class StateManager:
         """
         cursor = self._connection.execute(
             "SELECT * FROM trade_ledger WHERE closed_at_utc IS NOT NULL ORDER BY opened_at_utc"
+        )
+        return [_row_to_entry(row) for row in cursor.fetchall()]
+
+    def get_recent_trades(self, limit: int = 7) -> list[TradeLedgerEntry]:
+        """The `limit` most recently opened trade_ledger rows — both
+        `OPEN` and `CLOSED` — most recent first.
+
+        Used by `monitoring/telegram_bot.py`'s `/checkhisorder`. Ordered
+        by the table's own `AUTOINCREMENT` id (a strictly monotonic
+        insertion order, same rationale `OrderEvent.sequence_id` already
+        uses) rather than `opened_at_utc`, which is just a stored string
+        and not guaranteed collision-free.
+        """
+        cursor = self._connection.execute(
+            "SELECT * FROM trade_ledger ORDER BY id DESC LIMIT ?", (limit,)
         )
         return [_row_to_entry(row) for row in cursor.fetchall()]
 

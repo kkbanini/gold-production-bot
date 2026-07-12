@@ -365,33 +365,31 @@ wiring between them is correct too.
   by stopping the process, fixing/reviewing the situation, and either
   restarting with a patched `main()` or manually resetting the persisted
   `FSMContext`. Building the actual control channel is unscheduled.
-- **The news feed is never actually connected in the live loop, and the
-  normalized clock is only partially connected, despite both now having a
-  working abstraction (Phase 11b).** `main()` still calls
-  `_fetch_market_snapshot(handles.gateway, constraints.magic_number, [])`
-  — the empty list is a hardcoded placeholder, not real news events — and
-  still calls `datetime.now(timezone.utc)` directly for
+- ~~The news feed is never actually connected in the live loop.~~
+  **Fixed** (the news half). `main.py`'s `_fetch_news_events()` now calls
+  `container.calendar_provider.fetch_events()` every cycle for exactly
+  the ±`MACRO_BLACKOUT_WINDOW` range `is_trade_entry_locked()` evaluates,
+  degrading open (log + `[]`) if the whole provider chain fails — the
+  documented News-API-down posture is a degraded mode, not a hard halt
+  (`apply_news_feed_fail_safe()`'s risk-halving side remains unwired).
+  **Still open — the normalized clock is only partially connected:**
+  `main()` still calls `datetime.now(timezone.utc)` directly for
   `run_bar_close_cycle()`'s `now_utc`, the weekend-closure check, and the
-  next-bar-close sleep. `ClockProvider.get_server_time()` is now consumed,
-  but only for the equity-baseline rollover decision (see the fixed gap
-  above) — the rest of the loop's timing still reads the host machine
-  clock. The NFP/CPI/FOMC blackout and the News-API-down fail-safe
-  (Phase 7) are both fully implemented and tested in isolation;
-  `container.py`'s `ApplicationContainer` holds a fully-wired
-  `calendar_provider` (`CalendarProviderChain`, defaulting to a
-  network-independent `offline_snapshot` provider), but nothing in
-  `main.py` calls it yet. Wiring the network calendar providers to real
-  endpoints additionally requires a real `tradingeconomics`/`finnhub` API
-  contract, which this codebase has never verified (Phase 7 flagged that
-  no provider was ever named; `CALENDAR_TRADINGECONOMICS_BASE_URL`/
-  `CALENDAR_FINNHUB_BASE_URL` must be supplied by a deployer, never
-  guessed).
-- **`ENVIRONMENT_MODE`'s broker-side cross-check never landed.** `config/`
-  validates `ENVIRONMENT_MODE` is `DEMO`/`LIVE`, but `broker/mt5_gateway.py`
-  never cross-checks that value against the actually-connected account's
-  real demo/live status (RR-012). Nothing currently prevents starting the
-  process with `ENVIRONMENT_MODE=DEMO` while actually connected to a live
-  account, or vice versa.
+  next-bar-close sleep; `ClockProvider.get_server_time()` is consumed
+  only for the equity-baseline rollover decision. Wiring the network
+  calendar providers to real endpoints additionally requires a real
+  `tradingeconomics`/`finnhub` API contract, which this codebase has
+  never verified (Phase 7 flagged that no provider was ever named;
+  `CALENDAR_TRADINGECONOMICS_BASE_URL`/`CALENDAR_FINNHUB_BASE_URL` must
+  be supplied by a deployer, never guessed) — the default chain is the
+  local `offline_snapshot` provider.
+- ~~`ENVIRONMENT_MODE`'s broker-side cross-check never landed.~~
+  **Fixed** (RR-012). `MT5Gateway.get_account_trade_mode()` maps
+  `account_info().trade_mode` to `DEMO`/`CONTEST`/`REAL`, and
+  `ApplicationContainer.build()` refuses to start (fail-closed
+  `ConfigurationError`) when the configured `ENVIRONMENT_MODE` doesn't
+  match the account class the broker actually reports. A `CONTEST`
+  account matches neither mode and is always refused.
 - **SLO Metrics (`docs/PRODUCTION_SPEC.md` §7's fourth bullet) were never
   built.** No background daemon thread tracks `trade_latency`, `spread`,
   `order_reject_rate`, `mt5_latency`, `retry_count`, or

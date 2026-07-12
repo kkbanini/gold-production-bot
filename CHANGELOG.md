@@ -33,6 +33,260 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Fixed — `TRADING_MODE=SHORT_TERM` Never Actually Disabled the Regular Strategy
+
+- `run_bar_close_cycle()` evaluated `decide_entry_signal()` (the
+  original D1+H4+H1-aligned WAIT_FOR_CONDITIONS strategy) and `main()`
+  submitted its result unconditionally, regardless of `trading_mode` —
+  despite the module docstring's claim that `trading_mode` "selects
+  between" the two strategies. `_evaluate_short_term_entry()` already
+  gated its own evaluation on `trading_mode`; the regular strategy had
+  no equivalent gate at all. In practice this never caused a live
+  regular-mode fill (0 real trades ever recorded under
+  `STRATEGY_MAGIC_NUMBER` — its D1+H4+H1+ADX conditions are far
+  stricter than short-term's relaxed H1-only ones, so the gap simply
+  hadn't been hit yet), but it could fire at any moment while
+  `TRADING_MODE=SHORT_TERM` was configured, contradicting the
+  documented and expected behavior.
+- Fixed: `run_bar_close_cycle()` now returns `entry_decision=None`
+  immediately when `trading_mode == TRADING_MODE_SHORT_TERM` and the
+  regular position is flat — mirroring `_evaluate_short_term_entry()`'s
+  own gate. Only gates *new* entries: a regular position already open
+  keeps being managed (trailing stop, partial close, breakeven)
+  regardless of `trading_mode`, the same way short-term's own open
+  position is always managed independent of `trading_mode` too.
+  `WAIT_FOR_CONDITIONS` and `BOTH` are unaffected.
+
+### Reverted — Short-Term Mode Back to the Original ATR-Based SL/TP
+
+- The user chose to return to the original design: both dollar-target
+  experiments (`SHORT_TERM_TP_TARGET_USD` — $5, then $1 — and
+  `SHORT_TERM_SL_TARGET_USD` $1.50) are removed. `main.py` is back to
+  `SHORT_TERM_TP_ATR_MULTIPLIER = 1.0` / `SHORT_TERM_SL_ATR_MULTIPLIER
+  = 1.0` (risk:reward 1:1, both scaling with current volatility), and
+  the profit-peak lock is back to its ATR-retracement trigger
+  (`SHORT_TERM_PROFIT_LOCK_RETRACEMENT_ATR_MULTIPLIER = 0.5`;
+  `decide_short_term_profit_lock()` takes `atr_value` again,
+  `_evaluate_short_term_position_management()` takes `atr_value` instead
+  of `SymbolConstraints`). No rule closes an order at any fixed dollar
+  profit or loss anymore.
+- `risk.risk_manager.calculate_price_distance_for_target_profit()` stays
+  (pure, tested, no longer imported by `main.py`) — available if a
+  dollar-target variant is ever wanted again.
+
+### Added — Resilience + Push Alerts + Two §5 Gap Closures (news wiring, RR-012)
+
+- **The bar-close loop now survives transient MT5 connection losses.**
+  `main()` split into a thin crash-alert boundary plus
+  `_run_trading_loop()`, whose per-cycle broker work (`run_one_cycle()`,
+  a closure over the loop state) runs inside a `BrokerConnectionError`
+  guard: a mid-cycle connection loss (terminal restart, network blip)
+  logs, notifies, reconnects via `gateway.connect()`'s existing
+  exponential backoff, and resumes on the next bar close instead of
+  killing the process. Only *connection* errors are absorbed —
+  `BrokerOrderRejectedError` still propagates and halts (the documented
+  safe default: an ambiguous/rejected order must never be blindly
+  retried, per `docs/ARCHITECTURE_SUMMARY.md` §5's idempotency-gap
+  entry). An exception the guard can't absorb now triggers a final
+  Telegram crash alert before re-raising unchanged — the process still
+  halts fail-closed, it just no longer halts *silently*.
+- **New `monitoring/notifier.py`: optional fire-and-forget Telegram push
+  alerts.** The inverse of `monitoring/telegram_bot.py`'s pull model:
+  `main.py`'s own process now pushes a message the moment something
+  noteworthy happens — bot started, entry filled (regular and
+  short-term), short-term close reconciled (with real profit),
+  `HARD_LOCK` emergency liquidation, MT5 reconnect, crash.
+  `build_notifier_from_env()` returns `None` when `TELEGRAM_*` isn't
+  configured (optional add-on, never a boot requirement) and
+  `TelegramNotifier.send()` swallows every exception after logging — a
+  notification failure can never take down or delay the trading loop.
+  Held on the container as `ApplicationContainer.notifier`.
+- **Real news events now reach the live loop (§5 gap closed).** `main()`
+  passed a hardcoded `[]` to `_fetch_market_snapshot()` despite
+  `container.calendar_provider` being fully wired since Phase 11b — the
+  NFP/CPI/FOMC blackout logic was implemented and tested but never
+  received real events. New `_fetch_news_events()` fetches exactly the
+  ±`MACRO_BLACKOUT_WINDOW` range `is_trade_entry_locked()` evaluates,
+  every cycle, degrading open (log + `[]`) if the whole provider chain
+  fails — the documented News-API-down posture is a degraded mode, not
+  a hard halt (`apply_news_feed_fail_safe()`'s risk-halving side remains
+  unwired, matching the standing §5 note).
+- **`ENVIRONMENT_MODE`'s broker-side cross-check landed (RR-012, §5 gap
+  closed).** New `MT5Gateway.get_account_trade_mode()` (maps
+  `account_info().trade_mode` to `DEMO`/`CONTEST`/`REAL`);
+  `ApplicationContainer.build()` now refuses to start (fail-closed
+  `ConfigurationError`) when the configured `ENVIRONMENT_MODE` doesn't
+  match the account class the broker actually reports — previously
+  nothing prevented booting with `ENVIRONMENT_MODE=DEMO` while pointed
+  at a live account, or vice versa. A `CONTEST` account matches neither
+  mode and is always refused.
+
+### Changed — Short-Term Mode's Stop-Loss Converted to a Fixed Dollar Target + Profit-Lock Re-Based Off the TP
+
+- `main.py`'s `SHORT_TERM_SL_ATR_MULTIPLIER` (ATR-based SL) replaced with
+  `SHORT_TERM_SL_TARGET_USD = 1.5` — the short-term (scalp) mode's
+  stop-loss is now a fixed dollar target, converted to a price distance
+  via `risk.risk_manager.calculate_price_distance_for_target_profit()`
+  the same way the take-profit already was. Previously the SL scaled
+  with ATR while the TP stayed fixed at $1 — in live conditions this
+  meant SL routinely risked $12-16 against the $1 target (a ~90%+ win
+  rate needed to break even), while the real observed win rate was only
+  ~60-66%. A $1.50 SL against the $1 TP needs a much more achievable
+  ~60% breakeven win rate, matching what's actually being observed.
+- `main.py`'s `SHORT_TERM_PROFIT_LOCK_RETRACEMENT_ATR_MULTIPLIER`
+  (ATR-relative retracement trigger) replaced with
+  `SHORT_TERM_PROFIT_LOCK_RETRACEMENT_FRACTION_OF_TP = 0.5` — the
+  profit-peak lock's trigger is now a fraction of the TP's own price
+  distance instead of ATR. An ATR-relative threshold could end up
+  larger *or* smaller than the TP's distance depending on current
+  volatility, letting the lock fire before a position ever had a real
+  chance to reach TP — observed live, several positions closed at
+  $0.47-0.97, short of the full $1 target, purely because ATR happened
+  to be small that cycle. `decide_short_term_profit_lock()`'s signature
+  changed from `atr_value: float` to `tp_distance: float`;
+  `_evaluate_short_term_position_management()`'s from `atr_value: float`
+  to `constraints: SymbolConstraints` (computes `tp_distance` internally
+  from the position's own volume).
+- Both changes replace the two remaining ATR-driven parameters of
+  short-term mode with dollar-driven ones, so the mode's entire
+  risk/reward shape now stays constant regardless of current volatility
+  — previously only the TP was dollar-fixed, so the ratio silently
+  drifted with whatever ATR happened to be at entry.
+
+### Changed — Short-Term Mode's Take-Profit Lowered to $1
+
+- `main.py`'s `SHORT_TERM_TP_TARGET_USD` changed from `5.0` to `1.0` —
+  the short-term (scalp) mode's fixed dollar-profit take-profit now
+  closes at $1.00 of profit instead of $5.00, converted to a price
+  distance the same way as before via
+  `risk.risk_manager.calculate_price_distance_for_target_profit()`.
+  Real ledger data (22 closed trades: 12 wins totaling +$49.22, 10
+  losses totaling -$131.95, profit factor ≈0.37) showed losses running
+  far larger than wins — a smaller, faster-hit profit target is a
+  direct response, taking gains sooner rather than giving trades more
+  room to reverse into a loss. The stop-loss and profit-peak lock at the
+  time were unchanged (both later replaced — see above).
+
+### Added — Telegram `/checkhisorder` Recent Order History
+
+- `monitoring/telegram_bot.py` gained `/checkhisorder`: reports the 7
+  most recently opened `trade_ledger` rows (both still-`OPEN` and
+  `CLOSED`), most recent first — side, volume, symbol, status, profit
+  (once closed), and both opened/closed timestamps. Never shows the
+  internal `client_order_id`.
+- New `StateManager.get_recent_trades(limit=7)` (read-only): the `limit`
+  most recent `trade_ledger` rows ordered by the table's own
+  `AUTOINCREMENT` id (not `opened_at_utc`, a stored string with no
+  collision guarantee).
+- New pure `format_order_history_message(trades)` renders the reply;
+  `/checkhisorder`, like `/check`, is read-only and records nothing to
+  the Audit Trail (unlike `/killbot`).
+
+### Fixed — `/check` Could Misreport a Killed Process as Still Running
+
+- After `/killbot` terminates `main.py`, its last heartbeat can still be
+  well within `HEARTBEAT_STALE_AFTER` (20 minutes) — `/check` would keep
+  reporting "✅ กำลังทำงาน" for up to that long after the process was
+  actually confirmed gone.
+- `format_status_message()` gained a `process_alive: bool | None`
+  param, sourced from a new `_is_main_process_alive()` (the same PID-file
+  + `Get-CimInstance` check `_kill_main_process()` already verifies
+  against before killing, reused here read-only). `process_alive is
+  False` now reports "🛑 หยุดทำงาน (main.py ถูกปิดไปแล้ว)" immediately,
+  taking priority over heartbeat freshness; `None` (non-Windows, or no
+  PID file ever written) falls back to heartbeat staleness alone, as
+  before.
+
+### Added — Telegram `/killbot` Emergency Process Termination
+
+- `monitoring/telegram_bot.py` gained `/killbot`: terminates `main.py`'s
+  OS process outright — an emergency stop for when the operator wants
+  the whole process gone. Windows-only (`taskkill`, matching this
+  project's Windows-deployed environment) and not reversible from
+  Telegram: once killed, restarting requires manually running
+  `python main.py` again on the host.
+- `main.py` now writes its own PID to `storage/main.pid`
+  (`storage/db_engine.py`'s new `MAIN_PID_PATH`) once at boot — the only
+  way a separate process (`monitoring/telegram_bot.py`) can find it to
+  terminate. Overwritten fresh on every restart.
+- Before killing, `/killbot` re-queries the OS for the PID's actual
+  command line (`Get-CimInstance Win32_Process`) and confirms it still
+  contains `main.py` — guards against a stale/reused PID (main.py has no
+  graceful-shutdown path today, so `main.pid` can outlive the process
+  that wrote it) — refusing to act rather than risk terminating an
+  unrelated process that happened to reuse the same PID.
+- Recorded to the Audit Trail (`AuditActionType.MANUAL_OVERRIDE`,
+  `parameter_name="main_process_killed"`) — the same mechanism any other
+  state-altering administrative command uses; `actor` is the Telegram
+  chat_id, hashed before storage by the existing `record_audit_event()`.
+  This required `monitoring/telegram_bot.py` to become a writer:
+  `StateManager()` is opened normally (no longer `read_only=True`), its
+  only write being this Audit Trail entry.
+
+### Added — Telegram `/check` Status Bot
+
+- New `monitoring/` package (carved out the same way `resilience/` was —
+  a concern that doesn't belong to any single existing package):
+  `monitoring/telegram_bot.py` long-polls Telegram's `getUpdates` and
+  replies to a `/check` message from an allowed chat with whether
+  `main.py`'s bar-close loop is alive and which `TRADING_MODE` it's
+  running under. Runs as its own standalone process — never imported by
+  `main.py`/`container.py` — and opens its `StateManager` with
+  `read_only=True` (ADR-0003's single-writer principle: `main.py` stays
+  the sole writer), so it can be started, stopped, or restarted
+  independently with zero risk of contending for or corrupting the
+  ledger. Built on `requests` (already a project dependency) against
+  Telegram's plain HTTPS Bot API — no `python-telegram-bot` package
+  added.
+- New single-row `bot_heartbeat` table (`storage/db_engine.py`, same
+  pinned-singleton pattern as `system_state`) +
+  `StateManager.record_heartbeat(trading_mode)`/`get_heartbeat()`.
+  `main.py`'s bar-close loop calls `record_heartbeat()` once per
+  iteration — including its weekend-market-closed skip branch, so a
+  closed weekend market is never mistaken for a stopped process.
+  `format_status_message()` (pure) treats a heartbeat older than
+  `HEARTBEAT_STALE_AFTER` (20 minutes, made-up-but-documented — larger
+  than both cadences the loop ever heartbeats at) as "not running".
+- `StateManager.__init__` gained a `read_only: bool = False` param,
+  threaded to `storage/db_engine.py`'s existing `connect(read_only=...)`
+  support; schema initialization/migrations (DDL writes) are skipped in
+  read-only mode.
+- New `config/telegram_config.py` (`TelegramConfig.from_env()`) owns the
+  optional `TELEGRAM_BOT_TOKEN`/`TELEGRAM_ALLOWED_CHAT_ID` environment
+  variables — `main.py`'s trading loop never depends on them; only the
+  separate monitoring process does.
+
+### Fixed — `get_closing_deal()` Queried Broker Deal History Using the Host Clock
+
+- Even after the previous fix wired `MT5Gateway.reconcile_short_term_closes()`
+  into boot, three fresh short-term `trade_ledger` rows stayed stuck `OPEN`
+  despite their positions having closed hours earlier on the broker side —
+  the boot-time reconciliation and the mid-loop detection in
+  `_fetch_short_term_position()` both silently failed to find the closing
+  deal every single time.
+- Root cause: `get_closing_deal()` built its `mt5.history_deals_get()` query
+  window from `datetime.now(timezone.utc)` — the **host** clock — but
+  `deal.time` is stamped in **broker server** wall-clock terms (same
+  convention as `tick.time`, per `_resolve_broker_utc_offset()`). This demo
+  account's broker server runs ~3 hours ahead of host UTC, so the window's
+  upper bound (`host_now + 5 minutes`) landed ~3 hours before where the
+  actual closing deals were stamped, and the lookup returned `None` for
+  every recent close. This is exactly the class of bug `broker_utc_offset`
+  (ADR-0002) exists to prevent — `get_closing_deal()` was simply the one
+  call site that never applied it, unlike `MT5ClockProvider.get_server_time()`.
+- Fix: `get_closing_deal()` now builds its query window from
+  `datetime.now(timezone.utc) + self.broker_utc_offset`, the same
+  adjustment `MT5ClockProvider.get_server_time()` already applies.
+- New regression test (`test_get_closing_deal_query_window_is_broker_clock_not_host_clock`)
+  asserts the query window sits at broker-clock "now", not host-clock
+  "now", under a 3-hour synthetic offset — large enough that a host-UTC
+  regression can't pass by coincidence.
+- Verified live: reran `reconcile_short_term_closes()` against the real IC
+  Markets demo account after the fix — it immediately found all three
+  stuck positions' real closing deals (previously invisible), and the
+  three stale `OPEN` rows were reconciled to `CLOSED` with their real
+  outcomes.
+
 ### Changed — Short-Term Mode's Take-Profit Is a Fixed Dollar Target
 
 - `risk/risk_manager.py` — new `calculate_price_distance_for_target_profit()`

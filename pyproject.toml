@@ -27,7 +27,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["config*", "storage*", "broker*", "indicators*", "strategy*", "execution*", "risk*", "optimizer*", "backtester*", "analytics*", "news*", "resilience*"]
+include = ["config*", "storage*", "broker*", "indicators*", "strategy*", "execution*", "risk*", "optimizer*", "backtester*", "analytics*", "news*", "resilience*", "monitoring*"]
 
 [tool.ruff]
 target-version = "py312"
@@ -82,6 +82,7 @@ source = [
     "optimizer",
     "news",
     "resilience",
+    "monitoring",
 ]
 omit = ["*/__init__.py", "tests/chaos/*", "tests/stress/*"]
 

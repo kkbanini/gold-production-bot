@@ -56,10 +56,9 @@ unwired (see docs/ARCHITECTURE_SUMMARY.md §5).
 between the original D1+H4+H1-aligned strategy above and a second,
 independent short-term (scalp) mode (`decide_short_term_entry_signal()`,
 `strategy.trend_filter.evaluate_short_term_trend()`): relaxed to H1
-direction + a lower ADX bar, fixed minimum lot, an ATR-based SL and a
-fixed-dollar-profit TP (`SHORT_TERM_TP_TARGET_USD`, converted to a price
-distance via `risk.risk_manager.calculate_price_distance_for_target_profit()`)
-that MT5 closes automatically, or the profit-peak lock
+direction + a lower ADX bar, fixed minimum lot, and fixed 1x-ATR SL/TP
+distances (`SHORT_TERM_SL_ATR_MULTIPLIER`/`SHORT_TERM_TP_ATR_MULTIPLIER`,
+risk:reward 1:1) that MT5 closes automatically, or the profit-peak lock
 (`decide_short_term_profit_lock()`) closes early if price retraces from
 its best-favorable point while still in profit — so, unlike the regular
 position, it is never tracked in `FSMContext` (stateless; `main()`
@@ -76,6 +75,7 @@ next boot if the process was stopped when it happened), feeding
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable
@@ -91,6 +91,7 @@ from broker.mt5_gateway import (
     WEEKEND_CLOSE_HOUR_UTC,
     WEEKEND_REOPEN_HOUR_UTC,
     AccountState,
+    BrokerConnectionError,
     BrokerOrderRejectedError,
     BrokerPosition,
     MT5Gateway,
@@ -110,7 +111,12 @@ from execution.position_manager import (
     evaluate_partial_close_and_breakeven,
 )
 from indicators.math_engine import atr, ema
-from news.news_engine import EconomicEvent, is_trade_entry_locked
+from news.news_engine import (
+    MACRO_BLACKOUT_WINDOW,
+    EconomicEvent,
+    NewsFeedConnectionError,
+    is_trade_entry_locked,
+)
 from optimizer.self_learning import get_effective_parameter_value
 from risk.drawdown_fsm import (
     BaselineEpoch,
@@ -126,10 +132,8 @@ from risk.drawdown_fsm import (
     seed_equity_baselines,
     transition_drawdown_state,
 )
-from risk.risk_manager import (
-    calculate_compounded_lot_size,
-    calculate_price_distance_for_target_profit,
-)
+from risk.risk_manager import calculate_compounded_lot_size
+from storage.db_engine import MAIN_PID_PATH
 from storage.state_manager import OrderLifecycleState, StateManager, TradeLedgerEntry
 from strategy.execution_triggers import (
     BreakoutSignal,
@@ -175,17 +179,14 @@ TRADING_MODE_WAIT_FOR_CONDITIONS = "WAIT_FOR_CONDITIONS"
 TRADING_MODE_SHORT_TERM = "SHORT_TERM"
 TRADING_MODE_BOTH = "BOTH"
 
-# Short-term (scalp) mode's fixed SL (ATR-based) and TP (a fixed dollar
-# profit target, converted to a price distance via the broker's own
-# tick_value/tick_size — risk.risk_manager.calculate_price_distance_for_target_profit()
-# — so a fixed lot still means the SAME dollar outcome regardless of
-# instrument/broker, unlike a fixed ATR multiple). MT5 closes the
-# position automatically at whichever is hit first (or the profit-peak
-# lock below fires first), so no per-cycle trailing/partial-close
-# management like the regular position gets. No spec reference for
-# either — made-up-but-documented defaults.
+# Short-term (scalp) mode's fixed ATR-based TP/SL (risk:reward 1:1) — MT5
+# closes the position automatically at whichever is hit first, so no
+# per-cycle trailing/partial-close management like the regular position
+# gets. No spec reference — a made-up-but-documented default. (Fixed
+# dollar-target variants of both were tried live and reverted: the
+# original ATR-based design is the one the user chose to keep.)
+SHORT_TERM_TP_ATR_MULTIPLIER = 1.0
 SHORT_TERM_SL_ATR_MULTIPLIER = 1.0
-SHORT_TERM_TP_TARGET_USD = 5.0
 
 # The profit-peak lock's retracement trigger: once a short-term position
 # has been in profit and price retraces from its best-favorable point by
@@ -555,9 +556,7 @@ def _evaluate_short_term_entry(
 
     volume = constraints.volume_min
     stop_distance = SHORT_TERM_SL_ATR_MULTIPLIER * snapshot.atr_value
-    tp_distance = calculate_price_distance_for_target_profit(
-        SHORT_TERM_TP_TARGET_USD, volume, constraints.tick_value, constraints.tick_size
-    )
+    tp_distance = SHORT_TERM_TP_ATR_MULTIPLIER * snapshot.atr_value
     if decision.direction == "BUY":
         stop_loss = snapshot.current_price - stop_distance
         take_profit = snapshot.current_price + tp_distance
@@ -686,6 +685,18 @@ def run_bar_close_cycle(
     this same argument next cycle. All new parameters default to values
     that make this function behave exactly as before short-term mode
     existed.
+
+    `trading_mode == TRADING_MODE_SHORT_TERM` also disables the regular
+    strategy's *new*-entry evaluation entirely (`decide_entry_signal()`
+    is never even called) — `trading_mode` genuinely "selects between"
+    the two strategies as documented at module scope, rather than always
+    evaluating both regardless of the configured mode. This only gates
+    new entries: a regular position already open (the `else` branch
+    below `context.position is None`) keeps being managed — trailing
+    stop, partial close, breakeven — regardless of `trading_mode`,
+    mirroring short-term's own position management always running
+    independent of `trading_mode` too. `WAIT_FOR_CONDITIONS` and `BOTH`
+    are unaffected by this gate.
     """
     processing = evaluate_processing_time(cycle_duration_seconds)
     if processing.exceeded_cap:
@@ -743,10 +754,17 @@ def run_bar_close_cycle(
     )
 
     if context.position is None:
-        if blocks_new_entries(new_drawdown_state):
-            # SOFT_LOCK, flat: nothing to manage and no new *regular*
-            # entries allowed (short-term evaluation above already
-            # applied this same gate independently).
+        if trading_mode == TRADING_MODE_SHORT_TERM or blocks_new_entries(new_drawdown_state):
+            # Flat, and no new *regular* entry is allowed this cycle —
+            # either trading_mode == SHORT_TERM (trading_mode genuinely
+            # "selects between" the two strategies per the module
+            # docstring, mirroring _evaluate_short_term_entry()'s own
+            # trading_mode gate above for the regular strategy) or
+            # SOFT_LOCK (short-term evaluation above already applied this
+            # same drawdown gate independently). Only gates *new* entries:
+            # an already-open regular position (the `else` branch below)
+            # keeps being managed regardless of trading_mode/drawdown
+            # here, same as short-term's own open position always is.
             return BarCloseCycleResult(
                 context=updated_context,
                 drawdown=classification,
@@ -1055,6 +1073,31 @@ def _seed_initial_fsm_context(container: ApplicationContainer) -> FSMContext:
     )
 
 
+def _advance_equity_baselines(
+    baselines: EquityBaselines | None,
+    baseline_epoch: BaselineEpoch | None,
+    equity: float,
+    server_now: datetime,
+) -> tuple[EquityBaselines, BaselineEpoch]:
+    """First cycle: seed all three baselines from current equity, stamped
+    against broker server time. Every subsequent cycle: roll forward
+    whichever tier(s) have crossed their UTC-day/ISO-week/calendar-month
+    boundary since they were last set — a no-op unless the period actually
+    changed (docs/ARCHITECTURE_SUMMARY.md §5)."""
+    if baselines is None or baseline_epoch is None:
+        return seed_equity_baselines(equity, server_now)
+    return roll_equity_baselines(baselines, baseline_epoch, equity, server_now)
+
+
+def _notify(container: ApplicationContainer, text: str) -> None:
+    """None-safe wrapper around the optional Telegram push notifier
+    (`container.notifier` is `None` when `TELEGRAM_*` isn't configured).
+    `TelegramNotifier.send()` itself never raises, so calling this from
+    anywhere in the loop can never break trading."""
+    if container.notifier is not None:
+        container.notifier.send(text)
+
+
 def _record_short_term_close(container: ApplicationContainer, closed_ticket: int) -> None:
     """Reconcile a short-term position's real outcome into `trade_ledger`
     once `_fetch_short_term_position()` detects it's no longer open.
@@ -1092,6 +1135,41 @@ def _record_short_term_close(container: ApplicationContainer, closed_ticket: int
             closed_at_utc=closed_deal.closed_at_utc.isoformat(),
         )
     )
+    profit_sign = "+" if closed_deal.profit >= 0 else ""
+    _notify(
+        container,
+        f"⚪ ปิดออเดอร์ short-term: {ledger_entry.side} {ledger_entry.volume_lots} "
+        f"{ledger_entry.symbol} — กำไร/ขาดทุน {profit_sign}{closed_deal.profit:.2f} "
+        f"(ticket {closed_ticket})",
+    )
+
+
+def _fetch_news_events(container: ApplicationContainer) -> list[EconomicEvent]:
+    """Fetch the economic calendar events relevant to this cycle's
+    news-blackout check (`is_trade_entry_locked()`): exactly the
+    ±`MACRO_BLACKOUT_WINDOW` window around now, since that is the only
+    range the lock ever evaluates.
+
+    Previously `main()` passed a hardcoded `[]` here despite
+    `container.calendar_provider` being fully wired (a documented
+    `docs/ARCHITECTURE_SUMMARY.md` §5 gap) — the NFP/CPI/FOMC blackout
+    logic was implemented and tested but never received real events.
+
+    Degrades open on total chain failure (every provider down, including
+    the always-local `offline_snapshot` default): logs and returns `[]`
+    rather than halting the loop — the documented News-API-down posture
+    is a degraded mode, not a hard trading halt
+    (`news.news_engine.apply_news_feed_fail_safe()`'s risk-halving side
+    remains unwired, matching the standing §5 note).
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        return container.calendar_provider.fetch_events(
+            now - MACRO_BLACKOUT_WINDOW, now + MACRO_BLACKOUT_WINDOW
+        )
+    except NewsFeedConnectionError:
+        logger.warning("All calendar providers failed; proceeding without news events this cycle.")
+        return []
 
 
 def _fetch_short_term_position(
@@ -1188,17 +1266,56 @@ def _submit_short_term_entry_if_any(
             broker_ticket=broker_position.ticket,
         )
     )
+    _notify(
+        container,
+        f"🟢 เปิดออเดอร์ short-term: {broker_position.side} {broker_position.volume} "
+        f"{broker_position.symbol} @ {broker_position.price_open} "
+        f"(SL {broker_position.stop_loss} / TP {broker_position.take_profit})",
+    )
 
 
 def main() -> None:
-    """Entry point: bootstrap, then loop forever, acting once per new M5
-    bar close. Not executed in this environment (no live MT5 credentials);
-    see docs/ARCHITECTURE_SUMMARY.md before running this against a real
-    account.
+    """Entry point: bootstrap, then loop forever (via `_run_trading_loop()`),
+    acting once per new M5 bar close. Any exception that escapes the loop
+    (i.e. one `_run_trading_loop()`'s own transient-reconnect handling
+    could not absorb) triggers a final Telegram crash alert before
+    re-raising unchanged — the process still halts fail-closed, it just
+    no longer halts *silently*.
     """
     logging.basicConfig(level=logging.INFO)
-    container = ApplicationContainer.build()
 
+    # monitoring/telegram_bot.py's /killbot reads this to find this
+    # process to terminate. Written once at boot (a PID doesn't change
+    # for the life of the process) — overwritten fresh on every restart,
+    # so a stale PID from a previous run is never observed for long.
+    MAIN_PID_PATH.write_text(str(os.getpid()))
+
+    container = ApplicationContainer.build()
+    _notify(container, f"🚀 บอทเริ่มทำงานแล้ว (โหมด {container.config.trading_mode})")
+    try:
+        _run_trading_loop(container)
+    except Exception as exc:
+        _notify(
+            container,
+            f"💥 บอทหยุดทำงานจากข้อผิดพลาด: {exc!r} — ต้องรัน python main.py ใหม่เองที่เครื่อง",
+        )
+        raise
+
+
+def _run_trading_loop(container: ApplicationContainer) -> None:
+    """The bar-close loop itself, split from `main()` so its caller can
+    wrap it in a single crash-alert boundary.
+
+    Each cycle's broker work runs inside a `BrokerConnectionError` guard:
+    a transient MT5 connection loss mid-cycle (terminal restart, network
+    blip) reconnects via `gateway.connect()`'s own exponential backoff and
+    resumes on the next bar close, instead of killing the process — the
+    single biggest practical availability gap this loop had. Only
+    *connection* errors are absorbed: `BrokerOrderRejectedError` still
+    propagates and halts (the documented safe default — an ambiguous or
+    rejected order must never be blindly retried, see
+    docs/ARCHITECTURE_SUMMARY.md §5's idempotency-gap entry).
+    """
     context = _seed_initial_fsm_context(container)
     baselines: EquityBaselines | None = None
     baseline_epoch: BaselineEpoch | None = None
@@ -1220,39 +1337,22 @@ def main() -> None:
         context.drawdown_state.value,
     )
 
-    while True:
-        if is_weekend_market_closed(datetime.now(timezone.utc)):
-            logger.info(
-                "Weekend market closure (Fri %02d:00 UTC - Sun %02d:00 UTC): "
-                "skipping cycle, rechecking in %.0fs.",
-                WEEKEND_CLOSE_HOUR_UTC,
-                WEEKEND_REOPEN_HOUR_UTC,
-                WEEKEND_RECHECK_SECONDS,
-            )
-            time.sleep(WEEKEND_RECHECK_SECONDS)
-            continue
-
-        wait_seconds = seconds_until_next_bar_close(datetime.now(timezone.utc))
-        logger.info("Waiting %.1fs for next M5 bar close.", wait_seconds)
-        time.sleep(wait_seconds)
+    def run_one_cycle() -> None:
+        # Everything below talks to the broker and mutates the enclosing
+        # loop state — a closure (not a free function) so the
+        # BrokerConnectionError guard in the while-loop below can abort it
+        # mid-way and the next call simply re-fetches everything fresh.
+        nonlocal context, baselines, baseline_epoch
+        nonlocal previous_short_term_position, short_term_peak_price
 
         started = time.perf_counter()
         account_state = container.gateway.get_account_state()
         short_term_position = _fetch_short_term_position(container, previous_short_term_position)
         previous_short_term_position = short_term_position
         server_now = container.clock_provider.get_server_time(container.gateway.symbol_spec.name)
-        if baselines is None or baseline_epoch is None:
-            # First cycle: seed all three baselines from current equity,
-            # stamped against broker server time.
-            baselines, baseline_epoch = seed_equity_baselines(account_state.equity, server_now)
-        else:
-            # Every subsequent cycle: roll forward whichever tier(s) have
-            # crossed their UTC-day/ISO-week/calendar-month boundary since
-            # they were last set — a no-op unless the period actually
-            # changed (docs/ARCHITECTURE_SUMMARY.md §5).
-            baselines, baseline_epoch = roll_equity_baselines(
-                baselines, baseline_epoch, account_state.equity, server_now
-            )
+        baselines, baseline_epoch = _advance_equity_baselines(
+            baselines, baseline_epoch, account_state.equity, server_now
+        )
 
         # Resolve the self-learning optimizer's latest applied values fresh
         # every cycle (not just at boot) — a Saturday shift takes effect
@@ -1267,7 +1367,7 @@ def main() -> None:
         snapshot = _fetch_market_snapshot(
             container.gateway,
             constraints.magic_number,
-            [],
+            _fetch_news_events(container),
             adx_trend_threshold=effective_adx_threshold,
         )
         ended = time.perf_counter()
@@ -1322,6 +1422,11 @@ def main() -> None:
                     position=None,
                     drawdown_state=context.drawdown_state,
                     drawdown_reason=context.drawdown_reason,
+                )
+                _notify(
+                    container,
+                    f"🚨 HARD_LOCK: ปิด position ฉุกเฉิน (ticket {action.position_ticket}) "
+                    "— ระบบหยุดเปิดออเดอร์ใหม่จนกว่าจะมีการรีเซ็ตด้วยมือ",
                 )
 
         if (
@@ -1378,6 +1483,12 @@ def main() -> None:
                     broker_ticket=broker_position.ticket,
                 )
             )
+            _notify(
+                container,
+                f"🟢 เปิดออเดอร์ (regular): {broker_position.side} {broker_position.volume} "
+                f"{broker_position.symbol} @ {broker_position.price_open} "
+                f"(SL {broker_position.stop_loss})",
+            )
             context = FSMContext(
                 state=TradingState.IN_POSITION,
                 position=PositionState(
@@ -1396,6 +1507,40 @@ def main() -> None:
             )
 
         _submit_short_term_entry_if_any(container, result)
+
+    while True:
+        # Written every iteration, including the weekend-skip branch below,
+        # so monitoring/telegram_bot.py's /check command never mistakes a
+        # closed-market weekend for a stopped/crashed process.
+        container.state_manager.record_heartbeat(container.config.trading_mode)
+
+        if is_weekend_market_closed(datetime.now(timezone.utc)):
+            logger.info(
+                "Weekend market closure (Fri %02d:00 UTC - Sun %02d:00 UTC): "
+                "skipping cycle, rechecking in %.0fs.",
+                WEEKEND_CLOSE_HOUR_UTC,
+                WEEKEND_REOPEN_HOUR_UTC,
+                WEEKEND_RECHECK_SECONDS,
+            )
+            time.sleep(WEEKEND_RECHECK_SECONDS)
+            continue
+
+        wait_seconds = seconds_until_next_bar_close(datetime.now(timezone.utc))
+        logger.info("Waiting %.1fs for next M5 bar close.", wait_seconds)
+        time.sleep(wait_seconds)
+
+        try:
+            run_one_cycle()
+        except BrokerConnectionError:
+            logger.exception("MT5 connection lost mid-cycle; attempting to reconnect.")
+            _notify(container, "⚠️ การเชื่อมต่อ MT5 หลุดระหว่างรอบ — กำลังเชื่อมต่อใหม่...")
+            # connect() has its own exponential backoff (6 attempts,
+            # 1s-60s); if it exhausts them this re-raises
+            # BrokerConnectionError, which escapes to main()'s crash-alert
+            # boundary — halting loudly rather than silently.
+            container.gateway.disconnect()
+            container.gateway.connect()
+            _notify(container, "✅ เชื่อมต่อ MT5 กลับมาแล้ว — ทำงานต่อตามปกติ")
 
 
 if __name__ == "__main__":

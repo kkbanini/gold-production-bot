@@ -27,6 +27,13 @@ from pathlib import Path
 DEFAULT_DB_PATH: Path = Path(__file__).resolve().parent / "gold_bot.db"
 DEFAULT_BUSY_TIMEOUT_MS = 5000
 
+# main.py writes its own OS process ID here at boot; monitoring/telegram_bot.py's
+# /killbot reads it to find the process to terminate. Colocated with
+# DEFAULT_DB_PATH (not owned by monitoring/) so both main.py and
+# monitoring/telegram_bot.py depend only on storage/ for this path, never
+# on each other directly.
+MAIN_PID_PATH: Path = Path(__file__).resolve().parent / "main.pid"
+
 _SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS trade_ledger (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +80,17 @@ CREATE TABLE IF NOT EXISTS parameter_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_parameter_history_name ON parameter_history (parameter_name);
+
+-- Single-row liveness signal, same pinned-singleton pattern as
+-- system_state: main.py's bar-close loop upserts this every iteration
+-- (including during the weekend skip branch) so monitoring/telegram_bot.py
+-- can tell "process alive and iterating" apart from "stopped/crashed"
+-- without touching FSM state.
+CREATE TABLE IF NOT EXISTS bot_heartbeat (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    trading_mode        TEXT NOT NULL,
+    last_heartbeat_utc  TEXT NOT NULL
+);
 """
 
 

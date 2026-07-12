@@ -45,10 +45,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from broker.clock_provider import MT5ClockProvider
 from broker.mt5_gateway import MT5Gateway, resolve_position_audit
 from config.calendar_config import CalendarConfig
-from config.config_manager import ConfigManager
+from config.config_manager import ConfigManager, ConfigurationError
 from config.feature_flags import FeatureFlagManager, FeatureFlags
 from config.secret_redaction import SecretRedactingFilter
 from execution.position_manager import TRAILING_ATR_MULTIPLIER
+from monitoring.notifier import TelegramNotifier, build_notifier_from_env
 from news.calendar_provider import CalendarProviderChain, build_calendar_provider_chain
 from optimizer.self_learning import (
     TunableParameter,
@@ -126,6 +127,9 @@ class ApplicationContainer:
     feature_flags: FeatureFlagManager
     initial_drawdown_state: DrawdownState
     optimizer_scheduler: BackgroundScheduler
+    # None when TELEGRAM_BOT_TOKEN/TELEGRAM_ALLOWED_CHAT_ID aren't set —
+    # push notifications are optional, never a boot requirement.
+    notifier: TelegramNotifier | None
 
     @classmethod
     def build(
@@ -167,6 +171,21 @@ class ApplicationContainer:
             gateway.symbol_spec.name,
             config.strategy_magic_number,
         )
+
+        # RR-012: cross-check the configured ENVIRONMENT_MODE against the
+        # account class the broker actually reports for this connection —
+        # nothing else prevents booting with ENVIRONMENT_MODE=DEMO while
+        # pointed at a live account (or vice versa). Fail-closed, same as
+        # every other boot-sequence error. A CONTEST account matches
+        # neither mode and is always refused.
+        account_trade_mode = gateway.get_account_trade_mode()
+        expected_trade_mode = "DEMO" if config.environment_mode == "DEMO" else "REAL"
+        if account_trade_mode != expected_trade_mode:
+            raise ConfigurationError(
+                f"ENVIRONMENT_MODE={config.environment_mode} but the connected MT5 "
+                f"account is a {account_trade_mode} account (RR-012). Refusing to "
+                "start: fix ENVIRONMENT_MODE or the MT5_LOGIN/MT5_SERVER credentials."
+            )
 
         audit = gateway.audit_open_positions(state_manager.get_open_trades())
         if not audit.is_clean:
@@ -229,6 +248,10 @@ class ApplicationContainer:
 
         feature_flags = FeatureFlagManager(FeatureFlags.from_env())
 
+        notifier = build_notifier_from_env()
+        if notifier is None:
+            logger.info("Telegram push notifications disabled (TELEGRAM_* not configured).")
+
         # Self-learning optimizer (optimizer/self_learning.py, previously
         # built but never started anywhere — optimizer/README.md's
         # "Depended On By" section flagged this exact wiring as missing).
@@ -255,4 +278,5 @@ class ApplicationContainer:
             feature_flags=feature_flags,
             initial_drawdown_state=initial_drawdown_state,
             optimizer_scheduler=optimizer_scheduler,
+            notifier=notifier,
         )

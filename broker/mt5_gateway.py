@@ -456,8 +456,16 @@ class MT5Gateway:
         (5-minute) detection loop checking every cycle, so a close is
         always found well within its own lookback window before it ever
         ages out.
+
+        `deal.time` is stamped in broker server-clock terms, same as
+        `tick.time` in `_resolve_broker_utc_offset` — so the query window
+        must be built from broker time (`ClockProvider.get_server_time()`'s
+        same `+ broker_utc_offset` adjustment), not host UTC. Using host
+        UTC here silently missed every close whenever the broker's clock
+        runs ahead of the host's, since the window's upper bound then
+        falls before the actual deal timestamps.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc) + self.broker_utc_offset
         deals: Any = mt5.history_deals_get(now - lookback, now + timedelta(minutes=5))
         if not deals:
             return None
@@ -644,6 +652,27 @@ class MT5Gateway:
             margin_free=info.margin_free,
             as_of_utc=datetime.now(timezone.utc),
         )
+
+    def get_account_trade_mode(self) -> Literal["DEMO", "CONTEST", "REAL"]:
+        """The connected account's broker-reported demo/contest/real
+        classification (`account_info().trade_mode`: 0=demo, 1=contest,
+        2=real — MT5's own `ACCOUNT_TRADE_MODE_*` values).
+
+        Exists so `container.py` can cross-check the configured
+        `ENVIRONMENT_MODE` against the account actually connected
+        (RR-012): nothing else prevents booting with `ENVIRONMENT_MODE=DEMO`
+        while pointed at a live account, or vice versa.
+        """
+        info: Any = mt5.account_info()
+        if info is None:
+            raise BrokerConnectionError(
+                f"account_info() returned None; last_error={mt5.last_error()!r}"
+            )
+        if info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO:
+            return "DEMO"
+        if info.trade_mode == mt5.ACCOUNT_TRADE_MODE_CONTEST:
+            return "CONTEST"
+        return "REAL"
 
     def get_bars(self, timeframe: int, count: int) -> BarSeries:
         """Fetch the last `count` *closed* bars for `timeframe` (one of the

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -23,9 +23,12 @@ import pytest
 import broker.mt5_gateway as gw
 import container as container_module
 import main as orchestrator
+import monitoring.telegram_bot as telegram_bot
 import optimizer.self_learning as sl
 import strategy.trend_filter as trend_filter
 from broker.clock_provider import MT5ClockProvider
+from config.config_manager import ConfigurationError
+from config.telegram_config import TelegramConfig
 from container import ApplicationContainer
 from execution.position_manager import OrderActionPayload
 from news.calendar_provider import OfflineSnapshotCalendarProvider
@@ -272,10 +275,35 @@ class TestBrokerAccountAndBars:
         positions = gateway.get_open_positions_by_magic(magic_number=999)
         assert [p.ticket for p in positions] == [200]
 
+    def test_get_account_trade_mode_demo(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        assert gateway.get_account_trade_mode() == "DEMO"
+
+    def test_get_account_trade_mode_real(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.account.trade_mode = fake_mt5.ACCOUNT_TRADE_MODE_REAL
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        assert gateway.get_account_trade_mode() == "REAL"
+
+    def test_get_account_trade_mode_contest(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.account.trade_mode = fake_mt5.ACCOUNT_TRADE_MODE_CONTEST
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        assert gateway.get_account_trade_mode() == "CONTEST"
+
     def test_get_closing_deal_finds_the_closing_entry(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
         fake_mt5.deals = [
             FakeDeal(
                 1,
@@ -299,16 +327,49 @@ class TestBrokerAccountAndBars:
             ),
         ]
         gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
         result = gateway.get_closing_deal(500)
         assert result is not None
         assert result.close_price == 2010.0
         assert result.profit == 10.0
         assert result.closed_at_utc == datetime.fromtimestamp(2000, tz=timezone.utc)
 
+    def test_get_closing_deal_query_window_is_broker_clock_not_host_clock(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test: `get_closing_deal` must build its
+        `history_deals_get` window from broker server time
+        (`broker_utc_offset`-adjusted), not host UTC — `deal.time` is
+        stamped in broker-clock terms, so a host-UTC window silently
+        misses recent closes whenever the broker clock runs ahead."""
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        broker_offset = timedelta(hours=3)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        tick_time = datetime.now(timezone.utc) + broker_offset
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=int(tick_time.timestamp()))
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+
+        before = datetime.now(timezone.utc) + gateway.broker_utc_offset
+        gateway.get_closing_deal(500)
+        after = datetime.now(timezone.utc) + gateway.broker_utc_offset
+
+        assert len(fake_mt5.history_deals_get_calls) == 1
+        date_from, date_to = fake_mt5.history_deals_get_calls[0]
+        assert isinstance(date_from, datetime)
+        assert isinstance(date_to, datetime)
+        # The window's upper bound must sit close to broker-clock "now",
+        # not host-clock "now" — the host/broker gap here is 3 hours, far
+        # bigger than any tolerance a host-UTC bug would still pass under.
+        assert before + timedelta(minutes=5) - timedelta(seconds=5) <= date_to
+        assert date_to <= after + timedelta(minutes=5) + timedelta(seconds=5)
+
     def test_get_closing_deal_returns_none_when_not_closed(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
         fake_mt5.deals = [
             FakeDeal(
                 1,
@@ -320,13 +381,17 @@ class TestBrokerAccountAndBars:
             ),
         ]
         gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
         assert gateway.get_closing_deal(500) is None
 
     def test_get_closing_deal_returns_none_when_no_deals_at_all(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
         gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
         assert gateway.get_closing_deal(500) is None
 
     def test_submit_market_order_buy_at_ask(
@@ -604,6 +669,8 @@ class TestReconcileShortTermCloses:
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
         # No FakePosition seeded for ticket 500: it's no longer open.
         fake_mt5.deals = [
             FakeDeal(
@@ -624,6 +691,7 @@ class TestReconcileShortTermCloses:
             ),
         ]
         gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
         updates = gateway.reconcile_short_term_closes(777, [self._ledger_entry()])
         assert len(updates) == 1
         assert updates[0].client_order_id == "co-1"
@@ -636,7 +704,10 @@ class TestReconcileShortTermCloses:
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
         gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
         updates = gateway.reconcile_short_term_closes(777, [self._ledger_entry()])
         assert updates == []
 
@@ -667,6 +738,165 @@ class TestReconcileShortTermCloses:
         entry = self._ledger_entry(broker_ticket=None)
         updates = gateway.reconcile_short_term_closes(777, [entry])
         assert updates == []
+
+
+class TestBotHeartbeat:
+    """`StateManager.record_heartbeat()`/`get_heartbeat()` — the liveness
+    signal `monitoring/telegram_bot.py`'s `/check` command reads."""
+
+    def test_get_heartbeat_returns_none_before_any_write(self, state_manager: StateManager) -> None:
+        assert state_manager.get_heartbeat() is None
+
+    def test_record_then_get_round_trips(self, state_manager: StateManager) -> None:
+        state_manager.record_heartbeat("SHORT_TERM")
+        heartbeat = state_manager.get_heartbeat()
+        assert heartbeat is not None
+        assert heartbeat.trading_mode == "SHORT_TERM"
+        assert heartbeat.last_heartbeat_utc != ""
+
+    def test_second_write_overwrites_the_singleton_row(self, state_manager: StateManager) -> None:
+        state_manager.record_heartbeat("WAIT_FOR_CONDITIONS")
+        state_manager.record_heartbeat("BOTH")
+        heartbeat = state_manager.get_heartbeat()
+        assert heartbeat is not None
+        assert heartbeat.trading_mode == "BOTH"
+        count = state_manager._connection.execute("SELECT COUNT(*) FROM bot_heartbeat").fetchone()[
+            0
+        ]
+        assert count == 1
+
+    def test_read_only_state_manager_sees_writer_committed_heartbeat(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "heartbeat_ro.db"
+        writer = StateManager(db_path)
+        writer.record_heartbeat("SHORT_TERM")
+
+        reader = StateManager(db_path, read_only=True)
+        heartbeat = reader.get_heartbeat()
+        assert heartbeat is not None
+        assert heartbeat.trading_mode == "SHORT_TERM"
+
+        with pytest.raises(sqlite3.OperationalError):
+            reader.record_heartbeat("BOTH")
+
+        reader.close()
+        writer.close()
+
+
+class TestGetRecentTrades:
+    """`StateManager.get_recent_trades()` — the most-recent-first slice
+    `monitoring/telegram_bot.py`'s `/checkhisorder` reads."""
+
+    def _entry(self, client_order_id: str, **overrides: object) -> TradeLedgerEntry:
+        defaults: dict[str, object] = dict(
+            client_order_id=client_order_id,
+            symbol="XAUUSD",
+            side="BUY",
+            volume_lots=0.01,
+            status="OPEN",
+            opened_at_utc="2026-07-09T15:00:00.000000Z",
+        )
+        defaults.update(overrides)
+        return TradeLedgerEntry(**defaults)  # type: ignore[arg-type]
+
+    def test_empty_ledger_returns_empty_list(self, state_manager: StateManager) -> None:
+        assert state_manager.get_recent_trades() == []
+
+    def test_returns_most_recent_first(self, state_manager: StateManager) -> None:
+        for i in range(3):
+            state_manager.record_trade(self._entry(f"co-{i}"))
+        trades = state_manager.get_recent_trades()
+        assert [t.client_order_id for t in trades] == ["co-2", "co-1", "co-0"]
+
+    def test_respects_limit(self, state_manager: StateManager) -> None:
+        for i in range(10):
+            state_manager.record_trade(self._entry(f"co-{i}"))
+        trades = state_manager.get_recent_trades(limit=7)
+        assert len(trades) == 7
+        assert [t.client_order_id for t in trades] == [f"co-{i}" for i in range(9, 2, -1)]
+
+    def test_includes_both_open_and_closed(self, state_manager: StateManager) -> None:
+        state_manager.record_trade(self._entry("co-open", status="OPEN"))
+        state_manager.record_trade(
+            self._entry(
+                "co-closed",
+                status="CLOSED",
+                closed_at_utc="2026-07-09T15:10:00.000000Z",
+                close_price=2011.0,
+                profit=5.0,
+            )
+        )
+        trades = state_manager.get_recent_trades()
+        assert {t.client_order_id for t in trades} == {"co-open", "co-closed"}
+
+
+class TestTelegramBotCommandDispatch:
+    """`monitoring/telegram_bot.py`'s `_handle_command()` — the dispatch
+    logic behind `/check`/`/killbot`/`/checkhisorder`, tested against a
+    real `StateManager` (its effects are real DB writes + Audit Trail
+    rows, not pure)."""
+
+    def _config(self, chat_id: int = 8163059171) -> TelegramConfig:
+        return TelegramConfig(bot_token="123:ABC", allowed_chat_ids=(chat_id,))
+
+    def test_check_reports_running(
+        self, state_manager: StateManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # _is_main_process_alive() shells out to the real OS; mocked here
+        # so this test's outcome never depends on whether a real main.py
+        # process happens to be running on the host at test time.
+        monkeypatch.setattr(telegram_bot, "_is_main_process_alive", lambda: True)
+        state_manager.record_heartbeat("SHORT_TERM")
+        reply = telegram_bot._handle_command(
+            self._config(), state_manager, command=telegram_bot.CHECK_COMMAND, chat_id=8163059171
+        )
+        assert "กำลังทำงาน" in reply
+
+    def test_killbot_records_audit_event(
+        self, state_manager: StateManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(telegram_bot, "_kill_main_process", lambda: "🛑 killed (faked)")
+        reply = telegram_bot._handle_command(
+            self._config(), state_manager, command=telegram_bot.KILL_COMMAND, chat_id=8163059171
+        )
+        assert reply == "🛑 killed (faked)"
+
+        audit_events = state_manager.get_audit_trail(parameter_name="main_process_killed")
+        assert len(audit_events) == 1
+        assert audit_events[0].action_type == "MANUAL_OVERRIDE"
+        assert audit_events[0].new_value == "🛑 killed (faked)"
+
+    def test_checkhisorder_reports_recent_trades(self, state_manager: StateManager) -> None:
+        state_manager.record_trade(
+            TradeLedgerEntry(
+                client_order_id="co-1",
+                symbol="XAUUSD",
+                side="BUY",
+                volume_lots=0.01,
+                status="CLOSED",
+                opened_at_utc="2026-07-09T14:32:00.000000Z",
+                closed_at_utc="2026-07-09T14:42:00.000000Z",
+                close_price=2011.0,
+                profit=5.1,
+            )
+        )
+        reply = telegram_bot._handle_command(
+            self._config(),
+            state_manager,
+            command=telegram_bot.CHECK_HISTORY_COMMAND,
+            chat_id=8163059171,
+        )
+        assert "co-1" not in reply  # client_order_id itself is internal, never shown
+        assert "XAUUSD" in reply
+        assert "+5.10" in reply
+
+    def test_checkhisorder_reports_no_history_when_empty(self, state_manager: StateManager) -> None:
+        reply = telegram_bot._handle_command(
+            self._config(),
+            state_manager,
+            command=telegram_bot.CHECK_HISTORY_COMMAND,
+            chat_id=8163059171,
+        )
+        assert "ยังไม่มีประวัติ" in reply
 
 
 class TestOptimizerIsolation:
@@ -949,6 +1179,25 @@ class TestApplicationContainer:
             assert app.initial_drawdown_state == DrawdownState.ACTIVE
         finally:
             app.state_manager.close()
+
+    def test_build_refuses_environment_mode_account_mismatch(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # RR-012: ENVIRONMENT_MODE=DEMO but the broker reports a REAL
+        # account — boot must fail closed, before any trading state is
+        # touched.
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        fake_mt5.account.trade_mode = fake_mt5.ACCOUNT_TRADE_MODE_REAL
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        with pytest.raises(ConfigurationError, match="RR-012"):
+            ApplicationContainer.build(env_file="nonexistent.env", db_path=tmp_path / "mismatch.db")
 
     def test_build_logs_position_audit_divergence(
         self,

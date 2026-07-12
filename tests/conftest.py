@@ -108,11 +108,13 @@ class FakeAccountInfo:
         equity: float = 10_000.0,
         margin: float = 0.0,
         margin_free: float = 10_000.0,
+        trade_mode: int = 0,  # ACCOUNT_TRADE_MODE_DEMO
     ) -> None:
         self.balance = balance
         self.equity = equity
         self.margin = margin
         self.margin_free = margin_free
+        self.trade_mode = trade_mode
 
 
 class FakeMT5:
@@ -131,6 +133,9 @@ class FakeMT5:
     TRADE_RETCODE_DONE = 10009
     DEAL_ENTRY_IN = 0
     DEAL_ENTRY_OUT = 1
+    ACCOUNT_TRADE_MODE_DEMO = 0
+    ACCOUNT_TRADE_MODE_CONTEST = 1
+    ACCOUNT_TRADE_MODE_REAL = 2
 
     def __init__(self) -> None:
         self.symbols: dict[str, FakeSymbolInfo] = {}
@@ -146,8 +151,10 @@ class FakeMT5:
         self.account: FakeAccountInfo = FakeAccountInfo()
         self.rates: dict[int, list[dict[str, float]]] = {}
         self.deals: list[FakeDeal] = []
+        self.history_deals_get_calls: list[tuple[object, object]] = []
 
     def history_deals_get(self, date_from: object, date_to: object) -> tuple[FakeDeal, ...]:
+        self.history_deals_get_calls.append((date_from, date_to))
         return tuple(self.deals)
 
     def symbol_info(self, name: str) -> FakeSymbolInfo | None:

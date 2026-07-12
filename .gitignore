@@ -33,6 +33,9 @@ env/
 *.sqlite
 *.sqlite3
 
+# --- Runtime PID file (monitoring/telegram_bot.py's /killbot) ---
+*.pid
+
 # --- OS files ---
 .DS_Store
 Thumbs.db

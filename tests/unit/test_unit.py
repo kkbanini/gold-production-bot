@@ -13,8 +13,10 @@ import logging
 import os
 import random
 import sqlite3
-from datetime import datetime, timezone
+import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,12 +24,15 @@ import pytest
 import broker.clock_provider as cp
 import broker.mt5_gateway as gw
 import main as orchestrator
+import monitoring.notifier as notifier_module
+import monitoring.telegram_bot as telegram_bot
 import news.calendar_provider as calp
 import resilience.backoff as backoff
 from config.calendar_config import CalendarConfig
 from config.config_manager import ConfigManager, ConfigurationError, ConfigValidator
 from config.feature_flags import FeatureFlagManager, FeatureFlags
 from config.secret_redaction import SecretRedactingFilter
+from config.telegram_config import TelegramConfig
 from execution.position_manager import (
     EMERGENCY_LIQUIDATION_COMMENT,
     PositionState,
@@ -39,7 +44,13 @@ from execution.position_manager import (
 )
 from execution.validation import SeverityLevel, check_duplicate_order_before_retry
 from indicators.math_engine import adx, atr, ema, sma
+from monitoring.telegram_bot import (
+    HEARTBEAT_STALE_AFTER,
+    format_order_history_message,
+    format_status_message,
+)
 from news.news_engine import (
+    MACRO_BLACKOUT_WINDOW,
     EconomicEvent,
     NewsFeedConnectionError,
     NewsFeedHealthState,
@@ -76,6 +87,7 @@ from storage.db_engine import DEFAULT_BUSY_TIMEOUT_MS, checkpoint_wal, connect, 
 from storage.migrations import MIGRATIONS, apply_pending_migrations, get_applied_migrations
 from storage.state_manager import (
     AuditActionType,
+    HeartbeatInfo,
     OrderEvent,
     OrderLifecycleState,
     StateManager,
@@ -322,6 +334,46 @@ class TestCalendarConfig:
         monkeypatch.setenv("CALENDAR_TIMEOUT_MS", "not-a-number")
         with pytest.raises(ConfigurationError, match="CALENDAR_TIMEOUT_MS"):
             CalendarConfig.from_env()
+
+
+# ---------------------------------------------------------------------------
+# config/telegram_config.py (monitoring/telegram_bot.py's /check command)
+# ---------------------------------------------------------------------------
+
+
+class TestTelegramConfig:
+    TELEGRAM_ENV_KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_CHAT_ID")
+
+    def _clear_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for key in self.TELEGRAM_ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_missing_bot_token_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "12345")
+        with pytest.raises(ConfigurationError, match="TELEGRAM_BOT_TOKEN"):
+            TelegramConfig.from_env(env_file="nonexistent.env")
+
+    def test_missing_chat_id_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+        with pytest.raises(ConfigurationError, match="TELEGRAM_ALLOWED_CHAT_ID"):
+            TelegramConfig.from_env(env_file="nonexistent.env")
+
+    def test_non_integer_chat_id_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "not-a-number")
+        with pytest.raises(ConfigurationError, match="TELEGRAM_ALLOWED_CHAT_ID"):
+            TelegramConfig.from_env(env_file="nonexistent.env")
+
+    def test_valid_config_parses_multiple_chat_ids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "111, 222,333")
+        config = TelegramConfig.from_env(env_file="nonexistent.env")
+        assert config.bot_token == "123:ABC"
+        assert config.allowed_chat_ids == (111, 222, 333)
 
 
 # ---------------------------------------------------------------------------
@@ -3068,6 +3120,54 @@ class TestBarCloseCycleShortTermMode(_BarCloseCycleHelpers):
         assert result.short_term_entry_take_profit is None
         assert result.short_term_entry_volume is None
 
+    def test_short_term_only_mode_disables_regular_new_entries_even_with_valid_signal(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        # The mirror of the test above: trading_mode="SHORT_TERM" must
+        # disable the *regular* strategy's new entries entirely, even
+        # though the default _snapshot() fixture is a fully valid regular
+        # BUY signal (D1+H4+H1 aligned, ADX-confirmed, breakout agrees) —
+        # decide_entry_signal() must never even be reached.
+        context = self._idle_context()
+        snapshot = self._snapshot()
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="SHORT_TERM",
+        )
+        assert result.entry_decision is None
+        assert result.entry_stop_loss is None
+        assert result.entry_volume is None
+
+    def test_both_mode_still_allows_regular_new_entries(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        # trading_mode="BOTH" must NOT trip the SHORT_TERM-only gate —
+        # the regular strategy keeps evaluating new entries normally.
+        context = self._idle_context()
+        snapshot = self._snapshot()
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="BOTH",
+        )
+        assert result.entry_decision is not None
+        assert result.entry_decision.direction == "BUY"
+
     def test_short_term_mode_proposes_entry_independent_of_regular_position(
         self,
         baselines: EquityBaselines,
@@ -3077,27 +3177,14 @@ class TestBarCloseCycleShortTermMode(_BarCloseCycleHelpers):
         # Regular mode is IN_POSITION (mismatched trend so it proposes no
         # new regular entry) while short-term mode is flat and has a
         # valid signal — both must be evaluated independently.
-        # tick_value=2.0 (not the fixture's default 1.0) deliberately makes
-        # the dollar-based TP distance (2.5) diverge from the ATR-based SL
-        # distance (5.0) — proving TP is genuinely profit-target-derived,
-        # not coincidentally equal to an ATR multiple.
         position = self._position()
         context = self._in_position_context(position)
         snapshot = self._snapshot(trend_direction="BEARISH", short_term_trend_direction="BULLISH")
-        custom_constraints = orchestrator.SymbolConstraints(
-            point=constraints.point,
-            volume_min=constraints.volume_min,
-            volume_max=constraints.volume_max,
-            volume_step=constraints.volume_step,
-            magic_number=constraints.magic_number,
-            tick_value=2.0,
-            tick_size=0.01,
-        )
         result = orchestrator.run_bar_close_cycle(
             context,
             snapshot,
             baselines,
-            custom_constraints,
+            constraints,
             feature_flags,
             cycle_duration_seconds=0.05,
             trading_mode="SHORT_TERM",
@@ -3105,8 +3192,8 @@ class TestBarCloseCycleShortTermMode(_BarCloseCycleHelpers):
         assert result.short_term_entry_decision is not None
         assert result.short_term_entry_decision.direction == "BUY"
         assert result.short_term_entry_stop_loss == pytest.approx(2010.0 - 5.0)  # 1x ATR
-        assert result.short_term_entry_take_profit == pytest.approx(2010.0 + 2.5)  # $5 target
-        assert result.short_term_entry_volume == custom_constraints.volume_min
+        assert result.short_term_entry_take_profit == pytest.approx(2010.0 + 5.0)  # 1x ATR
+        assert result.short_term_entry_volume == constraints.volume_min
 
     def test_both_mode_regular_in_position_short_term_flat_no_collision(
         self,
@@ -3491,3 +3578,431 @@ class TestBarCloseCycleProfitLock(_BarCloseCycleHelpers):
         )
         assert result.short_term_peak_price == 2001.0
         assert result.position_actions == ()
+
+
+# ---------------------------------------------------------------------------
+# monitoring/telegram_bot.py
+# ---------------------------------------------------------------------------
+
+
+class TestFormatStatusMessage:
+    def test_none_heartbeat_reports_never_run(self) -> None:
+        message = format_status_message(None, now=datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc))
+        assert "ยังไม่เคยพบ" in message
+
+    def test_fresh_heartbeat_reports_running(self) -> None:
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+        heartbeat = HeartbeatInfo(
+            trading_mode="SHORT_TERM", last_heartbeat_utc="2026-07-09T11:58:00.000000Z"
+        )
+        message = format_status_message(heartbeat, now=now)
+        assert "กำลังทำงาน" in message
+        assert "SHORT_TERM" in message
+
+    def test_stale_heartbeat_reports_not_running(self) -> None:
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+        heartbeat = HeartbeatInfo(
+            trading_mode="BOTH", last_heartbeat_utc="2026-07-09T11:00:00.000000Z"
+        )
+        message = format_status_message(heartbeat, now=now)
+        assert "หยุดทำงาน" in message
+        assert "BOTH" in message
+
+    def test_boundary_exactly_at_stale_after_is_still_alive(self) -> None:
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+        heartbeat = HeartbeatInfo(
+            trading_mode="SHORT_TERM",
+            last_heartbeat_utc=(now - HEARTBEAT_STALE_AFTER).isoformat().replace("+00:00", "Z"),
+        )
+        message = format_status_message(heartbeat, now=now)
+        assert "กำลังทำงาน" in message
+
+    def test_one_second_past_stale_after_is_not_alive(self) -> None:
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+        heartbeat = HeartbeatInfo(
+            trading_mode="SHORT_TERM",
+            last_heartbeat_utc=(now - HEARTBEAT_STALE_AFTER - timedelta(seconds=1))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        )
+        message = format_status_message(heartbeat, now=now)
+        assert "หยุดทำงาน" in message
+
+    def test_process_confirmed_dead_reports_stopped_even_with_fresh_heartbeat(self) -> None:
+        # The exact /killbot scenario: PID confirmed gone within seconds,
+        # long before the heartbeat itself would ever go stale.
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+        heartbeat = HeartbeatInfo(
+            trading_mode="SHORT_TERM", last_heartbeat_utc="2026-07-09T11:59:30.000000Z"
+        )
+        message = format_status_message(heartbeat, now=now, process_alive=False)
+        assert "หยุดทำงาน" in message
+        assert "กำลังทำงาน" not in message
+
+    def test_process_confirmed_alive_with_fresh_heartbeat_reports_running(self) -> None:
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+        heartbeat = HeartbeatInfo(
+            trading_mode="SHORT_TERM", last_heartbeat_utc="2026-07-09T11:59:30.000000Z"
+        )
+        message = format_status_message(heartbeat, now=now, process_alive=True)
+        assert "กำลังทำงาน" in message
+
+    def test_process_alive_none_falls_back_to_heartbeat_staleness(self) -> None:
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+        heartbeat = HeartbeatInfo(
+            trading_mode="SHORT_TERM",
+            last_heartbeat_utc=(now - HEARTBEAT_STALE_AFTER - timedelta(seconds=1))
+            .isoformat()
+            .replace("+00:00", "Z"),
+        )
+        message = format_status_message(heartbeat, now=now, process_alive=None)
+        assert "หยุดทำงาน" in message
+
+
+class TestIsMainProcessAlive:
+    def test_returns_none_on_non_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(telegram_bot.platform, "system", lambda: "Linux")
+        assert telegram_bot._is_main_process_alive() is None
+
+    def test_returns_none_when_pid_file_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(telegram_bot.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", tmp_path / "nonexistent.pid")
+        assert telegram_bot._is_main_process_alive() is None
+
+    def test_returns_true_when_pid_matches_main_py(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pid_file = tmp_path / "main.pid"
+        pid_file.write_text("4242")
+        monkeypatch.setattr(telegram_bot.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", pid_file)
+        monkeypatch.setattr(
+            telegram_bot,
+            "subprocess",
+            type(
+                "FakeSubprocess",
+                (),
+                {
+                    "run": staticmethod(
+                        lambda *a, **k: subprocess.CompletedProcess(
+                            args=[], returncode=0, stdout="D:\\...\\python.exe main.py", stderr=""
+                        )
+                    )
+                },
+            ),
+        )
+        assert telegram_bot._is_main_process_alive() is True
+
+    def test_returns_false_when_pid_no_longer_exists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pid_file = tmp_path / "main.pid"
+        pid_file.write_text("4242")
+        monkeypatch.setattr(telegram_bot.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", pid_file)
+        monkeypatch.setattr(
+            telegram_bot,
+            "subprocess",
+            type(
+                "FakeSubprocess",
+                (),
+                {
+                    "run": staticmethod(
+                        lambda *a, **k: subprocess.CompletedProcess(
+                            args=[], returncode=0, stdout="", stderr=""
+                        )
+                    )
+                },
+            ),
+        )
+        assert telegram_bot._is_main_process_alive() is False
+
+
+class TestFormatOrderHistoryMessage:
+    def _open_trade(self, client_order_id: str = "co-1") -> TradeLedgerEntry:
+        return TradeLedgerEntry(
+            client_order_id=client_order_id,
+            symbol="XAUUSD",
+            side="BUY",
+            volume_lots=0.01,
+            status="OPEN",
+            opened_at_utc="2026-07-09T15:10:00.000000Z",
+        )
+
+    def _closed_trade(self, client_order_id: str = "co-2", profit: float = 5.1) -> TradeLedgerEntry:
+        return TradeLedgerEntry(
+            client_order_id=client_order_id,
+            symbol="XAUUSD",
+            side="SELL",
+            volume_lots=0.02,
+            status="CLOSED",
+            opened_at_utc="2026-07-09T14:32:00.000000Z",
+            closed_at_utc="2026-07-09T14:42:00.000000Z",
+            close_price=2011.0,
+            profit=profit,
+        )
+
+    def test_empty_list_reports_no_history(self) -> None:
+        message = format_order_history_message([])
+        assert "ยังไม่มีประวัติ" in message
+
+    def test_includes_side_volume_symbol(self) -> None:
+        message = format_order_history_message([self._open_trade()])
+        assert "BUY 0.01 XAUUSD" in message
+
+    def test_open_trade_shows_open_status_no_profit(self) -> None:
+        message = format_order_history_message([self._open_trade()])
+        assert "OPEN" in message
+        assert "กำไร" not in message
+
+    def test_closed_trade_shows_closed_status_and_profit(self) -> None:
+        message = format_order_history_message([self._closed_trade(profit=5.1)])
+        assert "CLOSED" in message
+        assert "+5.10" in message
+
+    def test_negative_profit_shows_minus_sign(self) -> None:
+        message = format_order_history_message([self._closed_trade(profit=-2.17)])
+        assert "-2.17" in message
+
+    def test_closed_trade_shows_both_opened_and_closed_timestamps(self) -> None:
+        message = format_order_history_message([self._closed_trade()])
+        assert "2026-07-09 14:32:00 UTC" in message
+        assert "2026-07-09 14:42:00 UTC" in message
+
+    def test_open_trade_shows_only_opened_timestamp(self) -> None:
+        message = format_order_history_message([self._open_trade()])
+        assert "2026-07-09 15:10:00 UTC" in message
+        assert "| ปิด:" not in message
+
+    def test_multiple_trades_are_numbered_in_input_order(self) -> None:
+        message = format_order_history_message(
+            [self._open_trade("co-a"), self._closed_trade("co-b")]
+        )
+        lines = message.splitlines()
+        assert any(line.startswith("1.") for line in lines)
+        assert any(line.startswith("2.") for line in lines)
+
+    def test_client_order_id_never_appears_in_output(self) -> None:
+        message = format_order_history_message([self._open_trade("secret-internal-id")])
+        assert "secret-internal-id" not in message
+
+
+class TestBuildNotifierFromEnv:
+    """`monitoring/notifier.py`'s optional-by-design factory."""
+
+    def _clear_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_ID", raising=False)
+
+    def test_returns_none_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        assert notifier_module.build_notifier_from_env() is None
+
+    def test_returns_none_when_only_token_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+        assert notifier_module.build_notifier_from_env() is None
+
+    def test_returns_none_on_unparseable_chat_ids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "not-a-number")
+        assert notifier_module.build_notifier_from_env() is None
+
+    def test_builds_notifier_with_parsed_chat_ids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "111, 222")
+        notifier = notifier_module.build_notifier_from_env()
+        assert notifier is not None
+        assert notifier._chat_ids == (111, 222)
+
+
+class TestTelegramNotifierSend:
+    """`TelegramNotifier.send()`'s never-raises contract — a notification
+    failure must never take down the bar-close loop it reports on."""
+
+    def test_send_swallows_every_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def boom(*args: object, **kwargs: object) -> object:
+            raise RuntimeError("telegram is down")
+
+        monkeypatch.setattr(notifier_module.requests, "post", boom)
+        notifier = notifier_module.TelegramNotifier("123:ABC", (111,))
+        notifier.send("hello")  # must not raise
+
+    def test_send_posts_to_every_configured_chat(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        posted: list[int] = []
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+        def fake_post(url: str, *, json: dict[str, object], timeout: float) -> FakeResponse:
+            posted.append(int(str(json["chat_id"])))
+            return FakeResponse()
+
+        monkeypatch.setattr(notifier_module.requests, "post", fake_post)
+        notifier = notifier_module.TelegramNotifier("123:ABC", (111, 222))
+        notifier.send("hello")
+        assert posted == [111, 222]
+
+    def test_one_chat_failure_does_not_block_the_next(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        posted: list[int] = []
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+        def fake_post(url: str, *, json: dict[str, object], timeout: float) -> FakeResponse:
+            if json["chat_id"] == 111:
+                raise RuntimeError("first chat down")
+            posted.append(int(str(json["chat_id"])))
+            return FakeResponse()
+
+        monkeypatch.setattr(notifier_module.requests, "post", fake_post)
+        notifier_module.TelegramNotifier("123:ABC", (111, 222)).send("hello")
+        assert posted == [222]
+
+
+class TestFetchNewsEvents:
+    """`main._fetch_news_events()` — the live loop's calendar wiring
+    (previously a hardcoded `[]`, a documented §5 gap)."""
+
+    def _event(self) -> EconomicEvent:
+        return EconomicEvent(
+            title="Non-Farm Payrolls",
+            country="US",
+            impact="HIGH",
+            scheduled_at_utc=datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc),
+        )
+
+    def test_passes_chain_events_through(self) -> None:
+        event = self._event()
+        windows: list[tuple[datetime, datetime]] = []
+
+        def fake_fetch(from_utc: datetime, to_utc: datetime) -> list[EconomicEvent]:
+            windows.append((from_utc, to_utc))
+            return [event]
+
+        container = SimpleNamespace(calendar_provider=SimpleNamespace(fetch_events=fake_fetch))
+        events = orchestrator._fetch_news_events(container)  # type: ignore[arg-type]
+        assert events == [event]
+        # The fetch window is exactly the ±MACRO_BLACKOUT_WINDOW range the
+        # lock evaluates — nothing wider is ever needed.
+        (from_utc, to_utc), *_ = windows
+        assert to_utc - from_utc == 2 * MACRO_BLACKOUT_WINDOW
+
+    def test_degrades_to_empty_when_whole_chain_fails(self) -> None:
+        def fake_fetch(from_utc: datetime, to_utc: datetime) -> list[EconomicEvent]:
+            raise NewsFeedConnectionError("all providers exhausted")
+
+        container = SimpleNamespace(calendar_provider=SimpleNamespace(fetch_events=fake_fetch))
+        assert orchestrator._fetch_news_events(container) == []  # type: ignore[arg-type]
+
+
+class TestReadMainPid:
+    def test_returns_none_when_file_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", tmp_path / "nonexistent.pid")
+        assert telegram_bot._read_main_pid() is None
+
+    def test_parses_valid_pid(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        pid_file = tmp_path / "main.pid"
+        pid_file.write_text("12345")
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", pid_file)
+        assert telegram_bot._read_main_pid() == 12345
+
+    def test_returns_none_on_invalid_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pid_file = tmp_path / "main.pid"
+        pid_file.write_text("not-a-pid")
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", pid_file)
+        assert telegram_bot._read_main_pid() is None
+
+
+class TestKillMainProcess:
+    """`/killbot`'s OS-level process termination — every `subprocess.run`
+    call is mocked (no real process is ever touched in this suite)."""
+
+    def _fake_completed_process(self, *, stdout: str = "", returncode: int = 0) -> object:
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+    def test_non_windows_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(telegram_bot.platform, "system", lambda: "Linux")
+        assert "Windows" in telegram_bot._kill_main_process()
+
+    def test_missing_pid_file_reports_not_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(telegram_bot.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", tmp_path / "nonexistent.pid")
+        assert "ไม่พบข้อมูล PID" in telegram_bot._kill_main_process()
+
+    def test_stale_pid_not_matching_main_py_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pid_file = tmp_path / "main.pid"
+        pid_file.write_text("999")
+        monkeypatch.setattr(telegram_bot.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", pid_file)
+        monkeypatch.setattr(
+            telegram_bot,
+            "subprocess",
+            type(
+                "FakeSubprocess",
+                (),
+                {"run": staticmethod(lambda *a, **k: self._fake_completed_process(stdout=""))},
+            ),
+        )
+        reply = telegram_bot._kill_main_process()
+        assert "ไม่ใช่ main.py" in reply
+
+    def test_matching_pid_is_killed_successfully(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pid_file = tmp_path / "main.pid"
+        pid_file.write_text("4242")
+        monkeypatch.setattr(telegram_bot.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", pid_file)
+
+        calls: list[list[str]] = []
+
+        def fake_run(args: list[str], **kwargs: object) -> object:
+            calls.append(args)
+            if args[0] == "powershell":
+                return self._fake_completed_process(stdout="D:\\...\\python.exe main.py")
+            return self._fake_completed_process(returncode=0)
+
+        monkeypatch.setattr(
+            telegram_bot, "subprocess", type("FakeSubprocess", (), {"run": staticmethod(fake_run)})
+        )
+        reply = telegram_bot._kill_main_process()
+        assert "หยุดการทำงานของบอททั้งหมดแล้ว" in reply
+        assert any(args[0] == "taskkill" for args in calls)
+
+    def test_taskkill_failure_is_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pid_file = tmp_path / "main.pid"
+        pid_file.write_text("4242")
+        monkeypatch.setattr(telegram_bot.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(telegram_bot, "MAIN_PID_PATH", pid_file)
+
+        def fake_run(args: list[str], **kwargs: object) -> object:
+            if args[0] == "powershell":
+                return self._fake_completed_process(stdout="D:\\...\\python.exe main.py")
+            return subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="Access is denied"
+            )
+
+        monkeypatch.setattr(
+            telegram_bot, "subprocess", type("FakeSubprocess", (), {"run": staticmethod(fake_run)})
+        )
+        reply = telegram_bot._kill_main_process()
+        assert "ล้มเหลว" in reply
