@@ -9,6 +9,7 @@ the MetaTrader5 package directly (RQ-001).
 from __future__ import annotations
 
 import dataclasses
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,8 @@ import numpy as np
 from execution.position_manager import OrderActionPayload
 from indicators.math_engine import FloatArray
 from storage.state_manager import TradeLedgerEntry
+
+logger = logging.getLogger(__name__)
 
 # Re-exported MT5 timeframe constants, so callers (e.g. main.py) never need
 # to import MetaTrader5 directly (ADR-0002/RQ-001: only broker/ may).
@@ -231,13 +234,22 @@ def resolve_position_audit(
 
 @dataclass(frozen=True, slots=True)
 class AccountState:
-    """A snapshot of the connected account's balance/equity/margin."""
+    """A snapshot of the connected account's balance/equity/margin.
+
+    `leverage`/`floating_profit` default to `0`/`0.0` so every existing
+    construction site (this module's own `get_account_state()`, and test
+    fixtures built before these two fields existed) keeps working
+    unchanged — only `monitoring/telegram_bot.py`'s `/check` account
+    summary needs them today.
+    """
 
     balance: float
     equity: float
     margin_used: float
     margin_free: float
     as_of_utc: datetime
+    leverage: int = 0
+    floating_profit: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,6 +412,23 @@ class MT5Gateway:
         broker_time = datetime.fromtimestamp(tick.time, tz=timezone.utc)
         return broker_time - datetime.now(timezone.utc)
 
+    @staticmethod
+    def _to_broker_position(position: Any) -> BrokerPosition:
+        side = "BUY" if position.type == mt5.POSITION_TYPE_BUY else "SELL"
+        return BrokerPosition(
+            ticket=position.ticket,
+            symbol=position.symbol,
+            side=side,
+            volume=position.volume,
+            price_open=position.price_open,
+            price_current=position.price_current,
+            stop_loss=position.sl,
+            take_profit=position.tp,
+            profit=position.profit,
+            magic=position.magic,
+            opened_at_utc=datetime.fromtimestamp(position.time, tz=timezone.utc),
+        )
+
     def get_open_positions_by_magic(self, magic_number: int | None = None) -> list[BrokerPosition]:
         """Return all open positions on the connected account matching
         `magic_number` (defaults to this gateway's own magic number).
@@ -416,27 +445,24 @@ class MT5Gateway:
         positions: Any = mt5.positions_get()
         if not positions:
             return []
-        matched: list[BrokerPosition] = []
-        for position in positions:
-            if position.magic != target_magic:
-                continue
-            side = "BUY" if position.type == mt5.POSITION_TYPE_BUY else "SELL"
-            matched.append(
-                BrokerPosition(
-                    ticket=position.ticket,
-                    symbol=position.symbol,
-                    side=side,
-                    volume=position.volume,
-                    price_open=position.price_open,
-                    price_current=position.price_current,
-                    stop_loss=position.sl,
-                    take_profit=position.tp,
-                    profit=position.profit,
-                    magic=position.magic,
-                    opened_at_utc=datetime.fromtimestamp(position.time, tz=timezone.utc),
-                )
-            )
-        return matched
+        return [
+            self._to_broker_position(position)
+            for position in positions
+            if position.magic == target_magic
+        ]
+
+    def get_all_open_positions(self) -> list[BrokerPosition]:
+        """Every open position on the connected account, regardless of
+        magic number — including manually-opened trades (`magic=0`) this
+        gateway's own strategy never places or manages. Used only for a
+        read-only account overview (`monitoring/telegram_bot.py`'s
+        `/check`); never for trading decisions, which always go through
+        `get_open_positions_by_magic()`'s magic-scoped view.
+        """
+        positions: Any = mt5.positions_get()
+        if not positions:
+            return []
+        return [self._to_broker_position(position) for position in positions]
 
     def get_closing_deal(
         self, position_ticket: int, *, lookback: timedelta = timedelta(hours=24)
@@ -576,7 +602,18 @@ class MT5Gateway:
         Raises BrokerOrderRejectedError if MT5 returns a non-DONE retcode,
         no result at all, or the payload references a ticket/symbol this
         gateway cannot currently resolve on the broker (e.g. the position
-        already closed, or no tick is available).
+        already closed, or no tick is available) — with one deliberate
+        exception: a `TRADE_ACTION_SLTP` modify that comes back
+        `TRADE_RETCODE_NO_CHANGES` (10025) is not a real failure. It means
+        the position's SL/TP already equals what was requested — e.g. a
+        stale local `FSMContext` recomputing the same trailing-stop level
+        a previous cycle's modify already applied at the broker, or two
+        cycles independently landing on the same tick-rounded value. This
+        is logged and treated as a no-op rather than raising: unlike an
+        ambiguous/genuinely-rejected order (docs/ARCHITECTURE_SUMMARY.md
+        §5's idempotency-gap note), there is nothing here that a retry —
+        or halting the whole process — would ever fix, since the desired
+        state is already in effect.
         """
         if payload.action == "TRADE_ACTION_DEAL":
             request = self._build_partial_close_request(payload)
@@ -585,6 +622,17 @@ class MT5Gateway:
 
         result: Any = mt5.order_send(request)
         retcode = getattr(result, "retcode", None)
+        if (
+            payload.action != "TRADE_ACTION_DEAL"
+            and result is not None
+            and retcode == mt5.TRADE_RETCODE_NO_CHANGES
+        ):
+            logger.info(
+                "SL/TP modify for ticket %s returned NO_CHANGES (already at the "
+                "requested level); treating as a no-op.",
+                payload.position_ticket,
+            )
+            return
         if result is None or retcode != mt5.TRADE_RETCODE_DONE:
             raise BrokerOrderRejectedError(
                 f"order_send failed for ticket {payload.position_ticket}: "
@@ -651,6 +699,8 @@ class MT5Gateway:
             margin_used=info.margin,
             margin_free=info.margin_free,
             as_of_utc=datetime.now(timezone.utc),
+            leverage=info.leverage,
+            floating_profit=info.profit,
         )
 
     def get_account_trade_mode(self) -> Literal["DEMO", "CONTEST", "REAL"]:
@@ -692,6 +742,33 @@ class MT5Gateway:
             raise BrokerConnectionError(
                 f"copy_rates_from_pos returned no data for {self.symbol_spec.name!r} "
                 f"(timeframe={timeframe}, count={count}); last_error={mt5.last_error()!r}"
+            )
+        return BarSeries(
+            open=np.array([bar["open"] for bar in rates], dtype=np.float64),
+            high=np.array([bar["high"] for bar in rates], dtype=np.float64),
+            low=np.array([bar["low"] for bar in rates], dtype=np.float64),
+            close=np.array([bar["close"] for bar in rates], dtype=np.float64),
+            tick_volume=np.array([bar["tick_volume"] for bar in rates], dtype=np.float64),
+            time_utc=tuple(datetime.fromtimestamp(bar["time"], tz=timezone.utc) for bar in rates),
+        )
+
+    def get_bars_range(self, timeframe: int, start_utc: datetime, end_utc: datetime) -> BarSeries:
+        """Fetch every closed bar for `timeframe` within `[start_utc, end_utc]`
+        on the resolved Gold symbol — for historical/backtest use
+        (`backtester/`), unlike `get_bars()`'s "last `count` bars from now"
+        contract. Both `start_utc`/`end_utc` must be timezone-aware; MT5's
+        `copy_rates_range()` already excludes the still-forming bar (only
+        bars with a `time` at or before `end_utc` and fully closed are
+        returned), so no `position=1` skip is needed here.
+        """
+        if start_utc.tzinfo is None or end_utc.tzinfo is None:
+            raise ValueError("start_utc and end_utc must be timezone-aware")
+        rates: Any = mt5.copy_rates_range(self.symbol_spec.name, timeframe, start_utc, end_utc)
+        if rates is None or len(rates) == 0:
+            raise BrokerConnectionError(
+                f"copy_rates_range returned no data for {self.symbol_spec.name!r} "
+                f"(timeframe={timeframe}, {start_utc} to {end_utc}); "
+                f"last_error={mt5.last_error()!r}"
             )
         return BarSeries(
             open=np.array([bar["open"] for bar in rates], dtype=np.float64),

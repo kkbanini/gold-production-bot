@@ -36,6 +36,12 @@ env/
 # --- Runtime PID file (monitoring/telegram_bot.py's /killbot) ---
 *.pid
 
+# --- Backtester run artifacts (backtester/run_backtest.py, run_walk_forward.py) ---
+# Generated output, not source; regenerate by re-running the CLI against
+# the live account's real history.
+backtester/backtest_trade_log.json
+backtester/walk_forward_results.json
+
 # --- OS files ---
 .DS_Store
 Thumbs.db

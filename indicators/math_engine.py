@@ -1,16 +1,25 @@
-"""Pure numpy technical indicator functions: SMA, EMA, Wilder ATR, Wilder ADX.
+"""Pure numpy technical indicator functions: SMA, EMA, Wilder ATR, Wilder
+ADX, Wilder RSI, MACD, Bollinger Bands.
 
 Standalone vector math over OHLC price arrays — no I/O, no broker
 dependency, no MetaTrader5 import. Direct MT5-computed indicator values are
 banned by directive; every value here is derived from raw OHLC arrays
 (RQ-007).
 
-EMA/ATR/ADX are IIR (recursive) filters by definition: each smoothed value
-depends on the previous smoothed value, which cannot be expressed as a
-single element-wise vectorized numpy operation. The recursive step below
-uses one explicit Python loop writing into a preallocated numpy array;
-every other computation (true range, directional movement, SMA's
-cumulative-sum window) is fully vectorized.
+EMA/ATR/ADX/RSI/MACD's signal line are IIR (recursive) filters by
+definition: each smoothed value depends on the previous smoothed value,
+which cannot be expressed as a single element-wise vectorized numpy
+operation. The recursive step below uses one explicit Python loop writing
+into a preallocated numpy array; every other computation (true range,
+directional movement, SMA's cumulative-sum window, Bollinger's rolling
+stddev) is fully vectorized.
+
+`rsi()`/`macd()`/`bollinger_bands()` are monitoring-only today — reported
+by `monitoring/telegram_bot.py`'s `/condition` command alongside the
+trend/ADX/trigger checklist, but not consulted by `main.py`'s actual
+entry/position-management decisions (a deliberate scope choice, not an
+oversight: adding them as real trading gates is a separate, larger change
+this session did not request).
 """
 
 from __future__ import annotations
@@ -113,6 +122,119 @@ def _validate_ohlc(
     if not (low.shape[0] == n and close.shape[0] == n):
         raise ValueError("high, low, close must be the same length")
     return high, low, close
+
+
+def rsi(values: FloatArray, period: int = 14) -> FloatArray:
+    """Relative Strength Index (Wilder's original smoothing of average
+    gain/loss, not a plain SMA-based variant).
+
+    Needs `period` price changes (i.e. `period + 1` closes) to seed the
+    first value via `_wilder_smooth()` — mirrors `atr()`/`adx()`'s own
+    Wilder-smoothing pattern. A zero average loss (an unbroken run of
+    gains) reads as RSI=100 rather than raising on the 0/0 division.
+    Returns an array the same length as `values`; the first `period`
+    entries are NaN.
+    """
+    if period < 1:
+        raise ValueError(f"period must be >= 1, got {period}")
+    values = np.asarray(values, dtype=np.float64)
+    n = values.shape[0]
+    if n < period + 1:
+        raise ValueError(f"need at least {period + 1} values, got {n}")
+
+    delta = np.diff(values)
+    gains: FloatArray = np.concatenate(([np.nan], np.where(delta > 0.0, delta, 0.0)))
+    losses: FloatArray = np.concatenate(([np.nan], np.where(delta < 0.0, -delta, 0.0)))
+    avg_gain = _wilder_smooth(gains, period) / period
+    avg_loss = _wilder_smooth(losses, period) / period
+
+    result: FloatArray = np.full(n, np.nan, dtype=np.float64)
+    valid: npt.NDArray[np.bool_] = ~np.isnan(avg_gain) & ~np.isnan(avg_loss)
+    zero_loss = valid & (avg_loss == 0.0)
+    nonzero_loss = valid & ~zero_loss
+    result[zero_loss] = 100.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs: FloatArray = avg_gain / avg_loss
+    result[nonzero_loss] = 100.0 - (100.0 / (1.0 + rs[nonzero_loss]))
+    return result
+
+
+def macd(
+    values: FloatArray,
+    *,
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> tuple[FloatArray, FloatArray, FloatArray]:
+    """Moving Average Convergence/Divergence: `macd_line = EMA(fast) -
+    EMA(slow)`, `signal_line = EMA(signal_period)` of `macd_line`,
+    `histogram = macd_line - signal_line`.
+
+    `signal_line`'s EMA is seeded from `macd_line`'s own first valid
+    (non-NaN) index — `slow_period - 1` — rather than index 0, mirroring
+    `ema()`'s seeding convention applied to the valid tail instead of
+    reimplementing NaN-skipping logic. Returns three arrays the same
+    length as `values`.
+    """
+    for name, value in (
+        ("fast_period", fast_period),
+        ("slow_period", slow_period),
+        ("signal_period", signal_period),
+    ):
+        if value < 1:
+            raise ValueError(f"{name} must be >= 1, got {value}")
+    if fast_period >= slow_period:
+        raise ValueError(f"fast_period must be < slow_period, got {fast_period} >= {slow_period}")
+
+    values = np.asarray(values, dtype=np.float64)
+    n = values.shape[0]
+    min_required = slow_period + signal_period - 1
+    if n < min_required:
+        raise ValueError(f"need at least {min_required} values, got {n}")
+
+    fast_ema = ema(values, fast_period)
+    slow_ema = ema(values, slow_period)
+    macd_line: FloatArray = fast_ema - slow_ema
+
+    signal_line: FloatArray = np.full(n, np.nan, dtype=np.float64)
+    start = slow_period - 1
+    alpha = 2.0 / (signal_period + 1.0)
+    seed_index = start + signal_period - 1
+    signal_line[seed_index] = macd_line[start : seed_index + 1].mean()
+    for i in range(seed_index + 1, n):
+        signal_line[i] = alpha * macd_line[i] + (1.0 - alpha) * signal_line[i - 1]
+
+    histogram: FloatArray = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def bollinger_bands(
+    values: FloatArray, period: int = 20, num_std: float = 2.0
+) -> tuple[FloatArray, FloatArray, FloatArray]:
+    """Bollinger Bands: `middle = SMA(period)`, `upper`/`lower = middle +/-
+    num_std * rolling population stddev(period)`.
+
+    Rolling stddev is computed via a vectorized sliding window (`ddof=0`,
+    population stddev — the conventional Bollinger Bands definition)
+    rather than a Python loop, consistent with this module's "fully
+    vectorized except IIR filters" design. Returns three arrays the same
+    length as `values`; the first `period - 1` entries of each are NaN.
+    """
+    if period < 1:
+        raise ValueError(f"period must be >= 1, got {period}")
+    values = np.asarray(values, dtype=np.float64)
+    n = values.shape[0]
+    if n < period:
+        raise ValueError(f"need at least {period} values, got {n}")
+
+    middle = sma(values, period)
+    windows = np.lib.stride_tricks.sliding_window_view(values, period)
+    rolling_std: FloatArray = np.full(n, np.nan, dtype=np.float64)
+    rolling_std[period - 1 :] = windows.std(axis=1, ddof=0)
+
+    upper: FloatArray = middle + num_std * rolling_std
+    lower: FloatArray = middle - num_std * rolling_std
+    return upper, middle, lower
 
 
 def atr(high: FloatArray, low: FloatArray, close: FloatArray, period: int = 14) -> FloatArray:

@@ -109,12 +109,16 @@ class FakeAccountInfo:
         margin: float = 0.0,
         margin_free: float = 10_000.0,
         trade_mode: int = 0,  # ACCOUNT_TRADE_MODE_DEMO
+        leverage: int = 100,
+        profit: float = 0.0,
     ) -> None:
         self.balance = balance
         self.equity = equity
         self.margin = margin
         self.margin_free = margin_free
         self.trade_mode = trade_mode
+        self.leverage = leverage
+        self.profit = profit
 
 
 class FakeMT5:
@@ -131,6 +135,7 @@ class FakeMT5:
     ORDER_TIME_GTC = "GTC"
     ORDER_FILLING_IOC = "IOC"
     TRADE_RETCODE_DONE = 10009
+    TRADE_RETCODE_NO_CHANGES = 10025
     DEAL_ENTRY_IN = 0
     DEAL_ENTRY_OUT = 1
     ACCOUNT_TRADE_MODE_DEMO = 0
@@ -207,6 +212,16 @@ class FakeMT5:
         if end <= 0:
             return tuple()
         return tuple(series[max(0, end - count) : end])
+
+    def copy_rates_range(
+        self, symbol: str, timeframe: int, date_from: Any, date_to: Any
+    ) -> tuple[dict[str, float], ...] | None:
+        # Mirrors real MT5 semantics: every seeded bar whose `time` (unix
+        # seconds) falls in [date_from, date_to] inclusive, oldest-first.
+        series = self.rates.get(timeframe, ())
+        start_ts = date_from.timestamp()
+        end_ts = date_to.timestamp()
+        return tuple(bar for bar in series if start_ts <= bar["time"] <= end_ts)
 
 
 @pytest.fixture

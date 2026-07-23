@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import backtester.walk_forward as wf
 import broker.clock_provider as cp
 import broker.mt5_gateway as gw
 import main as orchestrator
@@ -28,6 +29,25 @@ import monitoring.notifier as notifier_module
 import monitoring.telegram_bot as telegram_bot
 import news.calendar_provider as calp
 import resilience.backoff as backoff
+from analytics.performance import (
+    cagr,
+    compute_returns,
+    deflated_sharpe_ratio,
+    infer_periods_per_year,
+    kurtosis,
+    mar_ratio,
+    max_drawdown,
+    max_drawdown_duration,
+    profit_factor,
+    sharpe_ratio,
+    skewness,
+    sortino_ratio,
+    win_rate,
+)
+from backtester.historical_data import audit_bar_series
+from backtester.replay_gateway import HistoricalReplayGateway
+from backtester.signal_validation import SignalPrediction, SignalValidationResult, validate_signal
+from backtester.walk_forward import generate_folds, generate_parameter_grid
 from config.calendar_config import CalendarConfig
 from config.config_manager import ConfigManager, ConfigurationError, ConfigValidator
 from config.feature_flags import FeatureFlagManager, FeatureFlags
@@ -43,11 +63,15 @@ from execution.position_manager import (
     evaluate_partial_close_and_breakeven,
 )
 from execution.validation import SeverityLevel, check_duplicate_order_before_retry
-from indicators.math_engine import adx, atr, ema, sma
+from indicators.math_engine import adx, atr, bollinger_bands, ema, macd, rsi, sma
 from monitoring.telegram_bot import (
     HEARTBEAT_STALE_AFTER,
+    format_account_message,
+    format_condition_message,
+    format_indicator_message,
     format_order_history_message,
     format_status_message,
+    summarize_indicator_signal,
 )
 from news.news_engine import (
     MACRO_BLACKOUT_WINDOW,
@@ -95,6 +119,7 @@ from storage.state_manager import (
 )
 from strategy.execution_triggers import (
     BreakoutSignal,
+    Direction,
     PullbackSignal,
     WickFillResult,
     analyze_wick_fill,
@@ -153,6 +178,34 @@ class TestConfigManager:
         assert cfg.environment_mode == "DEMO"
         assert cfg.trading_mode == "WAIT_FOR_CONDITIONS"
         assert cfg.short_term_magic_number == 987655
+        # Drawdown lock thresholds default to RQ-022's own percentages when
+        # the optional override env vars are unset.
+        assert cfg.daily_soft_lock_limit == pytest.approx(0.05)
+        assert cfg.weekly_soft_lock_limit == pytest.approx(0.10)
+        assert cfg.monthly_soft_lock_limit == pytest.approx(0.20)
+        assert cfg.daily_hard_lock_limit == pytest.approx(0.10)
+        assert cfg.weekly_hard_lock_limit == pytest.approx(0.20)
+        assert cfg.monthly_hard_lock_limit == pytest.approx(0.40)
+
+    def test_drawdown_lock_limit_override_applies(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("DAILY_SOFT_LOCK_LIMIT", "0.50")
+        monkeypatch.setenv("DAILY_HARD_LOCK_LIMIT", "0.70")
+        cfg = ConfigManager.load(env_file="nonexistent.env")
+        assert cfg.daily_soft_lock_limit == pytest.approx(0.50)
+        assert cfg.daily_hard_lock_limit == pytest.approx(0.70)
+        # Untouched tiers keep the RQ-022 default.
+        assert cfg.weekly_soft_lock_limit == pytest.approx(0.10)
+
+    def test_non_numeric_drawdown_lock_limit_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("DAILY_SOFT_LOCK_LIMIT", "not-a-number")
+        with pytest.raises(ConfigurationError, match="DAILY_SOFT_LOCK_LIMIT"):
+            ConfigManager.load(env_file="nonexistent.env")
 
     def test_invalid_trading_mode_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._clear_env(monkeypatch)
@@ -762,6 +815,63 @@ def _ref_adx(high: list[float], low: list[float], close: list[float], period: in
     return [v / period if v == v else float("nan") for v in smoothed_dx]
 
 
+def _ref_rsi(values: list[float], period: int) -> list[float]:
+    n = len(values)
+    result = [float("nan")] * n
+    deltas = [values[i] - values[i - 1] for i in range(1, n)]
+    gains = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    result[period] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        result[i + 1] = 100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    return result
+
+
+def _ref_macd(
+    values: list[float], fast_period: int, slow_period: int, signal_period: int
+) -> tuple[list[float], list[float], list[float]]:
+    n = len(values)
+    fast = _ref_ema(values, fast_period)
+    slow = _ref_ema(values, slow_period)
+    macd_line = [
+        (f - s) if (f == f and s == s) else float("nan") for f, s in zip(fast, slow, strict=True)
+    ]
+    start = slow_period - 1
+    alpha = 2.0 / (signal_period + 1.0)
+    seed_index = start + signal_period - 1
+    signal_line = [float("nan")] * n
+    signal_line[seed_index] = sum(macd_line[start : seed_index + 1]) / signal_period
+    for i in range(seed_index + 1, n):
+        signal_line[i] = alpha * macd_line[i] + (1.0 - alpha) * signal_line[i - 1]
+    histogram = [
+        (m - s) if (m == m and s == s) else float("nan")
+        for m, s in zip(macd_line, signal_line, strict=True)
+    ]
+    return macd_line, signal_line, histogram
+
+
+def _ref_bollinger_bands(
+    values: list[float], period: int, num_std: float
+) -> tuple[list[float], list[float], list[float]]:
+    n = len(values)
+    upper = [float("nan")] * n
+    middle = [float("nan")] * n
+    lower = [float("nan")] * n
+    for i in range(period - 1, n):
+        window = values[i - period + 1 : i + 1]
+        mean = sum(window) / period
+        variance = sum((x - mean) ** 2 for x in window) / period
+        std = variance**0.5
+        middle[i] = mean
+        upper[i] = mean + num_std * std
+        lower[i] = mean - num_std * std
+    return upper, middle, lower
+
+
 class TestMathEngine:
     def test_sma_matches_reference(self) -> None:
         rng = np.random.default_rng(1)
@@ -844,6 +954,83 @@ class TestMathEngine:
     def test_adx_insufficient_data_raises(self) -> None:
         with pytest.raises(ValueError, match="need at least"):
             adx(np.ones(10), np.ones(10), np.ones(10), 14)
+
+    def test_rsi_matches_reference(self) -> None:
+        rng = np.random.default_rng(3)
+        values = 1950 + np.cumsum(rng.normal(0, 2, size=60))
+        result = rsi(values, 14)
+        reference = _ref_rsi(values.tolist(), 14)
+        np.testing.assert_allclose(result[14:], reference[14:], rtol=1e-9)
+
+    def test_rsi_stays_within_0_100_bounds(self) -> None:
+        rng = np.random.default_rng(3)
+        values = 1950 + np.cumsum(rng.normal(0, 2, size=60))
+        result = rsi(values, 14)
+        valid = result[14:]
+        assert np.all(valid >= 0.0)
+        assert np.all(valid <= 100.0)
+
+    def test_rsi_unbroken_gains_reads_100(self) -> None:
+        values = np.arange(1900.0, 1930.0)
+        result = rsi(values, 14)
+        assert result[-1] == 100.0
+
+    def test_rsi_insufficient_data_raises(self) -> None:
+        with pytest.raises(ValueError, match="need at least"):
+            rsi(np.ones(10), 14)
+
+    def test_macd_matches_reference(self) -> None:
+        rng = np.random.default_rng(5)
+        values = 1950 + np.cumsum(rng.normal(0, 2, size=60))
+        macd_line, signal_line, histogram = macd(
+            values, fast_period=12, slow_period=26, signal_period=9
+        )
+        ref_macd_line, ref_signal_line, ref_histogram = _ref_macd(values.tolist(), 12, 26, 9)
+        np.testing.assert_allclose(macd_line[25:], ref_macd_line[25:], rtol=1e-9)
+        np.testing.assert_allclose(signal_line[33:], ref_signal_line[33:], rtol=1e-9)
+        np.testing.assert_allclose(histogram[33:], ref_histogram[33:], rtol=1e-9)
+
+    def test_macd_histogram_equals_line_minus_signal(self) -> None:
+        rng = np.random.default_rng(5)
+        values = 1950 + np.cumsum(rng.normal(0, 2, size=60))
+        macd_line, signal_line, histogram = macd(values)
+        valid = ~np.isnan(histogram)
+        np.testing.assert_allclose(histogram[valid], (macd_line - signal_line)[valid], rtol=1e-12)
+
+    def test_macd_fast_period_must_be_less_than_slow_period(self) -> None:
+        with pytest.raises(ValueError, match="fast_period must be < slow_period"):
+            macd(np.ones(60), fast_period=26, slow_period=12, signal_period=9)
+
+    def test_macd_insufficient_data_raises(self) -> None:
+        with pytest.raises(ValueError, match="need at least"):
+            macd(np.ones(20), fast_period=12, slow_period=26, signal_period=9)
+
+    def test_bollinger_bands_matches_reference(self) -> None:
+        rng = np.random.default_rng(9)
+        values = 1950 + np.cumsum(rng.normal(0, 2, size=60))
+        upper, middle, lower = bollinger_bands(values, period=20, num_std=2.0)
+        ref_upper, ref_middle, ref_lower = _ref_bollinger_bands(values.tolist(), 20, 2.0)
+        np.testing.assert_allclose(upper[19:], ref_upper[19:], rtol=1e-9)
+        np.testing.assert_allclose(middle[19:], ref_middle[19:], rtol=1e-9)
+        np.testing.assert_allclose(lower[19:], ref_lower[19:], rtol=1e-9)
+
+    def test_bollinger_bands_upper_above_lower(self) -> None:
+        rng = np.random.default_rng(9)
+        values = 1950 + np.cumsum(rng.normal(0, 2, size=60))
+        upper, middle, lower = bollinger_bands(values, period=20, num_std=2.0)
+        valid = ~np.isnan(middle)
+        assert np.all(upper[valid] >= middle[valid])
+        assert np.all(middle[valid] >= lower[valid])
+
+    def test_bollinger_bands_constant_series_has_zero_width(self) -> None:
+        upper, middle, lower = bollinger_bands(np.full(30, 100.0), period=20, num_std=2.0)
+        valid = ~np.isnan(middle)
+        np.testing.assert_allclose(upper[valid], middle[valid])
+        np.testing.assert_allclose(lower[valid], middle[valid])
+
+    def test_bollinger_bands_insufficient_data_raises(self) -> None:
+        with pytest.raises(ValueError, match="need at least"):
+            bollinger_bands(np.ones(10), period=20)
 
 
 # ---------------------------------------------------------------------------
@@ -1289,7 +1476,14 @@ class TestPositionManager:
         )
         assert actions == []
 
-    def test_trailing_stop_inactive_before_breakeven(self) -> None:
+    def test_pre_breakeven_trailing_uses_wider_multiplier(self) -> None:
+        # Regression test: before breakeven, the stop must still trail
+        # (using PRE_BREAKEVEN_TRAILING_ATR_MULTIPLIER, wider than the
+        # post-breakeven one) rather than staying frozen at the initial
+        # SL no matter how far price runs in favor — previously this
+        # returned None unconditionally, letting a position give back
+        # 100% of a large unrealized gain with zero protection before
+        # ever reaching Base_TP.
         position = PositionState(
             ticket=1,
             symbol="XAUUSD",
@@ -1298,10 +1492,51 @@ class TestPositionManager:
             entry_price=2000.0,
             stop_loss=1990.0,
             magic_number=555,
-            partial_closed=True,
+            partial_closed=False,
             breakeven_set=False,
         )
-        assert calculate_trailing_stop(position, current_price=2050.0, atr_value=5.0) is None
+        # default pre-breakeven multiplier 2.5 -> candidate = 2050 - 2.5*5
+        # = 2037.5, well above the initial SL of 1990: fires.
+        action = calculate_trailing_stop(position, current_price=2050.0, atr_value=5.0)
+        assert action is not None
+        assert action.stop_loss == 2037.5
+
+    def test_pre_breakeven_trailing_does_not_fire_before_meaningful_move(self) -> None:
+        # Price is still right at entry: the wide pre-breakeven candidate
+        # (2000 - 2.5*5 = 1987.5) doesn't beat the initial SL of 1990, so
+        # nothing fires — this is what keeps it from competing with
+        # Base_TP on every ordinary fluctuation right after entry.
+        position = PositionState(
+            ticket=1,
+            symbol="XAUUSD",
+            side="BUY",
+            volume=0.05,
+            entry_price=2000.0,
+            stop_loss=1990.0,
+            magic_number=555,
+            partial_closed=False,
+            breakeven_set=False,
+        )
+        action = calculate_trailing_stop(position, current_price=2000.0, atr_value=5.0)
+        assert action is None
+
+    def test_pre_breakeven_trailing_for_sell(self) -> None:
+        position = PositionState(
+            ticket=1,
+            symbol="XAUUSD",
+            side="SELL",
+            volume=0.05,
+            entry_price=2000.0,
+            stop_loss=2010.0,
+            magic_number=555,
+            partial_closed=False,
+            breakeven_set=False,
+        )
+        # candidate = 1950 + 2.5*5 = 1962.5, well below the initial SL of
+        # 2010: fires.
+        action = calculate_trailing_stop(position, current_price=1950.0, atr_value=5.0)
+        assert action is not None
+        assert action.stop_loss == 1962.5
 
     def test_trailing_stop_tightens_for_buy(self) -> None:
         position = PositionState(
@@ -2015,6 +2250,34 @@ class TestClassifyDrawdownEvent:
     def test_negative_equity_raises(self, baselines: EquityBaselines) -> None:
         with pytest.raises(ValueError, match="current_equity"):
             classify_drawdown_event(-1.0, baselines)
+
+    def test_soft_lock_override_suppresses_default_threshold_breach(
+        self, baselines: EquityBaselines
+    ) -> None:
+        # 5% down would breach the default DAILY_SOFT_LOCK_LIMIT (0.05);
+        # a wider override (small-account use case) must not fire on it.
+        result = classify_drawdown_event(9_500.0, baselines, daily_soft_lock_limit=0.50)
+        assert result.event == DrawdownEvent.WITHIN_TOLERANCE
+
+    def test_hard_lock_override_suppresses_default_threshold_breach(self) -> None:
+        # Isolate the daily tier (weekly/monthly baselines equal current
+        # equity, i.e. 0% drawdown there) so only the daily override is
+        # under test. 10% down would breach the default
+        # DAILY_HARD_LOCK_LIMIT (0.10); a wider override must fall through
+        # to within-tolerance instead.
+        baselines = EquityBaselines(
+            daily_start_equity=10_000.0, weekly_start_equity=9_000.0, monthly_start_equity=9_000.0
+        )
+        result = classify_drawdown_event(
+            9_000.0, baselines, daily_soft_lock_limit=0.50, daily_hard_lock_limit=0.70
+        )
+        assert result.event == DrawdownEvent.WITHIN_TOLERANCE
+
+    def test_override_still_breaches_past_the_wider_threshold(
+        self, baselines: EquityBaselines
+    ) -> None:
+        result = classify_drawdown_event(9_000.0, baselines, daily_soft_lock_limit=0.05)
+        assert result.event == DrawdownEvent.HARD_LOCK_THRESHOLD_BREACHED
 
 
 class TestEquityBaselineRollover:
@@ -3022,6 +3285,61 @@ class TestBarCloseCycle(_BarCloseCycleHelpers):
         assert result.position_actions[0].action == "TRADE_ACTION_DEAL"
         assert result.entry_decision is None
 
+    def test_partial_close_updates_position_flags_and_state(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        # Regression test for the deeper bug behind the 5.11-lot ->
+        # 0.01-lot cascade: the returned context must actually reflect
+        # partial_closed=True/breakeven_set=True/the reduced volume/the
+        # breakeven stop_loss — previously it silently passed the OLD
+        # position through unchanged, so this same Base_TP check re-fired
+        # every subsequent cycle for as long as price stayed at or beyond
+        # it, repeatedly halving whatever volume remained.
+        position = self._position()  # volume=0.10, entry_price=2000.0
+        context = self._in_position_context(position)
+        snapshot = self._snapshot(current_price=2010.0)  # Base_TP = 2000 + 5*2
+        result = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, feature_flags, cycle_duration_seconds=0.05
+        )
+        assert result.context.position is not None
+        assert result.context.position.partial_closed is True
+        assert result.context.position.breakeven_set is True
+        assert result.context.position.stop_loss == 2000.0  # entry_price, i.e. breakeven
+        assert result.context.position.volume == pytest.approx(0.05)  # 0.10 - 50%
+
+    def test_partial_close_does_not_refire_on_next_cycle(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        # The exact bug this closes: feed the FIRST cycle's returned
+        # context back in as a SECOND cycle's input, at the same
+        # Base_TP-reached price. Previously this fired an identical
+        # partial-close again (and would keep firing every cycle
+        # indefinitely); now it must not, since partial_closed is
+        # correctly True this time.
+        position = self._position()
+        context = self._in_position_context(position)
+        snapshot = self._snapshot(current_price=2010.0)
+        first = orchestrator.run_bar_close_cycle(
+            context, snapshot, baselines, constraints, feature_flags, cycle_duration_seconds=0.05
+        )
+        assert len(first.position_actions) == 2
+
+        second = orchestrator.run_bar_close_cycle(
+            first.context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+        )
+        assert not any(a.action == "TRADE_ACTION_DEAL" for a in second.position_actions)
+
     def test_in_position_after_breakeven_trails_stop(
         self,
         baselines: EquityBaselines,
@@ -3042,6 +3360,13 @@ class TestBarCloseCycle(_BarCloseCycleHelpers):
         assert len(result.position_actions) == 1
         assert result.position_actions[0].action == "TRADE_ACTION_SLTP"
         assert result.position_actions[0].stop_loss == 2012.5
+        # Regression test: the returned context must carry the new
+        # trailing level forward — previously position.stop_loss in the
+        # returned context never advanced, so every later cycle compared
+        # a fresh candidate against a stale reference instead of the
+        # level actually just set at the broker.
+        assert result.context.position is not None
+        assert result.context.position.stop_loss == 2012.5
 
     def test_no_current_price_yields_no_action_while_in_position(
         self,
@@ -3580,6 +3905,71 @@ class TestBarCloseCycleProfitLock(_BarCloseCycleHelpers):
         assert result.position_actions == ()
 
 
+class TestFsmContextToDict:
+    """`main._fsm_context_to_dict()` — the serialization half of
+    persisting `partial_closed`/`breakeven_set` across a restart
+    (docs/ARCHITECTURE_SUMMARY.md §5's now-fixed gap)."""
+
+    def _position(self, **overrides: object) -> orchestrator.PositionState:
+        defaults: dict[str, object] = dict(
+            ticket=42,
+            symbol="XAUUSD",
+            side="BUY",
+            volume=0.10,
+            entry_price=2000.0,
+            stop_loss=1990.0,
+            magic_number=555,
+            partial_closed=True,
+            breakeven_set=True,
+        )
+        defaults.update(overrides)
+        return orchestrator.PositionState(**defaults)  # type: ignore[arg-type]
+
+    def test_serializes_position_fields(self) -> None:
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IN_POSITION,
+            position=self._position(),
+            drawdown_state=DrawdownState.ACTIVE,
+            drawdown_reason=None,
+        )
+        result = orchestrator._fsm_context_to_dict(context)
+        assert result["state"] == "IN_POSITION"
+        assert result["drawdown_state"] == "ACTIVE"
+        assert result["drawdown_reason"] is None
+        assert result["position"] == {
+            "ticket": 42,
+            "symbol": "XAUUSD",
+            "side": "BUY",
+            "volume": 0.10,
+            "entry_price": 2000.0,
+            "stop_loss": 1990.0,
+            "magic_number": 555,
+            "partial_closed": True,
+            "breakeven_set": True,
+        }
+
+    def test_serializes_none_position_as_none(self) -> None:
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IDLE,
+            position=None,
+            drawdown_state=DrawdownState.ACTIVE,
+            drawdown_reason=None,
+        )
+        result = orchestrator._fsm_context_to_dict(context)
+        assert result["position"] is None
+
+    def test_result_is_json_serializable(self) -> None:
+        import json
+
+        context = orchestrator.FSMContext(
+            state=orchestrator.TradingState.IN_POSITION,
+            position=self._position(),
+            drawdown_state=DrawdownState.SOFT_LOCK,
+            drawdown_reason="7% intraday drawdown",
+        )
+        json.dumps(orchestrator._fsm_context_to_dict(context))  # must not raise
+
+
 # ---------------------------------------------------------------------------
 # monitoring/telegram_bot.py
 # ---------------------------------------------------------------------------
@@ -3787,6 +4177,473 @@ class TestFormatOrderHistoryMessage:
     def test_client_order_id_never_appears_in_output(self) -> None:
         message = format_order_history_message([self._open_trade("secret-internal-id")])
         assert "secret-internal-id" not in message
+
+
+class TestFormatAccountMessage:
+    """`/check`'s account-summary section (`monitoring/telegram_bot.py`)."""
+
+    def _account(self, **overrides: object) -> gw.AccountState:
+        defaults: dict[str, object] = dict(
+            balance=9.45,
+            equity=9.45,
+            margin_used=0.0,
+            margin_free=9.45,
+            as_of_utc=datetime(2026, 7, 16, 7, 25, tzinfo=timezone.utc),
+            leverage=1000,
+            floating_profit=0.0,
+        )
+        defaults.update(overrides)
+        return gw.AccountState(**defaults)  # type: ignore[arg-type]
+
+    def _position(self, **overrides: object) -> gw.BrokerPosition:
+        defaults: dict[str, object] = dict(
+            ticket=1,
+            symbol="XAUUSD",
+            side="SELL",
+            volume=0.01,
+            price_open=4096.17,
+            price_current=4092.9,
+            stop_loss=0.0,
+            take_profit=0.0,
+            profit=3.27,
+            magic=0,
+            opened_at_utc=datetime(2026, 7, 16, 6, 0, tzinfo=timezone.utc),
+        )
+        defaults.update(overrides)
+        return gw.BrokerPosition(**defaults)  # type: ignore[arg-type]
+
+    def test_reports_balance_equity_margin_leverage(self) -> None:
+        message = format_account_message(self._account(), [])
+        assert "Balance: $9.45" in message
+        assert "Equity: $9.45" in message
+        assert "Margin ใช้ไป: $0.00" in message
+        assert "Margin ว่าง: $9.45" in message
+        assert "Leverage: 1:1000" in message
+
+    def test_no_positions_reports_none(self) -> None:
+        message = format_account_message(self._account(), [])
+        assert "Position เปิดอยู่: ไม่มี" in message
+
+    def test_positive_floating_profit_shows_plus_sign(self) -> None:
+        message = format_account_message(self._account(floating_profit=12.5), [])
+        assert "กำไร/ขาดทุนลอย: +$12.50" in message
+
+    def test_negative_floating_profit_shows_minus_sign(self) -> None:
+        message = format_account_message(self._account(floating_profit=-3.2), [])
+        assert "กำไร/ขาดทุนลอย: -$3.20" in message
+
+    def test_open_positions_are_listed_regardless_of_magic(self) -> None:
+        # magic=0 is a manually-opened trade the bot itself never places —
+        # /check's account overview must still surface it.
+        message = format_account_message(self._account(), [self._position(magic=0)])
+        assert "Position เปิดอยู่: มี 1 รายการ" in message
+        assert "SELL 0.01 XAUUSD" in message
+        assert "magic 0" in message
+
+    def test_multiple_open_positions_are_each_listed(self) -> None:
+        message = format_account_message(
+            self._account(),
+            [self._position(ticket=1, magic=123456), self._position(ticket=2, magic=654321)],
+        )
+        assert "Position เปิดอยู่: มี 2 รายการ" in message
+        assert "magic 123456" in message
+        assert "magic 654321" in message
+
+
+class TestFormatConditionMessage:
+    """`/condition`'s entry-gate checklist (`monitoring/telegram_bot.py`)."""
+
+    def _trend(self, **overrides: object) -> TrendAlignment:
+        defaults: dict[str, object] = dict(
+            direction="BEARISH",
+            d1_bullish=False,
+            h4_bullish=False,
+            h1_bullish=False,
+            adx_value=18.1,
+            adx_confirmed=False,
+        )
+        defaults.update(overrides)
+        return TrendAlignment(**defaults)  # type: ignore[arg-type]
+
+    def _breakout(self, direction: Direction = "NONE") -> BreakoutSignal:
+        return BreakoutSignal(
+            direction=direction, breakout_distance_points=0.0, volume_confirmed=False
+        )
+
+    def _pullback(self, direction: Direction = "NONE") -> PullbackSignal:
+        return PullbackSignal(direction=direction, reference_level=4040.0)
+
+    def _wick_fill(self, rejection: Direction = "NONE") -> WickFillResult:
+        return WickFillResult(upper_shadow_ratio=0.4, lower_shadow_ratio=0.3, rejection=rejection)
+
+    def _message(self, **overrides: object) -> str:
+        defaults: dict[str, object] = dict(
+            is_locked=False,
+            drawdown_state_label="ACTIVE",
+            has_position=False,
+            trend=self._trend(),
+            breakout=self._breakout(),
+            pullback=self._pullback(),
+            wick_fill=self._wick_fill(),
+            adx_trend_threshold=25.0,
+        )
+        defaults.update(overrides)
+        return format_condition_message(**defaults)  # type: ignore[arg-type]
+
+    def test_locked_drawdown_shows_failing_mark(self) -> None:
+        message = self._message(is_locked=True, drawdown_state_label="HARD_LOCK")
+        assert "❌ Drawdown ไม่ติดล็อก (สถานะ: HARD_LOCK)" in message
+
+    def test_unlocked_drawdown_shows_passing_mark(self) -> None:
+        message = self._message(is_locked=False, drawdown_state_label="ACTIVE")
+        assert "✅ Drawdown ไม่ติดล็อก (สถานะ: ACTIVE)" in message
+
+    def test_existing_position_shows_failing_mark(self) -> None:
+        message = self._message(has_position=True)
+        assert "❌ ไม่มี position เปิดอยู่แล้ว" in message
+
+    def test_no_position_shows_passing_mark(self) -> None:
+        message = self._message(has_position=False)
+        assert "✅ ไม่มี position เปิดอยู่แล้ว" in message
+
+    def test_none_direction_trend_shows_failing_mark(self) -> None:
+        message = self._message(trend=self._trend(direction="NONE"))
+        assert "❌ เทรนด์ D1+H4+H1 ตรงกัน (ปัจจุบัน: NONE)" in message
+
+    def test_aligned_trend_shows_passing_mark(self) -> None:
+        message = self._message(trend=self._trend(direction="BEARISH"))
+        assert "✅ เทรนด์ D1+H4+H1 ตรงกัน (ปัจจุบัน: BEARISH)" in message
+
+    def test_adx_not_confirmed_shows_failing_mark(self) -> None:
+        message = self._message(trend=self._trend(adx_value=18.1, adx_confirmed=False))
+        assert "❌ ADX ยืนยันเทรนด์แรงพอ (18.1 / ต้อง ≥ 25.0)" in message
+
+    def test_adx_confirmed_shows_passing_mark(self) -> None:
+        message = self._message(trend=self._trend(adx_value=30.0, adx_confirmed=True))
+        assert "✅ ADX ยืนยันเทรนด์แรงพอ (30.0 / ต้อง ≥ 25.0)" in message
+
+    def test_no_trigger_signal_shows_failing_mark(self) -> None:
+        message = self._message(
+            breakout=self._breakout("NONE"),
+            pullback=self._pullback("NONE"),
+            wick_fill=self._wick_fill("NONE"),
+        )
+        assert "❌ มี trigger signal" in message
+
+    def test_breakout_trigger_shows_passing_mark(self) -> None:
+        message = self._message(breakout=self._breakout("BUY"))
+        assert "✅ มี trigger signal" in message
+
+    def test_pullback_trigger_shows_passing_mark(self) -> None:
+        message = self._message(pullback=self._pullback("SELL"))
+        assert "✅ มี trigger signal" in message
+
+    def test_wick_fill_trigger_shows_passing_mark(self) -> None:
+        message = self._message(wick_fill=self._wick_fill("BUY"))
+        assert "✅ มี trigger signal" in message
+
+
+class TestSummarizeIndicatorSignal:
+    """The simple additive-vote BUY/SELL/HOLD heuristic
+    (`monitoring/telegram_bot.py`) — separate from, and never fed into,
+    `main.py`'s actual entry decision."""
+
+    def _votes(self, **overrides: float) -> dict[str, float]:
+        defaults: dict[str, float] = dict(
+            current_price=2000.0,
+            ma_value=1990.0,
+            rsi_value=50.0,
+            macd_histogram=0.2,
+            bollinger_upper=2010.0,
+            bollinger_lower=1970.0,
+        )
+        defaults.update(overrides)
+        return defaults
+
+    def test_all_bullish_votes_score_four_and_buy(self) -> None:
+        label, score = summarize_indicator_signal(
+            **self._votes(
+                current_price=1965.0,  # above MA is impossible if also <= lower band and MA=1990
+                ma_value=1960.0,
+                rsi_value=25.0,
+                macd_histogram=0.5,
+                bollinger_lower=1970.0,
+            )
+        )
+        assert score == 4
+        assert label == "BUY"
+
+    def test_all_bearish_votes_score_negative_four_and_sell(self) -> None:
+        label, score = summarize_indicator_signal(
+            **self._votes(
+                current_price=2015.0,
+                ma_value=2020.0,
+                rsi_value=80.0,
+                macd_histogram=-0.5,
+                bollinger_upper=2010.0,
+            )
+        )
+        assert score == -4
+        assert label == "SELL"
+
+    def test_ties_resolve_bullish_for_ma_and_macd(self) -> None:
+        # MA (>=) and MACD (>=) both resolve bullish on an exact tie;
+        # RSI/Bollinger stay neutral (0) here -> net score = 2, not a
+        # true 4-way tie.
+        label, score = summarize_indicator_signal(
+            **self._votes(
+                current_price=2000.0,
+                ma_value=2000.0,
+                rsi_value=50.0,
+                macd_histogram=0.0,
+                bollinger_upper=2010.0,
+                bollinger_lower=1990.0,
+            )
+        )
+        assert score == 2
+        assert label == "BUY"
+
+    def test_opposing_votes_cancel_to_hold(self) -> None:
+        # MA bullish (+1), RSI overbought bearish (-1), MACD bearish (-1),
+        # Bollinger oversold bullish (+1) -> net zero.
+        label, score = summarize_indicator_signal(
+            current_price=2000.0,
+            ma_value=1990.0,
+            rsi_value=80.0,
+            macd_histogram=-0.1,
+            bollinger_upper=2020.0,
+            bollinger_lower=2000.0,
+        )
+        assert score == 0
+        assert label == "HOLD"
+
+    def test_ma_vote_bullish_when_price_at_or_above(self) -> None:
+        _, score_above = summarize_indicator_signal(
+            **self._votes(current_price=2000.0, ma_value=1990.0)
+        )
+        _, score_below = summarize_indicator_signal(
+            **self._votes(current_price=1980.0, ma_value=1990.0)
+        )
+        assert score_above > score_below
+
+    def test_rsi_oversold_votes_bullish(self) -> None:
+        _, score = summarize_indicator_signal(**self._votes(rsi_value=20.0))
+        _, neutral_score = summarize_indicator_signal(**self._votes(rsi_value=50.0))
+        assert score > neutral_score
+
+    def test_rsi_overbought_votes_bearish(self) -> None:
+        _, score = summarize_indicator_signal(**self._votes(rsi_value=80.0))
+        _, neutral_score = summarize_indicator_signal(**self._votes(rsi_value=50.0))
+        assert score < neutral_score
+
+    def test_min_abs_score_default_matches_prior_behavior(self) -> None:
+        # score=1 (only MA bullish, everything else neutral) -> BUY under
+        # the default min_abs_score=1, exactly as before this param existed.
+        _, cancelled_score = summarize_indicator_signal(
+            current_price=2000.0,
+            ma_value=1990.0,
+            rsi_value=50.0,
+            macd_histogram=-0.1,
+            bollinger_upper=2010.0,
+            bollinger_lower=1970.0,
+        )
+        assert cancelled_score == 0  # MA (+1) and MACD (-1) cancel
+        label, score = summarize_indicator_signal(**self._votes(macd_histogram=0.1))
+        assert score == 2  # MA (+1) + MACD (+1), RSI/Bollinger neutral
+        assert label == "BUY"
+
+    def test_min_abs_score_2_requires_stronger_agreement(self) -> None:
+        # MA(+1) + MACD(+1, zero-histogram tie resolves bullish), RSI/
+        # Bollinger neutral -> score=2. Passes the default min_abs_score=1
+        # gate but not a stricter min_abs_score=3.
+        votes = self._votes(
+            ma_value=1990.0,
+            rsi_value=50.0,
+            macd_histogram=0.0,
+            bollinger_upper=2010.0,
+            bollinger_lower=1970.0,
+        )
+        label_default, score = summarize_indicator_signal(**votes)
+        assert score == 2
+        label_strict, _ = summarize_indicator_signal(**votes, min_abs_score=3)
+        assert label_default == "BUY"
+        assert label_strict == "HOLD"
+
+
+class TestFormatIndicatorMessage:
+    """`/condition`'s monitoring-only MA/RSI/MACD/Bollinger readout
+    (`monitoring/telegram_bot.py`) — never consulted by any trading
+    decision, purely informational."""
+
+    def _message(self, **overrides: object) -> str:
+        defaults: dict[str, object] = dict(
+            current_price=2000.0,
+            ma_period=20,
+            ma_value=1990.0,
+            rsi_period=14,
+            rsi_value=50.0,
+            macd_line=0.5,
+            macd_signal=0.3,
+            macd_histogram=0.2,
+            bollinger_period=20,
+            bollinger_upper=2010.0,
+            bollinger_middle=1990.0,
+            bollinger_lower=1970.0,
+        )
+        defaults.update(overrides)
+        return format_indicator_message(**defaults)  # type: ignore[arg-type]
+
+    def test_reports_ma_rsi_macd_bollinger_values(self) -> None:
+        message = self._message()
+        assert "MA(20): 1990.00" in message
+        assert "RSI(14): 50.0" in message
+        assert "MACD: line 0.500 / signal 0.300 / histogram 0.200" in message
+        assert "Bollinger Bands(20): upper 2010.00 / middle 1990.00 / lower 1970.00" in message
+
+    def test_price_above_ma_reported(self) -> None:
+        message = self._message(current_price=2000.0, ma_value=1990.0)
+        assert "ราคาปัจจุบัน สูงกว่า MA" in message
+
+    def test_price_below_ma_reported(self) -> None:
+        message = self._message(current_price=1980.0, ma_value=1990.0)
+        assert "ราคาปัจจุบัน ต่ำกว่า MA" in message
+
+    def test_rsi_overbought_label(self) -> None:
+        message = self._message(rsi_value=75.0)
+        assert "overbought" in message
+
+    def test_rsi_oversold_label(self) -> None:
+        message = self._message(rsi_value=20.0)
+        assert "oversold" in message
+
+    def test_rsi_normal_label(self) -> None:
+        message = self._message(rsi_value=50.0)
+        assert "ปกติ" in message
+
+    def test_macd_positive_histogram_shows_bullish_label(self) -> None:
+        message = self._message(macd_histogram=0.5)
+        assert "โมเมนตัมขาขึ้น" in message
+
+    def test_macd_negative_histogram_shows_bearish_label(self) -> None:
+        message = self._message(macd_histogram=-0.5)
+        assert "โมเมนตัมขาลง" in message
+
+    def test_price_above_upper_band_shows_overbought(self) -> None:
+        message = self._message(current_price=2015.0, bollinger_upper=2010.0)
+        assert "ชนแถบบน (overbought)" in message
+
+    def test_price_below_lower_band_shows_oversold(self) -> None:
+        message = self._message(current_price=1965.0, bollinger_lower=1970.0)
+        assert "ชนแถบล่าง (oversold)" in message
+
+    def test_price_within_bands_shows_middle(self) -> None:
+        message = self._message(
+            current_price=1995.0, bollinger_upper=2010.0, bollinger_lower=1970.0
+        )
+        assert "อยู่ในแถบกลาง" in message
+
+
+class TestSignalValidationResult:
+    """`backtester/signal_validation.py`'s aggregation dataclass — pure
+    arithmetic over a plain tuple of `SignalPrediction`, independent of
+    `validate_signal()`'s own indicator plumbing."""
+
+    def _prediction(self, label: str, correct: bool, bar_index: int = 0) -> SignalPrediction:
+        return SignalPrediction(bar_index=bar_index, label=label, score=1, correct=correct)
+
+    def test_accuracy_matches_hand_calc(self) -> None:
+        result = SignalValidationResult(
+            predictions=(
+                self._prediction("BUY", True),
+                self._prediction("BUY", False),
+                self._prediction("SELL", True),
+                self._prediction("SELL", True),
+            )
+        )
+        assert result.total == 4
+        assert result.accuracy == pytest.approx(0.75)
+
+    def test_accuracy_zero_for_no_predictions(self) -> None:
+        result = SignalValidationResult(predictions=())
+        assert result.total == 0
+        assert result.accuracy == 0.0
+
+    def test_accuracy_for_label_isolates_that_label_only(self) -> None:
+        result = SignalValidationResult(
+            predictions=(
+                self._prediction("BUY", True),
+                self._prediction("BUY", True),
+                self._prediction("BUY", False),
+                self._prediction("SELL", False),
+            )
+        )
+        assert result.accuracy_for("BUY") == pytest.approx(2 / 3)
+        assert result.accuracy_for("SELL") == 0.0
+
+    def test_accuracy_for_label_zero_when_label_never_predicted(self) -> None:
+        result = SignalValidationResult(predictions=(self._prediction("BUY", True),))
+        assert result.accuracy_for("SELL") == 0.0
+
+
+class TestValidateSignal:
+    """`backtester/signal_validation.py`'s `validate_signal()` — end-to-end
+    over small, deterministic synthetic price paths where the "correct"
+    answer is known by construction."""
+
+    def _bars(self, closes: list[float], *, start_hour: int = 0) -> gw.BarSeries:
+        n = len(closes)
+        start = datetime(2024, 1, 1, start_hour, tzinfo=timezone.utc)
+        times = tuple(start + timedelta(hours=i) for i in range(n))
+        close = np.array(closes, dtype=np.float64)
+        return gw.BarSeries(
+            open=close.copy(),
+            high=close + 0.5,
+            low=close - 0.5,
+            close=close,
+            tick_volume=np.full(n, 100.0),
+            time_utc=times,
+        )
+
+    def test_noisy_uptrend_favors_correct_buy_predictions(self) -> None:
+        # A noisy (not perfectly linear -- a perfectly linear series makes
+        # MACD's histogram settle at exactly 0 once the EMAs reach their
+        # steady-state lag offset, an unrealistic edge case that trips the
+        # "ties resolve bullish" convention regardless of true direction)
+        # steady uptrend: BUY predictions should be correct more often
+        # than chance (>50%).
+        rng = np.random.default_rng(11)
+        closes = list(2000.0 + np.cumsum(rng.normal(0.5, 1.0, size=300)))
+        result = validate_signal(self._bars(closes), horizon_bars=4, min_abs_score=1)
+        assert result.total > 0
+        assert result.accuracy_for("BUY") > 0.5
+
+    def test_noisy_downtrend_favors_correct_sell_predictions(self) -> None:
+        rng = np.random.default_rng(13)
+        closes = list(2000.0 + np.cumsum(rng.normal(-0.5, 1.0, size=300)))
+        result = validate_signal(self._bars(closes), horizon_bars=4, min_abs_score=1)
+        assert result.total > 0
+        assert result.accuracy_for("SELL") > 0.5
+
+    def test_returns_empty_result_when_series_too_short_for_warmup(self) -> None:
+        closes = [2000.0 + i for i in range(10)]
+        result = validate_signal(self._bars(closes), horizon_bars=4)
+        assert result.total == 0
+
+    def test_start_index_end_index_restrict_the_scored_range(self) -> None:
+        closes = [2000.0 + i * 0.5 for i in range(200)]
+        bars = self._bars(closes)
+        full = validate_signal(bars, horizon_bars=4, start_index=0, end_index=200)
+        restricted = validate_signal(bars, horizon_bars=4, start_index=100, end_index=150)
+        assert all(100 <= p.bar_index < 150 for p in restricted.predictions)
+        assert restricted.total < full.total
+
+    def test_min_abs_score_2_yields_fewer_or_equal_predictions_than_1(self) -> None:
+        rng = np.random.default_rng(3)
+        closes = list(2000.0 + np.cumsum(rng.normal(0, 2, size=300)))
+        bars = self._bars(closes)
+        loose = validate_signal(bars, horizon_bars=4, min_abs_score=1)
+        strict = validate_signal(bars, horizon_bars=4, min_abs_score=2)
+        assert strict.total <= loose.total
 
 
 class TestBuildNotifierFromEnv:
@@ -4006,3 +4863,525 @@ class TestKillMainProcess:
         )
         reply = telegram_bot._kill_main_process()
         assert "ล้มเหลว" in reply
+
+
+# ---------------------------------------------------------------------------
+# backtester/historical_data.py, backtester/replay_gateway.py,
+# analytics/performance.py (Phase 1 backtester)
+# ---------------------------------------------------------------------------
+
+
+def _bar_series(times: tuple[datetime, ...], closes: list[float] | None = None) -> gw.BarSeries:
+    n = len(times)
+    close = np.array(closes if closes is not None else [2000.0 + i for i in range(n)])
+    return gw.BarSeries(
+        open=close.copy(),
+        high=close + 1.0,
+        low=close - 1.0,
+        close=close,
+        tick_volume=np.full(n, 100.0),
+        time_utc=times,
+    )
+
+
+class TestAuditBarSeries:
+    """`backtester/historical_data.py`'s mandatory data-quality gate
+    (`docs/RESEARCH.md` §1)."""
+
+    def test_clean_hourly_series_passes(self) -> None:
+        start = datetime(2024, 1, 2, 0, 0, tzinfo=timezone.utc)  # Tuesday
+        times = tuple(start + timedelta(hours=i) for i in range(10))
+        audit_bar_series(_bar_series(times), timeframe_minutes=60)  # no raise
+
+    def test_non_monotonic_timestamps_raise(self) -> None:
+        start = datetime(2024, 1, 2, 0, 0, tzinfo=timezone.utc)
+        times = (start, start - timedelta(hours=1), start + timedelta(hours=2))
+        with pytest.raises(ValueError, match="non-monotonic"):
+            audit_bar_series(_bar_series(times), timeframe_minutes=60)
+
+    def test_duplicate_timestamps_raise(self) -> None:
+        start = datetime(2024, 1, 2, 0, 0, tzinfo=timezone.utc)
+        times = (start, start, start + timedelta(hours=1))
+        with pytest.raises(ValueError, match="non-monotonic"):
+            audit_bar_series(_bar_series(times), timeframe_minutes=60)
+
+    def test_small_non_weekend_gap_logs_but_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Tuesday 00:00 -> Tuesday 08:00 is a 8h gap on a 60m timeframe
+        # (> 2x), with neither endpoint inside the weekend closure window,
+        # but well under MAX_PLAUSIBLE_HOLIDAY_GAP (4 days) — treated as a
+        # probable holiday closure and logged, not raised (confirmed live:
+        # real XAUUSD H4 history has exactly this gap shape around
+        # Christmas 2024).
+        start = datetime(2024, 1, 2, 0, 0, tzinfo=timezone.utc)
+        times = (start, start + timedelta(hours=8))
+        with caplog.at_level(logging.WARNING):
+            audit_bar_series(_bar_series(times), timeframe_minutes=60)  # no raise
+        assert "probable holiday closure" in caplog.text
+
+    def test_gap_at_or_beyond_holiday_bound_raises(self) -> None:
+        # Monday 00:00 -> Friday 21:00 (same week, before Friday's own
+        # 22:00 close) is a ~4d21h gap: not weekend-explained (ends before
+        # close) and exceeds MAX_PLAUSIBLE_HOLIDAY_GAP (4 days) — too large
+        # to plausibly be an ordinary holiday, so this still raises.
+        start = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)  # Monday
+        times = (start, start + timedelta(days=4, hours=21))
+        with pytest.raises(ValueError, match="unexplained gap"):
+            audit_bar_series(_bar_series(times), timeframe_minutes=60)
+
+    def test_weekend_gap_does_not_raise(self) -> None:
+        # Friday 21:00 UTC -> Sunday 23:00 UTC: a large gap fully explained
+        # by the weekly weekend closure (Friday 22:00 -> Sunday 22:00 UTC).
+        friday_close = datetime(2024, 1, 5, 21, 0, tzinfo=timezone.utc)
+        sunday_reopen = datetime(2024, 1, 7, 23, 0, tzinfo=timezone.utc)
+        times = (friday_close, sunday_reopen)
+        audit_bar_series(_bar_series(times), timeframe_minutes=60)  # no raise
+
+    def test_short_series_is_trivially_clean(self) -> None:
+        audit_bar_series(
+            _bar_series((datetime(2024, 1, 2, tzinfo=timezone.utc),)), timeframe_minutes=60
+        )
+
+
+class TestHistoricalReplayGateway:
+    """`backtester/replay_gateway.py` — the seam that lets the simulator
+    drive `main.py`'s real decision code against historical bars."""
+
+    def _gateway(self) -> tuple[HistoricalReplayGateway, tuple[datetime, ...]]:
+        start = datetime(2024, 1, 2, 0, 0, tzinfo=timezone.utc)
+        h1_times = tuple(start + timedelta(hours=i) for i in range(20))
+        h1_bars = _bar_series(h1_times)
+        d1_bars = _bar_series(tuple(start + timedelta(days=i) for i in range(3)))
+        h4_bars = _bar_series(tuple(start + timedelta(hours=4 * i) for i in range(5)))
+        account = gw.AccountState(
+            balance=1000.0,
+            equity=1000.0,
+            margin_used=0.0,
+            margin_free=1000.0,
+            as_of_utc=start,
+        )
+        replay = HistoricalReplayGateway(
+            d1_bars=d1_bars, h4_bars=h4_bars, h1_bars=h1_bars, starting_account_state=account
+        )
+        return replay, h1_times
+
+    def test_get_bars_returns_only_bars_closed_by_cursor(self) -> None:
+        replay, h1_times = self._gateway()
+        replay.advance_to(h1_times[5])
+        bars = replay.get_bars(gw.TIMEFRAME_H1, 100)
+        assert len(bars.close) == 6  # indices 0..5 inclusive
+        assert bars.time_utc[-1] == h1_times[5]
+
+    def test_get_bars_never_leaks_a_bar_after_the_cursor(self) -> None:
+        replay, h1_times = self._gateway()
+        replay.advance_to(h1_times[5])
+        bars = replay.get_bars(gw.TIMEFRAME_H1, 100)
+        assert all(t <= h1_times[5] for t in bars.time_utc)
+
+    def test_get_bars_respects_count_limit(self) -> None:
+        replay, h1_times = self._gateway()
+        replay.advance_to(h1_times[10])
+        bars = replay.get_bars(gw.TIMEFRAME_H1, 3)
+        assert list(bars.time_utc) == list(h1_times[8:11])
+
+    def test_advance_to_before_any_bar_returns_empty(self) -> None:
+        replay, h1_times = self._gateway()
+        replay.advance_to(h1_times[0] - timedelta(minutes=1))
+        bars = replay.get_bars(gw.TIMEFRAME_H1, 10)
+        assert len(bars.close) == 0
+
+    def test_get_current_price_tracks_latest_closed_h1_bar(self) -> None:
+        replay, h1_times = self._gateway()
+        replay.advance_to(h1_times[3])
+        expected = replay.get_bars(gw.TIMEFRAME_H1, 1).close[-1]
+        assert replay.get_current_price() == expected
+
+    def test_account_state_is_settable_and_read_back(self) -> None:
+        replay, _ = self._gateway()
+        new_state = gw.AccountState(
+            balance=500.0,
+            equity=480.0,
+            margin_used=20.0,
+            margin_free=460.0,
+            as_of_utc=datetime.now(timezone.utc),
+        )
+        replay.account_state = new_state
+        assert replay.get_account_state() == new_state
+
+
+class TestPerformanceFormulas:
+    """`analytics/performance.py`'s formulas, exactly per
+    `docs/RESEARCH.md` §7."""
+
+    def _curve(
+        self, values: list[float], *, step: timedelta = timedelta(hours=1)
+    ) -> list[tuple[datetime, float]]:
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        return [(start + i * step, v) for i, v in enumerate(values)]
+
+    def test_compute_returns_matches_reference(self) -> None:
+        curve = self._curve([100.0, 110.0, 99.0, 99.0])
+        returns = compute_returns(curve)
+        np.testing.assert_allclose(returns, [0.10, -0.10, 0.0], rtol=1e-9)
+
+    def test_compute_returns_empty_for_short_curve(self) -> None:
+        assert list(compute_returns(self._curve([100.0]))) == []
+
+    def test_infer_periods_per_year_matches_hand_calc(self) -> None:
+        # 366 points spanning exactly 365 days -> ~366 periods/year.
+        curve = self._curve([100.0] * 366, step=timedelta(days=1))
+        result = infer_periods_per_year(curve)
+        assert result == pytest.approx(366 / (365 / 365.25), rel=1e-6)
+
+    def test_infer_periods_per_year_zero_for_short_span(self) -> None:
+        curve = self._curve([100.0, 101.0], step=timedelta(minutes=1))
+        assert infer_periods_per_year(curve) == 0.0
+
+    def test_sharpe_ratio_matches_hand_computation(self) -> None:
+        returns = np.array([0.01, -0.02, 0.03, 0.0])
+        expected = (returns.mean() - 0.0) / returns.std(ddof=0) * np.sqrt(252.0)
+        assert sharpe_ratio(returns, periods_per_year=252.0) == pytest.approx(expected)
+
+    def test_sharpe_ratio_zero_on_zero_variance(self) -> None:
+        returns = np.array([0.01, 0.01, 0.01])
+        assert sharpe_ratio(returns, periods_per_year=252.0) == 0.0
+
+    def test_sharpe_ratio_zero_on_empty_returns(self) -> None:
+        assert sharpe_ratio(np.array([]), periods_per_year=252.0) == 0.0
+
+    def test_sortino_ratio_uses_only_downside_deviation(self) -> None:
+        returns = np.array([0.05, 0.05, -0.01, -0.03])
+        downside = np.minimum(returns, 0.0)
+        expected = returns.mean() / downside.std(ddof=0) * np.sqrt(252.0)
+        assert sortino_ratio(returns, periods_per_year=252.0) == pytest.approx(expected)
+
+    def test_sortino_ratio_zero_when_never_negative(self) -> None:
+        returns = np.array([0.01, 0.02, 0.03])
+        assert sortino_ratio(returns, periods_per_year=252.0) == 0.0
+
+    def test_cagr_doubling_over_one_year(self) -> None:
+        curve = self._curve([100.0, 200.0], step=timedelta(days=365))
+        assert cagr(curve) == pytest.approx(1.0, rel=1e-2)
+
+    def test_cagr_zero_for_short_span(self) -> None:
+        curve = self._curve([100.0, 101.0], step=timedelta(minutes=1))
+        assert cagr(curve) == 0.0
+
+    def test_max_drawdown_matches_hand_calc(self) -> None:
+        curve = self._curve([100.0, 120.0, 90.0, 110.0])
+        # Peak 120 -> trough 90: drawdown = (120-90)/120 = 0.25
+        assert max_drawdown(curve) == pytest.approx(0.25)
+
+    def test_max_drawdown_zero_for_monotonic_rise(self) -> None:
+        curve = self._curve([100.0, 110.0, 120.0])
+        assert max_drawdown(curve) == 0.0
+
+    def test_max_drawdown_duration_matches_hand_calc(self) -> None:
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        curve = [
+            (start, 100.0),
+            (start + timedelta(days=1), 120.0),  # new peak
+            (start + timedelta(days=2), 90.0),  # underwater starts
+            (start + timedelta(days=5), 110.0),  # still underwater (< 120)
+            (start + timedelta(days=6), 130.0),  # new peak, underwater ends
+        ]
+        # Underwater from day 1 (peak time) through day 6 -> 5 days.
+        assert max_drawdown_duration(curve) == timedelta(days=5)
+
+    def test_mar_ratio_zero_when_no_drawdown(self) -> None:
+        curve = self._curve([100.0, 110.0, 120.0])
+        assert mar_ratio(curve) == 0.0
+
+    def test_mar_ratio_matches_cagr_over_drawdown(self) -> None:
+        curve = self._curve([100.0, 200.0, 150.0], step=timedelta(days=200))
+        expected = cagr(curve) / max_drawdown(curve)
+        assert mar_ratio(curve) == pytest.approx(expected)
+
+    def test_profit_factor_matches_hand_calc(self) -> None:
+        # gains=30, losses=abs(-10-5)=15 -> 30/15 = 2.0
+        assert profit_factor([10.0, 20.0, -10.0, -5.0]) == pytest.approx(2.0)
+
+    def test_profit_factor_infinite_with_no_losers(self) -> None:
+        assert profit_factor([10.0, 20.0]) == float("inf")
+
+    def test_profit_factor_zero_for_no_trades(self) -> None:
+        assert profit_factor([]) == 0.0
+
+    def test_win_rate_matches_hand_calc(self) -> None:
+        assert win_rate([10.0, -5.0, 3.0, -1.0]) == pytest.approx(0.5)
+
+    def test_win_rate_zero_for_no_trades(self) -> None:
+        assert win_rate([]) == 0.0
+
+
+class TestSkewnessKurtosis:
+    """`analytics/performance.py`'s `skewness()`/`kurtosis()` — γ3/γ4 in
+    `docs/RESEARCH.md` §3's Deflated Sharpe Ratio formula."""
+
+    def test_symmetric_distribution_has_near_zero_skewness(self) -> None:
+        # A symmetric set of returns around 0 has ~0 skewness.
+        returns = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+        assert skewness(returns) == pytest.approx(0.0, abs=1e-9)
+
+    def test_right_skewed_distribution_has_positive_skewness(self) -> None:
+        returns = np.array([-1.0, -1.0, -1.0, -1.0, 5.0])
+        assert skewness(returns) > 0.0
+
+    def test_left_skewed_distribution_has_negative_skewness(self) -> None:
+        returns = np.array([1.0, 1.0, 1.0, 1.0, -5.0])
+        assert skewness(returns) < 0.0
+
+    def test_skewness_zero_for_constant_series(self) -> None:
+        assert skewness(np.array([1.0, 1.0, 1.0])) == 0.0
+
+    def test_skewness_zero_for_short_series(self) -> None:
+        assert skewness(np.array([1.0])) == 0.0
+
+    def test_kurtosis_of_uniform_like_series_below_normal(self) -> None:
+        # A uniform-ish (platykurtic) series reads below the normal
+        # distribution's kurtosis of 3.0.
+        returns = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+        assert kurtosis(returns) < 3.0
+
+    def test_kurtosis_three_for_constant_series(self) -> None:
+        # Degenerate (zero-variance) input reads as the normal-distribution
+        # value — a neutral default, not an error.
+        assert kurtosis(np.array([1.0, 1.0, 1.0])) == 3.0
+
+    def test_kurtosis_three_for_short_series(self) -> None:
+        assert kurtosis(np.array([1.0])) == 3.0
+
+
+class TestDeflatedSharpeRatio:
+    """`analytics/performance.py`'s `deflated_sharpe_ratio()`, exactly per
+    `docs/RESEARCH.md` §3. Reference values independently computed via
+    `math.erf` for Φ (not reusing `scipy.stats.norm.cdf`, so this is a
+    genuine cross-check of the formula, not just of scipy) and
+    `scipy.stats.norm.ppf` for Φ⁻¹ (trusted as a correct library primitive
+    rather than reimplemented from scratch)."""
+
+    def test_matches_independently_computed_reference_case_a(self) -> None:
+        # sharpe=0.3, n_obs=20, skew=0.1, kurt=3.5, n_trials=10, var_sr=0.04
+        # -> DSR ~= 0.4744 (worked by hand, see this phase's implementation
+        # notes).
+        result = deflated_sharpe_ratio(
+            0.3,
+            n_observations=20,
+            skewness=0.1,
+            kurtosis=3.5,
+            n_trials=10,
+            sharpe_variance_across_trials=0.04,
+        )
+        assert result == pytest.approx(0.4744070116757761, rel=1e-9)
+
+    def test_more_trials_deflates_the_same_sharpe_further(self) -> None:
+        # Same sharpe/observations/skew/kurt, only n_trials rises 10 -> 50:
+        # DSR must fall (more trials = more chance the best-of-N looks good
+        # by luck alone, so the deflation correction grows).
+        dsr_10_trials = deflated_sharpe_ratio(
+            0.3,
+            n_observations=20,
+            skewness=0.1,
+            kurtosis=3.5,
+            n_trials=10,
+            sharpe_variance_across_trials=0.04,
+        )
+        dsr_50_trials = deflated_sharpe_ratio(
+            0.3,
+            n_observations=20,
+            skewness=0.1,
+            kurtosis=3.5,
+            n_trials=50,
+            sharpe_variance_across_trials=0.04,
+        )
+        assert dsr_50_trials == pytest.approx(0.25204958177051884, rel=1e-9)
+        assert dsr_50_trials < dsr_10_trials
+
+    def test_higher_sharpe_gives_higher_dsr_all_else_equal(self) -> None:
+        low = deflated_sharpe_ratio(
+            0.2,
+            n_observations=50,
+            skewness=0.0,
+            kurtosis=3.0,
+            n_trials=20,
+            sharpe_variance_across_trials=0.05,
+        )
+        high = deflated_sharpe_ratio(
+            1.0,
+            n_observations=50,
+            skewness=0.0,
+            kurtosis=3.0,
+            n_trials=20,
+            sharpe_variance_across_trials=0.05,
+        )
+        assert high > low
+
+    def test_zero_for_insufficient_observations(self) -> None:
+        result = deflated_sharpe_ratio(
+            1.0,
+            n_observations=1,
+            skewness=0.0,
+            kurtosis=3.0,
+            n_trials=10,
+            sharpe_variance_across_trials=0.04,
+        )
+        assert result == 0.0
+
+    def test_zero_for_insufficient_trials(self) -> None:
+        result = deflated_sharpe_ratio(
+            1.0,
+            n_observations=50,
+            skewness=0.0,
+            kurtosis=3.0,
+            n_trials=1,
+            sharpe_variance_across_trials=0.04,
+        )
+        assert result == 0.0
+
+    def test_zero_for_non_positive_trial_variance(self) -> None:
+        result = deflated_sharpe_ratio(
+            1.0,
+            n_observations=50,
+            skewness=0.0,
+            kurtosis=3.0,
+            n_trials=10,
+            sharpe_variance_across_trials=0.0,
+        )
+        assert result == 0.0
+
+    def test_zero_for_non_positive_denominator(self) -> None:
+        # A large positive skew combined with a large sharpe can drive the
+        # formula's inner square root negative: 1 - 10*10 + 0.5*100 = -49.
+        result = deflated_sharpe_ratio(
+            10.0,
+            n_observations=50,
+            skewness=10.0,
+            kurtosis=3.0,
+            n_trials=10,
+            sharpe_variance_across_trials=0.04,
+        )
+        assert result == 0.0
+
+
+class TestGenerateFolds:
+    """`backtester/walk_forward.py`'s anchored WFO fold generation, exactly
+    per `docs/RESEARCH.md` §4."""
+
+    def test_train_start_is_always_the_anchor(self) -> None:
+        anchor = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        data_end = datetime(2023, 6, 1, tzinfo=timezone.utc)
+        folds = generate_folds(anchor, data_end, min_folds=1)
+        assert all(f.train_start == anchor for f in folds)
+
+    def test_train_end_advances_by_step_months_each_fold(self) -> None:
+        anchor = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        data_end = datetime(2023, 6, 1, tzinfo=timezone.utc)
+        folds = generate_folds(
+            anchor, data_end, initial_train_months=24, step_months=1, min_folds=1
+        )
+        assert folds[0].train_end == datetime(2022, 1, 1, tzinfo=timezone.utc)
+        assert folds[1].train_end == datetime(2022, 2, 1, tzinfo=timezone.utc)
+
+    def test_test_start_is_train_end_plus_embargo(self) -> None:
+        anchor = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        data_end = datetime(2023, 6, 1, tzinfo=timezone.utc)
+        folds = generate_folds(
+            anchor, data_end, initial_train_months=24, embargo_days=3, min_folds=1
+        )
+        assert folds[0].test_start == folds[0].train_end + timedelta(days=3)
+
+    def test_test_end_is_test_start_plus_step_months(self) -> None:
+        anchor = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        data_end = datetime(2023, 6, 1, tzinfo=timezone.utc)
+        folds = generate_folds(
+            anchor, data_end, initial_train_months=24, step_months=2, min_folds=1
+        )
+        assert folds[0].test_end == datetime(2022, 3, 2, tzinfo=timezone.utc)
+
+    def test_stops_before_exceeding_data_end(self) -> None:
+        anchor = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        data_end = datetime(2023, 6, 1, tzinfo=timezone.utc)
+        folds = generate_folds(anchor, data_end, initial_train_months=24, min_folds=1)
+        assert all(f.test_end <= data_end for f in folds)
+
+    def test_raises_when_fewer_than_min_folds_fit(self) -> None:
+        anchor = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        data_end = datetime(2020, 6, 1, tzinfo=timezone.utc)  # far too short
+        with pytest.raises(ValueError, match="only 0 fold"):
+            generate_folds(anchor, data_end, initial_train_months=24, min_folds=12)
+
+    def test_default_settings_yield_at_least_12_folds_over_3_3_years(self) -> None:
+        # Matches the real IC Markets history span this phase actually
+        # validates against (2023-03-20 to ~2026-07).
+        anchor = datetime(2023, 3, 20, tzinfo=timezone.utc)
+        data_end = datetime(2026, 7, 17, tzinfo=timezone.utc)
+        folds = generate_folds(anchor, data_end)
+        assert len(folds) >= 12
+
+
+class TestGenerateParameterGrid:
+    """`backtester/walk_forward.py`'s parameter sweep grid."""
+
+    def test_reduced_default_grid_has_35_combos(self) -> None:
+        assert len(generate_parameter_grid()) == 35
+
+    def test_full_spec_grid_has_144_combos(self) -> None:
+        assert len(generate_parameter_grid(adx_step=1.0, trailing_step=0.25)) == 144
+
+    def test_grid_bounds_are_respected(self) -> None:
+        grid = generate_parameter_grid()
+        adx_values = {adx for adx, _ in grid}
+        trailing_values = {trailing for _, trailing in grid}
+        assert min(adx_values) == pytest.approx(20.0)
+        assert max(adx_values) == pytest.approx(35.0)
+        assert min(trailing_values) == pytest.approx(1.0)
+        assert max(trailing_values) == pytest.approx(3.0)
+
+    def test_grid_has_no_duplicate_combos(self) -> None:
+        grid = generate_parameter_grid()
+        assert len(grid) == len(set(grid))
+
+
+class TestSliceBars:
+    """`backtester/walk_forward.py`'s `_slice_bars()` — the fold IS/OOS
+    window cutter."""
+
+    def _bars(self) -> gw.BarSeries:
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        times = tuple(start + timedelta(days=i) for i in range(10))
+        close = np.arange(10, dtype=np.float64) + 100.0
+        return gw.BarSeries(
+            open=close.copy(),
+            high=close + 1.0,
+            low=close - 1.0,
+            close=close,
+            tick_volume=np.full(10, 100.0),
+            time_utc=times,
+        )
+
+    def test_slice_includes_both_boundaries(self) -> None:
+        bars = self._bars()
+        start = bars.time_utc[2]
+        end = bars.time_utc[5]
+        sliced = wf._slice_bars(bars, start, end)
+        assert sliced.time_utc[0] == start
+        assert sliced.time_utc[-1] == end
+        assert len(sliced.close) == 4
+
+    def test_slice_excludes_bars_outside_the_window(self) -> None:
+        bars = self._bars()
+        start = bars.time_utc[3]
+        end = bars.time_utc[3]
+        sliced = wf._slice_bars(bars, start, end)
+        assert len(sliced.close) == 1
+        assert sliced.close[0] == bars.close[3]
+
+    def test_slice_returns_empty_when_window_outside_data(self) -> None:
+        bars = self._bars()
+        sliced = wf._slice_bars(
+            bars,
+            datetime(2025, 1, 1, tzinfo=timezone.utc),
+            datetime(2025, 1, 2, tzinfo=timezone.utc),
+        )
+        assert len(sliced.close) == 0

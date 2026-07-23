@@ -33,6 +33,227 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Changed — `/condition`'s BUY/SELL Signal Now Shows Its Own Measured (Real) Accuracy Instead of an Unqualified Recommendation
+
+- Empirically validated `summarize_indicator_signal()`'s equal-weight
+  MA/RSI/MACD/Bollinger vote against real H1 XAUUSD history
+  (~3.3 years) via a new vectorized harness (`backtester/signal_validation.py`),
+  using the same in-sample (IS) / out-of-sample (OOS) chronological split
+  discipline as Phase 2's WFO (design decision below): swept
+  `min_abs_score` (1-4) x `horizon_bars` (2/4/8/12 bars) on the IS 70%,
+  then confirmed the current default and the best-looking IS candidate
+  against the untouched OOS 30%.
+- Result: `min_abs_score` 3-4 essentially never fire (all four
+  indicators rarely align that strongly at once in real data); every
+  `min_abs_score` 1-2 x horizon combination clusters at **48-51%
+  directional accuracy** on both IS and OOS — statistically
+  indistinguishable from a coin flip (current default,
+  `min_abs_score=1, horizon_bars=4`: 49.66% OOS, n=4,446; best IS
+  candidate, `horizon_bars=12`: 50.72% OOS, n=4,438 — ~1.3 standard
+  errors apart, not a real difference). No parameter within this simple
+  additive-vote architecture shows a genuine predictive edge.
+- Rather than tune a knob to manufacture an "improvement" that isn't
+  real, left the heuristic's weights/threshold unchanged and instead
+  added `MEASURED_SIGNAL_OOS_ACCURACY = 0.497` to
+  `monitoring/telegram_bot.py`, displayed directly in `/condition`'s own
+  output so any reader sees the real, measured number rather than an
+  unqualified "BUY"/"SELL" label. This signal remains monitoring-only
+  (`indicators/math_engine.py`'s module docstring) — it was never
+  consulted by `main.py`'s actual trading decisions before this change
+  either.
+
+### Added — Phase 2: Anchored Walk-Forward Validation (`backtester/walk_forward.py`) — Result: NOT PROMOTED
+
+- Implements `docs/adr/ADR-0004-anchored-walk-forward-validation.md` /
+  `docs/RESEARCH.md` §§1-8 in full: a fixed anchor with a growing
+  in-sample (IS) training window, an embargoed out-of-sample (OOS) test
+  window per fold, a parameter sweep over `ADX_TREND_THRESHOLD` /
+  `TRAILING_ATR_MULTIPLIER` scored by Deflated Sharpe Ratio (DSR;
+  `analytics/performance.py`'s new `deflated_sharpe_ratio()`,
+  `skewness()`, `kurtosis()`), and `docs/RESEARCH.md` §5's 5 promotion
+  gates (DSR, IS/OOS efficiency, MAR floor, max-OOS-drawdown ceiling,
+  minimum OOS trade count per fold and in total). Every fold's IS
+  parameter search and OOS evaluation reuse Phase 1's `run_backtest()`
+  unmodified — no second, parity-risking engine.
+- Ran against the real ~3.3-year XAUUSD history (15 monthly folds, a
+  reduced 35-combo grid: `ADX_TREND_THRESHOLD` in [20, 35] step 2.5,
+  `TRAILING_ATR_MULTIPLIER` in [1.0, 3.0] step 0.5 — the full
+  `docs/RESEARCH.md`-spec grid, ~7 hours, was out of scope for this
+  session). Nearly every fold selected the grid's own lower-boundary
+  values (`ADX=20.0, Trailing=1.0`) — a classic overfitting/
+  boundary-chasing red flag, not a real optimum. Two further ad-hoc
+  re-runs with the grid shifted progressively lower confirmed the same
+  pattern persisted at every level tried, with no plateau or reversal —
+  the metrics kept "improving" toward the new boundary each time instead
+  of converging, exactly what boundary-chasing on noise looks like
+  rather than a genuine signal.
+- Final committed-grid result: DSR, IS/OOS efficiency, MAR, and
+  max-drawdown gates all pass, but the trade-count gate fails (one fold
+  had zero OOS trades, below the required 30/fold minimum) —
+  `all_gates_passed=False`. Combined with the boundary-chasing pattern
+  above, the honest conclusion is that **no parameter set tested in
+  Phase 2 should be deployed**; the strategy's current parameters remain
+  unvalidated by this methodology regardless of which grid is chosen.
+
+### Added — Phase 1: Event-Driven Backtester and Performance Analytics (`backtester/`, `analytics/performance.py`)
+
+- `backtester/simulator.py`'s `run_backtest()`: an event-driven
+  simulator that reuses `main.py`'s actual live decision code
+  (`run_bar_close_cycle()`, `_fetch_market_snapshot()`) unmodified, fed
+  by `backtester/replay_gateway.py`'s `HistoricalReplayGateway` (a
+  historical stand-in satisfying `main.py`'s new `MarketDataGateway`
+  Protocol) instead of live MT5 — chosen specifically to avoid a second,
+  parity-risking decision engine.
+- `backtester/historical_data.py`'s `fetch_audited_history()` /
+  `audit_bar_series()`: validates fetched history for gaps/duplicates/
+  non-monotonic timestamps before any backtest run trusts it, tolerating
+  ordinary weekend closures and short holiday gaps (up to 4 days) while
+  still raising on anything larger or unexplained.
+- `analytics/performance.py`: Sharpe/Sortino/CAGR/MAR/max-drawdown
+  (+duration)/profit-factor/win-rate formulas and a `PerformanceReport`
+  DTO (`docs/API_SPEC.md` §5's shape, adapted to plain `float`).
+- Ran a single in-sample pass over the real ~3.3-year XAUUSD history
+  (2023-03-20 to today): 361 trades, Sharpe 1.62, MAR 1.50 — but also
+  surfaced a real, serious near-catastrophic loss (-$3,650 on
+  2026-01-29, a violent flash-crash after a parabolic gold rally) that
+  triggered the exact same `HARD_LOCK`-then-freeze bug pattern
+  (`docs/ARCHITECTURE_SUMMARY.md` §5's `MANUAL_RESET_REQUIRED` gap)
+  already encountered live earlier this session. This single in-sample
+  pass is explicitly *necessary, not sufficient* — see Phase 2 above,
+  which is the actual promotion methodology.
+
+### Added — Monitoring-Only Technical Indicators (RSI/MACD/Bollinger Bands/MA) and a `/condition` Signal Summary
+
+- `indicators/math_engine.py`: pure-numpy `rsi()`, `macd()`,
+  `bollinger_bands()` (validated against independent pure-Python
+  reference implementations), alongside the existing `sma()`. Explicitly
+  monitoring/display-only — never consulted by `main.py`'s actual entry/
+  exit decisions, by deliberate choice (kept the live strategy's decision
+  surface unchanged rather than risk it on unvalidated new signals).
+- `monitoring/telegram_bot.py`'s `/condition` now renders all four
+  indicators plus an additive-vote BUY/SELL/HOLD summary
+  (`summarize_indicator_signal()`) — see the empirical-accuracy entry
+  above for why this summary now ships with a measured-accuracy
+  disclaimer rather than being presented as an unqualified
+  recommendation.
+
+### Fixed — `partial_closed`/`breakeven_set` Never Actually Flipped to `True`, Even Within a Single Continuous Run
+
+- The real, deeper root cause behind the 5.11-lot -> 0.01-lot cascade
+  documented just below: persisting FSM state across restarts (that fix)
+  only closed *half* the gap. `run_bar_close_cycle()`'s position-
+  management branch called `evaluate_partial_close_and_breakeven()` and
+  `calculate_trailing_stop()`, got back the right `OrderActionPayload`s
+  for `main()` to submit, but then returned `updated_context` with
+  **the exact same, unmodified `PositionState` it started with** —
+  `_evaluate_drawdown_transition()`'s own docstring says as much
+  ("`state`/`position` pass through unchanged"). So even with the
+  restart-persistence fix in place, `partial_closed`/`breakeven_set`
+  never became `True` in the very same process that just fired them —
+  meaning `evaluate_partial_close_and_breakeven()` re-fired on *every
+  single subsequent cycle* for as long as price stayed at or beyond
+  Base_TP, repeatedly halving whatever volume remained, with no restart
+  required at all to trigger it.
+- Fixed: when `evaluate_partial_close_and_breakeven()` returns actions,
+  `run_bar_close_cycle()` now derives an updated `PositionState`
+  (`partial_closed=True`, `breakeven_set=True`, `stop_loss=entry_price`,
+  `volume` reduced by the actual close volume) and returns it as part of
+  `updated_context`. Symmetrically, when `calculate_trailing_stop()`
+  fires, the returned context's `stop_loss` now advances to the new
+  trailing level too — previously *that* never advanced either, so every
+  later cycle compared a fresh candidate against a stale reference
+  instead of the level actually just set at the broker (masked mostly by
+  the earlier `NO_CHANGES` fix, but still logically wrong).
+- New regression tests prove a second `run_bar_close_cycle()` call fed
+  the first call's own returned context, at the same Base_TP-reached
+  price, does *not* fire a second partial-close — the exact scenario
+  that silently halved a live position roughly nine times over.
+
+### Added — Trailing Stop Now Active From Entry, Not Just After Breakeven
+
+- Live consequence: a real position swung from **+$17,000 of unrealized
+  profit** (price came within ~7 points of Base_TP) all the way to an
+  **-$8,000+ loss**, because between entry and Base_TP the stop-loss
+  never moved at all — `calculate_trailing_stop()` returned `None`
+  unconditionally whenever `breakeven_set` was `False`, so the only
+  protection was the fixed initial 2x-ATR stop no matter how far price
+  ran in favor first.
+- Fixed: `calculate_trailing_stop()` is now active for the position's
+  entire life. Before breakeven, it uses a new, wider
+  `PRE_BREAKEVEN_TRAILING_ATR_MULTIPLIER` (`2.5`, vs. the existing
+  post-breakeven `TRAILING_ATR_MULTIPLIER` `1.5`) — loose enough not to
+  compete with Base_TP's own 2x-ATR target on ordinary fluctuations, but
+  finite, so a large favorable excursion that reverses before Base_TP no
+  longer gives back the entire gain with zero protection. The candidate
+  stop still only ever tightens, exactly as before.
+- Considered and deliberately not built: discrete staged partial-close
+  tiers (e.g. lock 25% at 1x ATR, another 25% at 2x ATR). Rejected as
+  more complexity than warranted for one live occurrence with no
+  backtested evidence behind any specific tier levels, and more new
+  per-position state to keep correctly persisted — exactly the class of
+  bug the two fixes above just closed for the existing state.
+
+### Fixed — Position-Management State Was Never Persisted, Re-Arming Partial-Close on Every Restart
+
+- Live consequence, found the hard way: a real position partial-closed
+  itself down from **5.11 lots to 0.01 lots** across a day of repeated
+  restarts (crashes, `/killbot`, deliberate reverts), then crashed
+  `main.py` outright on an MT5 `retcode=10013` (`INVALID`) trying to
+  partial-close an already-minimum-sized position. Root cause:
+  `PositionState.partial_closed`/`breakeven_set` aren't derivable from
+  broker-reported fields, and `storage/state_manager.py`'s
+  `save_fsm_state()`/`load_fsm_state()` existed (and were tested) but
+  were **never actually called anywhere in `main.py`** — every restart
+  mid-position re-seeded both flags to `False`
+  (`_seed_initial_fsm_context()`), so `evaluate_partial_close_and_breakeven()`
+  saw an already-partial-closed, already-breakeven position as if
+  neither had ever happened, and closed another 50% of whatever
+  remained.
+- Fixed: `main.py`'s bar-close loop now calls `save_fsm_state()` at the
+  end of every cycle (new pure `_fsm_context_to_dict()` serializes the
+  full `FSMContext`, including `partial_closed`/`breakeven_set`).
+  `_seed_initial_fsm_context()` now restores those two flags at boot via
+  new `_persisted_position_flags()`, **ticket-matched** against the
+  broker's currently-open position — a snapshot for a different
+  (since-closed) position can never leak its flags onto a new one, and
+  every other `PositionState` field (`ticket`/`volume`/`entry_price`/
+  `stop_loss`/etc.) still comes exclusively from the broker's live
+  report, never the snapshot. `last_sequence_id` is saved as a
+  placeholder `0` — nothing reads it back yet (crash recovery here is
+  single-snapshot, not full event-log replay, per
+  `docs/ARCHITECTURE_SUMMARY.md` §5).
+- The short-term mode's profit-peak lock (`short_term_peak_price`) has
+  the same class of gap and is **not** fixed by this change — it's a
+  plain loop-local variable, never part of `FSMContext`. Documented as a
+  still-open, separate gap in `docs/ARCHITECTURE_SUMMARY.md` §5.
+
+### Fixed — A Benign `NO_CHANGES` SL/TP-Modify Retcode Crashed the Whole Process
+
+- Live crash: `BrokerOrderRejectedError("order_send failed for ticket
+  1803973820: retcode=10025, last_error=(1, 'Success')")`. Retcode
+  `10025` is MT5's `TRADE_RETCODE_NO_CHANGES` — returned when a
+  `TRADE_ACTION_SLTP` modify request's SL/TP already equals what's
+  currently set on the position. This isn't a real rejection (a stale
+  local `FSMContext` recomputing the same trailing-stop level a previous
+  cycle's modify already applied at the broker, or two cycles
+  independently landing on the same tick-rounded value), but
+  `submit_position_action()` treated every non-`DONE` retcode as fatal,
+  so it raised `BrokerOrderRejectedError` — which, per this session's
+  earlier resilience work, is *not* one of the errors the bar-close
+  loop's reconnect guard absorbs (only `BrokerConnectionError` is), so
+  it propagated all the way up and killed the process (with a Telegram
+  crash alert, at least, rather than silently).
+- Fixed: `submit_position_action()` now special-cases
+  `TRADE_RETCODE_NO_CHANGES` for `TRADE_ACTION_SLTP` requests only —
+  logs it and returns normally rather than raising. A
+  `TRADE_ACTION_DEAL` (partial-close) request returning the same
+  retcode is unaffected and still raises, since "no changes" has no
+  sensible benign reading for a close order. Unlike the documented
+  idempotency-gap posture (`docs/ARCHITECTURE_SUMMARY.md` §5: an
+  ambiguous/genuinely-rejected order must never be blindly retried),
+  there is nothing here a retry or a process halt would ever fix — the
+  desired state is already in effect.
+
 ### Fixed — `TRADING_MODE=SHORT_TERM` Never Actually Disabled the Regular Strategy
 
 - `run_bar_close_cycle()` evaluated `decide_entry_signal()` (the

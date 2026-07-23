@@ -74,6 +74,7 @@ next boot if the process was stopped when it happened), feeding
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import time
@@ -82,7 +83,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, Protocol, TypeVar, runtime_checkable
 
 from broker.mt5_gateway import (
     TIMEFRAME_D1,
@@ -91,10 +92,11 @@ from broker.mt5_gateway import (
     WEEKEND_CLOSE_HOUR_UTC,
     WEEKEND_REOPEN_HOUR_UTC,
     AccountState,
+    BarSeries,
     BrokerConnectionError,
     BrokerOrderRejectedError,
     BrokerPosition,
-    MT5Gateway,
+    SymbolSpec,
     is_weekend_market_closed,
 )
 from config.feature_flags import FeatureFlagManager
@@ -119,6 +121,12 @@ from news.news_engine import (
 )
 from optimizer.self_learning import get_effective_parameter_value
 from risk.drawdown_fsm import (
+    DAILY_HARD_LOCK_LIMIT,
+    DAILY_SOFT_LOCK_LIMIT,
+    MONTHLY_HARD_LOCK_LIMIT,
+    MONTHLY_SOFT_LOCK_LIMIT,
+    WEEKLY_HARD_LOCK_LIMIT,
+    WEEKLY_SOFT_LOCK_LIMIT,
     BaselineEpoch,
     DrawdownClassification,
     DrawdownEvent,
@@ -412,6 +420,12 @@ def _evaluate_drawdown_transition(
     baselines: EquityBaselines,
     *,
     manual_reset_confirmed: bool,
+    daily_soft_lock_limit: float = DAILY_SOFT_LOCK_LIMIT,
+    weekly_soft_lock_limit: float = WEEKLY_SOFT_LOCK_LIMIT,
+    monthly_soft_lock_limit: float = MONTHLY_SOFT_LOCK_LIMIT,
+    daily_hard_lock_limit: float = DAILY_HARD_LOCK_LIMIT,
+    weekly_hard_lock_limit: float = WEEKLY_HARD_LOCK_LIMIT,
+    monthly_hard_lock_limit: float = MONTHLY_HARD_LOCK_LIMIT,
 ) -> tuple[FSMContext, DrawdownClassification]:
     """Classifies this cycle's drawdown severity, transitions
     `context.drawdown_state` through `risk/drawdown_fsm.py`'s pure FSM,
@@ -421,8 +435,21 @@ def _evaluate_drawdown_transition(
     `run_bar_close_cycle()` to keep that function's cyclomatic complexity
     under this project's `ruff`-enforced limit (`pyproject.toml`
     `max-complexity = 10`).
+
+    The six `*_lock_limit` args default to RQ-022's own percentages and
+    simply pass through to `classify_drawdown_event()` — see that
+    function's docstring for why an override exists at all.
     """
-    classification = classify_drawdown_event(snapshot.account_state.equity, baselines)
+    classification = classify_drawdown_event(
+        snapshot.account_state.equity,
+        baselines,
+        daily_soft_lock_limit=daily_soft_lock_limit,
+        weekly_soft_lock_limit=weekly_soft_lock_limit,
+        monthly_soft_lock_limit=monthly_soft_lock_limit,
+        daily_hard_lock_limit=daily_hard_lock_limit,
+        weekly_hard_lock_limit=weekly_hard_lock_limit,
+        monthly_hard_lock_limit=monthly_hard_lock_limit,
+    )
     drawdown_event = (
         DrawdownEvent.MANUAL_RESET_CONFIRMED if manual_reset_confirmed else classification.event
     )
@@ -660,6 +687,12 @@ def run_bar_close_cycle(
     short_term_position: BrokerPosition | None = None,
     trailing_atr_multiplier: float = TRAILING_ATR_MULTIPLIER,
     short_term_peak_price: float | None = None,
+    daily_soft_lock_limit: float = DAILY_SOFT_LOCK_LIMIT,
+    weekly_soft_lock_limit: float = WEEKLY_SOFT_LOCK_LIMIT,
+    monthly_soft_lock_limit: float = MONTHLY_SOFT_LOCK_LIMIT,
+    daily_hard_lock_limit: float = DAILY_HARD_LOCK_LIMIT,
+    weekly_hard_lock_limit: float = WEEKLY_HARD_LOCK_LIMIT,
+    monthly_hard_lock_limit: float = MONTHLY_HARD_LOCK_LIMIT,
 ) -> BarCloseCycleResult:
     """Pure decision function for a single M5 bar-close cycle: no I/O,
     entirely deterministic given its inputs. `main()` fetches the inputs
@@ -673,6 +706,12 @@ def run_bar_close_cycle(
     `main()` has no live control channel (API/CLI/admin signal) for an
     operator to actually set it yet; this is an open gap, see
     `docs/ARCHITECTURE_SUMMARY.md` §5.
+
+    The six `*_lock_limit` args default to RQ-022's own percentages and
+    simply pass through to `_evaluate_drawdown_transition()` /
+    `classify_drawdown_event()` — `main()` sources its values from
+    `ConfigManager` (`config/config_manager.py`), letting a very small
+    account override the defaults instead of editing `risk/drawdown_fsm.py`.
 
     `trading_mode`/`short_term_position` drive the short-term (scalp)
     mode's entry evaluation (`_evaluate_short_term_entry()`), independent
@@ -705,7 +744,16 @@ def run_bar_close_cycle(
         )
 
     updated_context, classification = _evaluate_drawdown_transition(
-        context, snapshot, baselines, manual_reset_confirmed=manual_reset_confirmed
+        context,
+        snapshot,
+        baselines,
+        manual_reset_confirmed=manual_reset_confirmed,
+        daily_soft_lock_limit=daily_soft_lock_limit,
+        weekly_soft_lock_limit=weekly_soft_lock_limit,
+        monthly_soft_lock_limit=monthly_soft_lock_limit,
+        daily_hard_lock_limit=daily_hard_lock_limit,
+        weekly_hard_lock_limit=weekly_hard_lock_limit,
+        monthly_hard_lock_limit=monthly_hard_lock_limit,
     )
     new_drawdown_state = updated_context.drawdown_state
     no_action = BarCloseCycleResult(
@@ -854,15 +902,45 @@ def run_bar_close_cycle(
         constraints.volume_max,
         constraints.volume_step,
     )
-    if not actions:
+    if actions:
+        # Base_TP just triggered: `actions` is [partial_close,
+        # move_to_breakeven], about to be submitted by main(). Update the
+        # local position view to match what they'll do at the broker —
+        # previously nothing here ever did this, so partial_closed/
+        # breakeven_set stayed False forever and this same check kept
+        # re-firing every single cycle for as long as price stayed at or
+        # beyond Base_TP, repeatedly halving whatever volume remained
+        # (found live: a position fell from 5.11 lots to 0.01 lots this
+        # way, across both restarts and ordinary continuous cycles).
+        close_volume = actions[0].volume or 0.0
+        updated_context = dataclasses.replace(
+            updated_context,
+            position=dataclasses.replace(
+                context.position,
+                volume=context.position.volume - close_volume,
+                stop_loss=context.position.entry_price,
+                partial_closed=True,
+                breakeven_set=True,
+            ),
+        )
+    else:
         trailing_action = calculate_trailing_stop(
             context.position,
             snapshot.current_price,
             snapshot.atr_value,
             trailing_atr_multiplier=trailing_atr_multiplier,
         )
-        if trailing_action is not None:
+        if trailing_action is not None and trailing_action.stop_loss is not None:
             actions = [trailing_action]
+            # Same reasoning as above: without this, position.stop_loss
+            # never advances cycle-to-cycle, so every later cycle keeps
+            # comparing a fresh candidate against a stale (often much
+            # looser) reference instead of the level actually just set at
+            # the broker.
+            updated_context = dataclasses.replace(
+                updated_context,
+                position=dataclasses.replace(context.position, stop_loss=trailing_action.stop_loss),
+            )
 
     return BarCloseCycleResult(
         context=updated_context,
@@ -932,8 +1010,31 @@ def submit_with_pre_flight_ledger(
     return client_order_id, result
 
 
+@runtime_checkable
+class MarketDataGateway(Protocol):
+    """The narrow subset of `MT5Gateway` that `_fetch_market_snapshot()`
+    actually calls — `get_bars()`, `symbol_spec.point`, `get_account_state()`,
+    `get_current_price()`. `MT5Gateway` satisfies this structurally with no
+    changes; the point of typing `_fetch_market_snapshot()`'s `gateway`
+    parameter against this Protocol instead of the concrete `MT5Gateway`
+    class is to let `backtester/replay_gateway.py`'s `HistoricalReplayGateway`
+    (a historical-replay stand-in, never touching real MT5) satisfy it too —
+    the exact reuse `docs/adr/ADR-0004-anchored-walk-forward-validation.md`
+    §6 requires, without retrofitting `main.py`'s impure I/O layer. Mirrors
+    `news/calendar_provider.py`'s `CalendarProvider` Protocol pattern,
+    already established in this codebase.
+    """
+
+    @property
+    def symbol_spec(self) -> SymbolSpec: ...
+
+    def get_bars(self, timeframe: int, count: int) -> BarSeries: ...
+    def get_account_state(self) -> AccountState: ...
+    def get_current_price(self) -> float: ...
+
+
 def _fetch_market_snapshot(
-    gateway: MT5Gateway,
+    gateway: MarketDataGateway,
     magic_number: int,
     news_events: list[EconomicEvent],
     *,
@@ -1027,6 +1128,55 @@ def _fetch_market_snapshot(
     )
 
 
+def _fsm_context_to_dict(context: FSMContext) -> dict[str, Any]:
+    """Pure: serialize `FSMContext` into the JSON-safe dict
+    `StateManager.save_fsm_state()` persists. The inverse of
+    `_persisted_position_flags()`'s read side — together these are what
+    let `partial_closed`/`breakeven_set` survive a process restart
+    (previously lost every time, see `_seed_initial_fsm_context()`)."""
+    position_dict: dict[str, Any] | None = None
+    if context.position is not None:
+        position_dict = {
+            "ticket": context.position.ticket,
+            "symbol": context.position.symbol,
+            "side": context.position.side,
+            "volume": context.position.volume,
+            "entry_price": context.position.entry_price,
+            "stop_loss": context.position.stop_loss,
+            "magic_number": context.position.magic_number,
+            "partial_closed": context.position.partial_closed,
+            "breakeven_set": context.position.breakeven_set,
+        }
+    return {
+        "state": context.state.value,
+        "position": position_dict,
+        "drawdown_state": context.drawdown_state.value,
+        "drawdown_reason": context.drawdown_reason,
+    }
+
+
+def _persisted_position_flags(state_manager: StateManager, broker_ticket: int) -> tuple[bool, bool]:
+    """`(partial_closed, breakeven_set)` from the last-persisted FSM
+    snapshot (`_fsm_context_to_dict()`'s output), if one exists and its
+    position's ticket matches `broker_ticket` — otherwise `(False,
+    False)`, the safe default for a position this process has never
+    itself recorded managing (a fresh entry, no snapshot has ever been
+    saved, or the snapshot refers to a different, since-closed position).
+    Never trusts a persisted ticket mismatch: the broker's currently-open
+    position is always the authoritative source for whether a position
+    is open at all, this only recovers the two flags broker fields can't
+    supply.
+    """
+    loaded = state_manager.load_fsm_state()
+    if loaded is None:
+        return False, False
+    state, _ = loaded
+    position = state.get("position")
+    if not isinstance(position, dict) or position.get("ticket") != broker_ticket:
+        return False, False
+    return bool(position.get("partial_closed", False)), bool(position.get("breakeven_set", False))
+
+
 def _seed_initial_fsm_context(container: ApplicationContainer) -> FSMContext:
     """Disaster Recovery's second half (`docs/PRODUCTION_SPEC.md` §7):
     seeds `main()`'s starting `FSMContext` directly from the broker's live
@@ -1037,18 +1187,21 @@ def _seed_initial_fsm_context(container: ApplicationContainer) -> FSMContext:
 
     If exactly one open position exists under this gateway's magic
     number, resumes `IN_POSITION` with it — `partial_closed`/
-    `breakeven_set` default to `False` since neither is derivable from
-    broker-reported fields alone (a known limitation: resuming
-    mid-position after a crash may repeat an already-completed
-    partial-close/breakeven step; see `docs/ARCHITECTURE_SUMMARY.md` §5).
-    Zero or more than one open position starts flat (`IDLE`) — "more than
-    one" is anomalous for this single-instrument system and would already
-    be caught by the disaster-recovery reconciliation's own divergence
-    check in the ordinary case.
+    `breakeven_set` are recovered via `_persisted_position_flags()` from
+    the last snapshot `_run_trading_loop()` saved every cycle, ticket-
+    matched against this same broker position (defaulting to `False`
+    only if no matching snapshot exists). Zero or more than one open
+    position starts flat (`IDLE`) — "more than one" is anomalous for this
+    single-instrument system and would already be caught by the
+    disaster-recovery reconciliation's own divergence check in the
+    ordinary case.
     """
     open_positions = container.gateway.get_open_positions_by_magic()
     if len(open_positions) == 1:
         broker_position = open_positions[0]
+        partial_closed, breakeven_set = _persisted_position_flags(
+            container.state_manager, broker_position.ticket
+        )
         return FSMContext(
             state=TradingState.IN_POSITION,
             position=PositionState(
@@ -1059,8 +1212,8 @@ def _seed_initial_fsm_context(container: ApplicationContainer) -> FSMContext:
                 entry_price=broker_position.price_open,
                 stop_loss=broker_position.stop_loss,
                 magic_number=broker_position.magic,
-                partial_closed=False,
-                breakeven_set=False,
+                partial_closed=partial_closed,
+                breakeven_set=breakeven_set,
             ),
             drawdown_state=container.initial_drawdown_state,
             drawdown_reason=None,
@@ -1096,6 +1249,32 @@ def _notify(container: ApplicationContainer, text: str) -> None:
     anywhere in the loop can never break trading."""
     if container.notifier is not None:
         container.notifier.send(text)
+
+
+def _notify_on_drawdown_lock_transition(
+    container: ApplicationContainer, *, was_locked: bool, context: FSMContext
+) -> None:
+    """Fires once on the transition *into* a locked drawdown state, not
+    every cycle it stays locked. SOFT_LOCK/HARD_LOCK/MANUAL_RESET_REQUIRED
+    all block new entries (`risk/drawdown_fsm.py`'s `blocks_new_entries()`);
+    WARNING does not, so it is deliberately excluded from this alert.
+    Factored out of `_run_trading_loop()` to keep that function's
+    cyclomatic complexity under this project's `ruff`-enforced limit
+    (`pyproject.toml` `max-complexity = 10`).
+    """
+    is_locked = blocks_new_entries(context.drawdown_state)
+    if not (is_locked and not was_locked):
+        return
+    reset_note = (
+        " ต้อง restart `python main.py` เองเพื่อปลดล็อก"
+        if context.drawdown_state == DrawdownState.MANUAL_RESET_REQUIRED
+        else ""
+    )
+    _notify(
+        container,
+        f"🔒 บอทติดล็อก: {context.drawdown_state.value} — "
+        f"{context.drawdown_reason or 'ไม่มีรายละเอียดเพิ่มเติม'}{reset_note}",
+    )
 
 
 def _record_short_term_close(container: ApplicationContainer, closed_ticket: int) -> None:
@@ -1372,6 +1551,8 @@ def _run_trading_loop(container: ApplicationContainer) -> None:
         )
         ended = time.perf_counter()
 
+        was_locked = blocks_new_entries(context.drawdown_state)
+
         result = run_bar_close_cycle(
             context,
             snapshot,
@@ -1383,9 +1564,16 @@ def _run_trading_loop(container: ApplicationContainer) -> None:
             short_term_position=short_term_position,
             trailing_atr_multiplier=effective_trailing_multiplier,
             short_term_peak_price=short_term_peak_price,
+            daily_soft_lock_limit=container.config.daily_soft_lock_limit,
+            weekly_soft_lock_limit=container.config.weekly_soft_lock_limit,
+            monthly_soft_lock_limit=container.config.monthly_soft_lock_limit,
+            daily_hard_lock_limit=container.config.daily_hard_lock_limit,
+            weekly_hard_lock_limit=container.config.weekly_hard_lock_limit,
+            monthly_hard_lock_limit=container.config.monthly_hard_lock_limit,
         )
         context = result.context
         short_term_peak_price = result.short_term_peak_price
+        _notify_on_drawdown_lock_transition(container, was_locked=was_locked, context=context)
 
         for action in result.position_actions:
             action_metadata: dict[str, Any] = {
@@ -1507,6 +1695,17 @@ def _run_trading_loop(container: ApplicationContainer) -> None:
             )
 
         _submit_short_term_entry_if_any(container, result)
+
+        # Persist this cycle's final FSMContext — in particular
+        # PositionState.partial_closed/breakeven_set, which are not
+        # derivable from broker-reported fields alone (docs/ARCHITECTURE_SUMMARY.md
+        # §5's now-fixed gap: without this, every restart mid-position
+        # re-armed an already-completed partial-close/breakeven step,
+        # repeatedly halving whatever volume remained). last_sequence_id
+        # is a placeholder 0 — nothing in this codebase reads it back yet
+        # (crash recovery here is single-snapshot, not full event-log
+        # replay).
+        container.state_manager.save_fsm_state(_fsm_context_to_dict(context), last_sequence_id=0)
 
     while True:
         # Written every iteration, including the weekend-skip branch below,

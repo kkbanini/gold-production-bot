@@ -420,18 +420,55 @@ wiring between them is correct too.
   the new `optimizer.self_learning.get_effective_parameter_value()`
   (latest applied shift, or the hardcoded default), so a Saturday shift
   changes live behavior starting the very next cycle.
-- **A `HARD_LOCK` freeze (not liquidate) loses short-term profit-peak
-  tracking.** If the short-term mode's new profit-peak lock (tracks the
-  best favorable price reached; closes early if price retraces `0.5x
-  ATR` while still in profit) is mid-tracking when a `HARD_LOCK` freezes
-  rather than liquidates, the tracked peak resets to `None` while frozen
-  (`run_bar_close_cycle()`'s `blocks_position_management` gate returns
-  before the profit-lock ever runs). If a human later clears
-  `MANUAL_RESET_REQUIRED` with that position still open, tracking
-  restarts fresh from the current price rather than resuming the true
-  historical peak — the same class of limitation already documented
-  above for the regular position's partial-close/breakeven state after
-  a crash restart.
+- ~~Resuming mid-position after a crash/restart re-armed an already-
+  completed partial-close/breakeven step, since `PositionState.partial_closed`/
+  `breakeven_set` weren't derivable from broker-reported fields and
+  `storage/state_manager.py`'s `save_fsm_state()`/`load_fsm_state()`
+  existed but were never actually called anywhere in `main.py`.~~
+  **Fixed** (found live: a real position partial-closed itself down from
+  5.11 lots to 0.01 lots, eventually crashing on an MT5 `retcode=10013`
+  trying to partial-close an already-minimum-sized position).
+  `main.py`'s bar-close loop now calls `save_fsm_state()` every cycle
+  (`_fsm_context_to_dict()`); boot-time seeding
+  (`_seed_initial_fsm_context()`) restores `partial_closed`/
+  `breakeven_set` via `_persisted_position_flags()`, ticket-matched
+  against the broker's currently-open position so a snapshot for a
+  different (since-closed) position can never leak its flags onto a new
+  one. Every other `PositionState` field still comes from the broker,
+  never the snapshot. **This turned out to be only half the bug**: even
+  within a single continuous run (no restart at all), `run_bar_close_cycle()`
+  returned `updated_context` with the exact same, unmodified
+  `PositionState` it started with (`_evaluate_drawdown_transition()`'s
+  own docstring: "`state`/`position` pass through unchanged") — so
+  `partial_closed`/`breakeven_set` never became `True` in-process
+  either, and `evaluate_partial_close_and_breakeven()` re-fired every
+  single subsequent cycle for as long as price stayed at or beyond
+  Base_TP. Also fixed: `run_bar_close_cycle()` now derives an updated
+  `PositionState` (flags, breakeven `stop_loss`, reduced `volume`) from
+  the actions it's about to return, and does the same for
+  `calculate_trailing_stop()`'s advancing `stop_loss`.
+- ~~The stop-loss never moved between entry and Base_TP, so a large
+  favorable excursion that reversed before reaching it gave back the
+  entire unrealized gain with zero protection.~~ **Fixed** (found live:
+  a position swung from +$17,000 unrealized, ~7 points short of
+  Base_TP, to an $8,000+ loss). `calculate_trailing_stop()` is now active
+  for the position's entire life, using a new wider
+  `PRE_BREAKEVEN_TRAILING_ATR_MULTIPLIER` (`2.5`) before breakeven is
+  set instead of returning `None` unconditionally.
+- **A `HARD_LOCK` freeze (not liquidate) still loses short-term
+  profit-peak tracking.** A related but separate, still-open gap: unlike
+  the regular position's `partial_closed`/`breakeven_set` (fixed above),
+  the short-term profit-peak lock's tracked peak (`short_term_peak_price`)
+  is a plain loop-local variable, never part of `FSMContext` and never
+  persisted. If the short-term mode's profit-peak lock (tracks the best
+  favorable price reached; closes early if price retraces `0.5x ATR`
+  while still in profit) is mid-tracking when a `HARD_LOCK` freezes
+  rather than liquidates, the tracked peak resets to `None` on the next
+  restart regardless (`run_bar_close_cycle()`'s `blocks_position_management`
+  gate returns before the profit-lock ever runs while frozen). If a
+  human later clears `MANUAL_RESET_REQUIRED` with that position still
+  open, tracking restarts fresh from the current price rather than
+  resuming the true historical peak.
 
 ## 6. What is and isn't covered by the automated test suite
 

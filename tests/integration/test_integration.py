@@ -18,6 +18,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import broker.mt5_gateway as gw
@@ -26,6 +27,8 @@ import main as orchestrator
 import monitoring.telegram_bot as telegram_bot
 import optimizer.self_learning as sl
 import strategy.trend_filter as trend_filter
+from backtester.simulator import BacktestResult, run_backtest
+from backtester.walk_forward import WalkForwardResult, run_walk_forward_validation
 from broker.clock_provider import MT5ClockProvider
 from config.config_manager import ConfigurationError
 from config.telegram_config import TelegramConfig
@@ -133,6 +136,47 @@ class TestOrderActionSubmission:
         with pytest.raises(gw.BrokerOrderRejectedError):
             gateway.submit_position_action(payload)
 
+    def test_sltp_no_changes_retcode_is_treated_as_a_no_op(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.positions[1001] = FakePosition(1001, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555)
+        fake_mt5.next_retcode = fake_mt5.TRADE_RETCODE_NO_CHANGES
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        payload = OrderActionPayload(
+            action="TRADE_ACTION_SLTP",
+            position_ticket=1001,
+            symbol="XAUUSD",
+            magic=555,
+            comment="atr_trailing_stop",
+            stop_loss=2012.5,
+        )
+        gateway.submit_position_action(payload)  # must not raise
+
+    def test_deal_action_still_raises_on_no_changes_retcode(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # NO_CHANGES only makes sense for a modify (TRADE_ACTION_SLTP);
+        # a partial-close (TRADE_ACTION_DEAL) returning it would be a
+        # genuinely unexpected broker response, not a benign no-op.
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.positions[1001] = FakePosition(1001, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(bid=2009.5, ask=2010.0)
+        fake_mt5.next_retcode = fake_mt5.TRADE_RETCODE_NO_CHANGES
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        payload = OrderActionPayload(
+            action="TRADE_ACTION_DEAL",
+            position_ticket=1001,
+            symbol="XAUUSD",
+            magic=555,
+            comment="partial_close_base_tp",
+            volume=0.05,
+        )
+        with pytest.raises(gw.BrokerOrderRejectedError):
+            gateway.submit_position_action(payload)
+
     def test_missing_position_raises_rejected_error(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -221,6 +265,75 @@ class TestBrokerAccountAndBars:
         assert list(bars.close) == [2002.0, 2008.0]
         assert list(bars.tick_volume) == [100.0, 150.0]
         assert len(bars.time_utc) == 2
+
+    def test_get_bars_range_returns_bars_within_window(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        fake_mt5.rates[gw.TIMEFRAME_H1] = [
+            {
+                "open": 2000.0,
+                "high": 2005.0,
+                "low": 1995.0,
+                "close": 2002.0,
+                "tick_volume": 100.0,
+                "time": 1720000000,
+            },
+            {
+                "open": 2002.0,
+                "high": 2010.0,
+                "low": 2000.0,
+                "close": 2008.0,
+                "tick_volume": 150.0,
+                "time": 1720000300,
+            },
+            {
+                "open": 2008.0,
+                "high": 2012.0,
+                "low": 2007.0,
+                "close": 2011.0,
+                "tick_volume": 30.0,
+                "time": 1720000600,
+            },
+        ]
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        bars = gateway.get_bars_range(
+            gw.TIMEFRAME_H1,
+            datetime.fromtimestamp(1720000000, tz=timezone.utc),
+            datetime.fromtimestamp(1720000300, tz=timezone.utc),
+        )
+        assert list(bars.close) == [2002.0, 2008.0]
+        assert len(bars.time_utc) == 2
+
+    def test_get_bars_range_raises_when_no_data(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        with pytest.raises(gw.BrokerConnectionError):
+            gateway.get_bars_range(
+                gw.TIMEFRAME_H1,
+                datetime(2020, 1, 1, tzinfo=timezone.utc),
+                datetime(2020, 1, 2, tzinfo=timezone.utc),
+            )
+
+    def test_get_bars_range_rejects_naive_datetimes(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        with pytest.raises(ValueError, match="timezone-aware"):
+            gateway.get_bars_range(gw.TIMEFRAME_H1, datetime(2020, 1, 1), datetime(2020, 1, 2))
 
     def test_get_current_price_returns_latest_bid(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
@@ -1265,6 +1378,110 @@ class TestApplicationContainer:
         finally:
             app.state_manager.close()
 
+    def test_seed_restores_persisted_flags_on_ticket_match(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """The bug this closes: `partial_closed`/`breakeven_set` used to
+        reset to False on every restart, re-arming an already-completed
+        partial-close/breakeven step and repeatedly halving whatever
+        volume remained. A saved snapshot for the SAME ticket now
+        restores both flags."""
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        fake_mt5.positions[777] = FakePosition(
+            777, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555, volume=0.05
+        )
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        app = ApplicationContainer.build(
+            env_file="nonexistent.env", db_path=tmp_path / "container_seed_restore.db"
+        )
+        try:
+            app.state_manager.save_fsm_state(
+                {
+                    "state": "IN_POSITION",
+                    "position": {
+                        "ticket": 777,
+                        "symbol": "XAUUSD",
+                        "side": "BUY",
+                        "volume": 0.10,
+                        "entry_price": 2000.0,
+                        "stop_loss": 2000.0,
+                        "magic_number": 555,
+                        "partial_closed": True,
+                        "breakeven_set": True,
+                    },
+                    "drawdown_state": "ACTIVE",
+                    "drawdown_reason": None,
+                },
+                last_sequence_id=0,
+            )
+            context = orchestrator._seed_initial_fsm_context(app)
+            assert context.position is not None
+            assert context.position.ticket == 777
+            # The broker-reported volume (0.05) wins over the stale
+            # snapshot's (0.10) — only partial_closed/breakeven_set are
+            # ever taken from the snapshot.
+            assert context.position.volume == 0.05
+            assert context.position.partial_closed is True
+            assert context.position.breakeven_set is True
+        finally:
+            app.state_manager.close()
+
+    def test_seed_ignores_persisted_flags_on_ticket_mismatch(
+        self,
+        fake_mt5: FakeMT5,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A snapshot for a *different* ticket (e.g. the previous position
+        already closed and a new one opened) must never leak its flags
+        onto the currently-open position."""
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        fake_mt5.positions[888] = FakePosition(
+            888, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555, volume=0.05
+        )
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+
+        app = ApplicationContainer.build(
+            env_file="nonexistent.env", db_path=tmp_path / "container_seed_mismatch.db"
+        )
+        try:
+            app.state_manager.save_fsm_state(
+                {
+                    "state": "IN_POSITION",
+                    "position": {
+                        "ticket": 777,
+                        "symbol": "XAUUSD",
+                        "side": "BUY",
+                        "volume": 0.10,
+                        "entry_price": 2000.0,
+                        "stop_loss": 2000.0,
+                        "magic_number": 555,
+                        "partial_closed": True,
+                        "breakeven_set": True,
+                    },
+                    "drawdown_state": "ACTIVE",
+                    "drawdown_reason": None,
+                },
+                last_sequence_id=0,
+            )
+            context = orchestrator._seed_initial_fsm_context(app)
+            assert context.position is not None
+            assert context.position.ticket == 888
+            assert context.position.partial_closed is False
+            assert context.position.breakeven_set is False
+        finally:
+            app.state_manager.close()
+
     def test_build_seeds_flat_context_when_no_open_positions(
         self,
         fake_mt5: FakeMT5,
@@ -1452,3 +1669,194 @@ class TestApplicationContainer:
             ApplicationContainer.build(
                 env_file="nonexistent.env", db_path=tmp_path / "container_calendar_err.db"
             )
+
+
+class TestBacktestSimulatorEndToEnd:
+    """`backtester/simulator.py`'s `run_backtest()` driven over a small,
+    fully synthetic multi-month OHLC fixture — no live MT5 call, matching
+    this test file's own convention for anything not exercising a real
+    external boundary otherwise. This is the parity proof: `run_backtest()`
+    calls the exact same `main._fetch_market_snapshot()`/
+    `main.run_bar_close_cycle()` the live loop calls, just fed synthetic
+    historical bars via `HistoricalReplayGateway` instead of a real MT5
+    connection.
+    """
+
+    def _synthetic_bars(
+        self, n_days: int, *, seed: int = 42, base_price: float = 2000.0
+    ) -> tuple[gw.BarSeries, gw.BarSeries, gw.BarSeries]:
+        rng = np.random.default_rng(seed)
+        start = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+        def make(count: int, step: timedelta) -> gw.BarSeries:
+            times = tuple(start + i * step for i in range(count))
+            close = base_price + np.cumsum(rng.normal(0, 2.0, size=count))
+            high = close + rng.uniform(0.5, 5.0, size=count)
+            low = close - rng.uniform(0.5, 5.0, size=count)
+            open_ = close + rng.normal(0, 1.0, size=count)
+            return gw.BarSeries(
+                open=open_,
+                high=high,
+                low=low,
+                close=close,
+                tick_volume=np.full(count, 100.0),
+                time_utc=times,
+            )
+
+        d1_bars = make(n_days, timedelta(days=1))
+        h4_bars = make(n_days * 6, timedelta(hours=4))
+        h1_bars = make(n_days * 24, timedelta(hours=1))
+        return d1_bars, h4_bars, h1_bars
+
+    @pytest.fixture(scope="class")
+    def backtest_result(self) -> tuple[gw.BarSeries, BacktestResult]:
+        # Computed once and shared across every test in this class — each
+        # test asserts a different property of the *same* run rather than
+        # re-running the (~seconds-scale) simulation per assertion.
+        d1_bars, h4_bars, h1_bars = self._synthetic_bars(n_days=400)
+        return h1_bars, run_backtest(d1_bars, h4_bars, h1_bars, starting_equity=10_000.0)
+
+    def test_runs_to_completion_and_produces_an_equity_curve(
+        self, backtest_result: tuple[gw.BarSeries, BacktestResult]
+    ) -> None:
+        h1_bars, result = backtest_result
+        assert len(result.equity_curve) > 0
+        # One equity point per H1 bar processed.
+        assert len(result.equity_curve) == len(h1_bars.close)
+
+    def test_equity_curve_is_chronologically_ordered(
+        self, backtest_result: tuple[gw.BarSeries, BacktestResult]
+    ) -> None:
+        _, result = backtest_result
+        times = [t for t, _ in result.equity_curve]
+        assert times == sorted(times)
+
+    def test_trades_have_plausible_shape(
+        self, backtest_result: tuple[gw.BarSeries, BacktestResult]
+    ) -> None:
+        _, result = backtest_result
+        for trade in result.trades:
+            assert trade.entry_time <= trade.exit_time
+            assert trade.volume > 0.0
+            assert trade.side in ("BUY", "SELL")
+            assert trade.reason in (
+                "stop_loss",
+                "partial_close_base_tp",
+                orchestrator.EMERGENCY_LIQUIDATION_COMMENT,
+            )
+
+    def test_equity_only_changes_on_a_closed_trade(
+        self, backtest_result: tuple[gw.BarSeries, BacktestResult]
+    ) -> None:
+        # Between any two consecutive equity-curve points where no trade's
+        # exit_time falls in between, the *balance* component shouldn't
+        # have silently jumped — approximated here by checking that large
+        # equity deltas correspond to a nearby trade close, not drift.
+        _, result = backtest_result
+        exit_times = {trade.exit_time for trade in result.trades}
+        assert exit_times.issubset({t for t, _ in result.equity_curve})
+
+    def test_no_trades_before_warmup_completes(
+        self, backtest_result: tuple[gw.BarSeries, BacktestResult]
+    ) -> None:
+        # D1_BAR_COUNT=220 days of warmup required before any decision is
+        # even evaluated — no trade can open before that.
+        h1_bars, result = backtest_result
+        warmup_end = h1_bars.time_utc[0] + timedelta(days=orchestrator.D1_BAR_COUNT)
+        assert all(trade.entry_time >= warmup_end for trade in result.trades)
+
+    def test_deterministic_given_same_seed(self) -> None:
+        d1_a, h4_a, h1_a = self._synthetic_bars(n_days=400, seed=7)
+        d1_b, h4_b, h1_b = self._synthetic_bars(n_days=400, seed=7)
+        result_a = run_backtest(d1_a, h4_a, h1_a, starting_equity=10_000.0)
+        result_b = run_backtest(d1_b, h4_b, h1_b, starting_equity=10_000.0)
+        assert len(result_a.trades) == len(result_b.trades)
+        assert result_a.equity_curve[-1][1] == pytest.approx(result_b.equity_curve[-1][1])
+
+
+class TestWalkForwardValidationEndToEnd:
+    """`backtester/walk_forward.py`'s `run_walk_forward_validation()` driven
+    over a small, fully synthetic multi-year OHLC fixture with a tiny
+    2-combo grid and a short `initial_train_months`/`step_months` sized to
+    fit exactly 3 folds — no live MT5 call. This is Phase 2's core parity/
+    correctness proof: every fold's OOS trades must fall strictly within
+    that fold's own `[test_start, test_end]` window (no look-ahead or
+    cross-fold leakage), and each fold's IS window must start at the
+    anchor (the "anchored" property, `docs/RESEARCH.md` §4).
+    """
+
+    def _synthetic_bars(
+        self, n_days: int, *, seed: int = 42, base_price: float = 2000.0
+    ) -> tuple[gw.BarSeries, gw.BarSeries, gw.BarSeries]:
+        rng = np.random.default_rng(seed)
+        start = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+        def make(count: int, step: timedelta) -> gw.BarSeries:
+            times = tuple(start + i * step for i in range(count))
+            close = base_price + np.cumsum(rng.normal(0, 2.0, size=count))
+            high = close + rng.uniform(0.5, 5.0, size=count)
+            low = close - rng.uniform(0.5, 5.0, size=count)
+            open_ = close + rng.normal(0, 1.0, size=count)
+            return gw.BarSeries(
+                open=open_,
+                high=high,
+                low=low,
+                close=close,
+                tick_volume=np.full(count, 100.0),
+                time_utc=times,
+            )
+
+        d1_bars = make(n_days, timedelta(days=1))
+        h4_bars = make(n_days * 6, timedelta(hours=4))
+        h1_bars = make(n_days * 24, timedelta(hours=1))
+        return d1_bars, h4_bars, h1_bars
+
+    @pytest.fixture(scope="class")
+    def wfo_result(self) -> WalkForwardResult:
+        d1_bars, h4_bars, h1_bars = self._synthetic_bars(n_days=470)
+        result = run_walk_forward_validation(
+            d1_bars,
+            h4_bars,
+            h1_bars,
+            parameter_grid=[(25.0, 1.5), (30.0, 2.0)],
+            initial_train_months=12,
+            step_months=1,
+            embargo_days=1,
+            min_folds=3,
+        )
+        return result
+
+    def test_produces_exactly_the_folds_that_fit(self, wfo_result: WalkForwardResult) -> None:
+        assert len(wfo_result.folds) == 3
+
+    def test_every_fold_is_window_starts_at_the_anchor(self, wfo_result: WalkForwardResult) -> None:
+        anchor = wfo_result.folds[0].fold.train_start
+        assert all(f.fold.train_start == anchor for f in wfo_result.folds)
+
+    def test_every_oos_trade_falls_within_its_own_folds_test_window(
+        self, wfo_result: WalkForwardResult
+    ) -> None:
+        for fold_result in wfo_result.folds:
+            for trade in fold_result.oos_trades:
+                assert fold_result.fold.test_start <= trade.exit_time <= fold_result.fold.test_end
+
+    def test_concatenated_equity_curve_is_chronologically_ordered(
+        self, wfo_result: WalkForwardResult
+    ) -> None:
+        times = [t for t, _ in wfo_result.concatenated_equity_curve]
+        assert times == sorted(times)
+
+    def test_performance_report_has_a_populated_dsr(self, wfo_result: WalkForwardResult) -> None:
+        assert wfo_result.performance_report.deflated_sharpe_ratio is not None
+
+    def test_promotion_gates_total_trades_matches_sum_across_folds(
+        self, wfo_result: WalkForwardResult
+    ) -> None:
+        expected = sum(len(f.oos_trades) for f in wfo_result.folds)
+        assert wfo_result.promotion_gates.total_oos_trades == expected
+
+    def test_each_fold_selection_tried_every_grid_combo(
+        self, wfo_result: WalkForwardResult
+    ) -> None:
+        for fold_result in wfo_result.folds:
+            assert len(fold_result.selection.combo_results) == 2

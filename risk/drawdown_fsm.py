@@ -179,12 +179,28 @@ class DrawdownClassification:
 
 
 def classify_drawdown_event(
-    current_equity: float, baselines: EquityBaselines
+    current_equity: float,
+    baselines: EquityBaselines,
+    *,
+    daily_soft_lock_limit: float = DAILY_SOFT_LOCK_LIMIT,
+    weekly_soft_lock_limit: float = WEEKLY_SOFT_LOCK_LIMIT,
+    monthly_soft_lock_limit: float = MONTHLY_SOFT_LOCK_LIMIT,
+    daily_hard_lock_limit: float = DAILY_HARD_LOCK_LIMIT,
+    weekly_hard_lock_limit: float = WEEKLY_HARD_LOCK_LIMIT,
+    monthly_hard_lock_limit: float = MONTHLY_HARD_LOCK_LIMIT,
 ) -> DrawdownClassification:
     """Compute daily/weekly/monthly drawdown against `baselines` and
     classify the *worst* (most severe) tier into a single `DrawdownEvent`
     — the sole numeric-to-symbolic boundary in this module; every
     transition decision downstream operates on the symbolic event alone.
+
+    The six `*_limit` keyword args default to this module's own constants
+    (RQ-022) so every existing caller is unaffected; they exist so a very
+    small account (where the RQ-022 percentages translate into a dollar
+    amount smaller than a single trade's normal spread/ATR-based risk,
+    tripping SOFT_LOCK/HARD_LOCK on ordinary trade activity rather than
+    genuine capital erosion) can override them via `ConfigManager`
+    (`config/config_manager.py`) instead of editing this module.
     """
     for label, baseline in (
         ("daily", baselines.daily_start_equity),
@@ -207,19 +223,19 @@ def classify_drawdown_event(
     )
 
     hard_breach = (
-        daily_dd >= DAILY_HARD_LOCK_LIMIT
-        or weekly_dd >= WEEKLY_HARD_LOCK_LIMIT
-        or monthly_dd >= MONTHLY_HARD_LOCK_LIMIT
+        daily_dd >= daily_hard_lock_limit
+        or weekly_dd >= weekly_hard_lock_limit
+        or monthly_dd >= monthly_hard_lock_limit
     )
     soft_breach = (
-        daily_dd >= DAILY_SOFT_LOCK_LIMIT
-        or weekly_dd >= WEEKLY_SOFT_LOCK_LIMIT
-        or monthly_dd >= MONTHLY_SOFT_LOCK_LIMIT
+        daily_dd >= daily_soft_lock_limit
+        or weekly_dd >= weekly_soft_lock_limit
+        or monthly_dd >= monthly_soft_lock_limit
     )
     warning_breach = (
-        daily_dd >= DAILY_SOFT_LOCK_LIMIT * WARNING_RATIO_OF_SOFT_LOCK
-        or weekly_dd >= WEEKLY_SOFT_LOCK_LIMIT * WARNING_RATIO_OF_SOFT_LOCK
-        or monthly_dd >= MONTHLY_SOFT_LOCK_LIMIT * WARNING_RATIO_OF_SOFT_LOCK
+        daily_dd >= daily_soft_lock_limit * WARNING_RATIO_OF_SOFT_LOCK
+        or weekly_dd >= weekly_soft_lock_limit * WARNING_RATIO_OF_SOFT_LOCK
+        or monthly_dd >= monthly_soft_lock_limit * WARNING_RATIO_OF_SOFT_LOCK
     )
 
     if hard_breach:

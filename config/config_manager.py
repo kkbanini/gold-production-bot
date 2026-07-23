@@ -21,6 +21,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from risk.drawdown_fsm import (
+    DAILY_HARD_LOCK_LIMIT,
+    DAILY_SOFT_LOCK_LIMIT,
+    MONTHLY_HARD_LOCK_LIMIT,
+    MONTHLY_SOFT_LOCK_LIMIT,
+    WEEKLY_HARD_LOCK_LIMIT,
+    WEEKLY_SOFT_LOCK_LIMIT,
+)
+
 REQUIRED_ENV_VARS: tuple[str, ...] = (
     "MT5_LOGIN",
     "MT5_PASSWORD",
@@ -127,6 +136,22 @@ class ConfigValidator:
         except ValueError as exc:
             raise ConfigurationError(f"{key}={raw!r} is not a valid integer.") from exc
 
+    def check_float_or_default(self, env: Mapping[str, str], key: str, default: float) -> float:
+        """Optional numeric override: `key` is never in `REQUIRED_ENV_VARS`,
+        so an unset/blank value falls back to `default` (one of
+        `risk/drawdown_fsm.py`'s own RQ-022 constants) rather than failing
+        startup. Used for the drawdown lock threshold overrides below —
+        letting a very small account raise its lock thresholds via `.env`
+        instead of editing `risk/drawdown_fsm.py` itself.
+        """
+        raw = env.get(key, "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ConfigurationError(f"{key}={raw!r} is not a valid number.") from exc
+
     def check_magic_numbers_distinct(
         self, strategy_magic_number: int, short_term_magic_number: int
     ) -> None:
@@ -173,6 +198,12 @@ class ConfigManager:
     environment_mode: str
     trading_mode: str
     short_term_magic_number: int
+    daily_soft_lock_limit: float
+    weekly_soft_lock_limit: float
+    monthly_soft_lock_limit: float
+    daily_hard_lock_limit: float
+    weekly_hard_lock_limit: float
+    monthly_hard_lock_limit: float
 
     @classmethod
     def load(cls, env_file: str | Path | None = None) -> "ConfigManager":
@@ -187,13 +218,14 @@ class ConfigManager:
         """
         load_dotenv(dotenv_path=env_file, override=False)
 
+        validator = ConfigValidator()
         (
             mt5_login,
             strategy_magic_number,
             environment_mode,
             trading_mode,
             short_term_magic_number,
-        ) = ConfigValidator().validate(os.environ)
+        ) = validator.validate(os.environ)
 
         return cls(
             mt5_login=mt5_login,
@@ -204,4 +236,22 @@ class ConfigManager:
             environment_mode=environment_mode,
             trading_mode=trading_mode,
             short_term_magic_number=short_term_magic_number,
+            daily_soft_lock_limit=validator.check_float_or_default(
+                os.environ, "DAILY_SOFT_LOCK_LIMIT", DAILY_SOFT_LOCK_LIMIT
+            ),
+            weekly_soft_lock_limit=validator.check_float_or_default(
+                os.environ, "WEEKLY_SOFT_LOCK_LIMIT", WEEKLY_SOFT_LOCK_LIMIT
+            ),
+            monthly_soft_lock_limit=validator.check_float_or_default(
+                os.environ, "MONTHLY_SOFT_LOCK_LIMIT", MONTHLY_SOFT_LOCK_LIMIT
+            ),
+            daily_hard_lock_limit=validator.check_float_or_default(
+                os.environ, "DAILY_HARD_LOCK_LIMIT", DAILY_HARD_LOCK_LIMIT
+            ),
+            weekly_hard_lock_limit=validator.check_float_or_default(
+                os.environ, "WEEKLY_HARD_LOCK_LIMIT", WEEKLY_HARD_LOCK_LIMIT
+            ),
+            monthly_hard_lock_limit=validator.check_float_or_default(
+                os.environ, "MONTHLY_HARD_LOCK_LIMIT", MONTHLY_HARD_LOCK_LIMIT
+            ),
         )

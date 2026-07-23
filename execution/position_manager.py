@@ -23,14 +23,34 @@ BASE_TP_ATR_MULTIPLIER = 2.0
 PARTIAL_CLOSE_FRACTION = 0.5
 TRAILING_ATR_MULTIPLIER = 1.5
 
+# Trailing multiplier used BEFORE breakeven has been set — deliberately
+# wider than TRAILING_ATR_MULTIPLIER (looser, so it doesn't compete with
+# Base_TP's own 2x-ATR target) but still finite, unlike the previous
+# behavior of no trailing at all in this window (a fixed initial SL that
+# never moved between entry and Base_TP). Found live: a position swung
+# from roughly +$17,000 of unrealized profit — just short of Base_TP —
+# all the way back to an $8,000+ loss with zero protection along the
+# way, since nothing tightened the stop until the exact Base_TP price
+# was reached. No spec reference — a made-up-but-documented default.
+PRE_BREAKEVEN_TRAILING_ATR_MULTIPLIER = 2.5
+
 
 @dataclass(frozen=True, slots=True)
 class PositionState:
     """Local view of an open position's management state.
 
-    Persisting this across restarts (e.g. via a future storage/ column)
-    is a later-phase concern; this phase only defines the decision logic
-    that consumes it.
+    `partial_closed`/`breakeven_set` are persisted across a process
+    restart via `main._fsm_context_to_dict()`/`storage.state_manager.StateManager.save_fsm_state()`
+    (saved every cycle) and restored via `main._persisted_position_flags()`
+    (`main._seed_initial_fsm_context()`, ticket-matched against the
+    broker's real open position) — without this, every restart mid-
+    position re-armed an already-completed partial-close/breakeven step,
+    repeatedly halving whatever volume remained (found live: a position
+    partial-closed itself down from 5.11 lots to 0.01 across repeated
+    restarts). `ticket`/`symbol`/`side`/`volume`/`entry_price`/`stop_loss`/
+    `magic_number` are never taken from the persisted snapshot, only from
+    the broker's live position — it remains the sole source of truth for
+    anything it can report directly.
     """
 
     ticket: int
@@ -140,25 +160,41 @@ def calculate_trailing_stop(
     atr_value: float,
     *,
     trailing_atr_multiplier: float = TRAILING_ATR_MULTIPLIER,
+    pre_breakeven_trailing_atr_multiplier: float = PRE_BREAKEVEN_TRAILING_ATR_MULTIPLIER,
 ) -> OrderActionPayload | None:
-    """Dynamic ATR trailing stop, active only once breakeven has been set
-    (`evaluate_partial_close_and_breakeven` covers the entry-to-breakeven
-    leg; this covers the runner beyond that point). The candidate stop
-    only ever tightens in the trend's favor — a candidate level that would
-    loosen the existing stop is rejected, protecting an already-locked-in
-    gain from a transient adverse price move.
+    """Dynamic ATR trailing stop, active for the position's *entire*
+    life — not just after breakeven. Uses the wider (looser)
+    `pre_breakeven_trailing_atr_multiplier` before
+    `evaluate_partial_close_and_breakeven()` has set breakeven, then the
+    tighter `trailing_atr_multiplier` after. Previously this returned
+    `None` unconditionally before breakeven, meaning the fixed initial SL
+    never moved no matter how far price ran in favor — found live: a
+    position swung from roughly +$17,000 unrealized (just short of
+    Base_TP) to an $8,000+ loss with zero protection the entire way,
+    since nothing tightened the stop until the exact Base_TP price.
+    Using a wider pre-breakeven multiplier (rather than the same one
+    Base_TP itself uses) keeps this from firing on every ordinary
+    fluctuation and racing/duplicating Base_TP's own job — it only ever
+    starts improving on the initial stop once price has moved
+    meaningfully in favor, well before the full Base_TP distance.
+
+    Either way the candidate stop only ever tightens in the trend's
+    favor — a candidate level that would loosen the existing stop is
+    rejected, protecting an already-locked-in gain (or partial
+    retracement buffer) from a transient adverse price move.
     """
-    if not position.breakeven_set:
-        return None
     if atr_value <= 0:
         raise ValueError(f"atr_value must be > 0, got {atr_value}")
+    multiplier = (
+        trailing_atr_multiplier if position.breakeven_set else pre_breakeven_trailing_atr_multiplier
+    )
 
     if position.side == "BUY":
-        candidate_sl = current_price - trailing_atr_multiplier * atr_value
+        candidate_sl = current_price - multiplier * atr_value
         if candidate_sl <= position.stop_loss:
             return None
     else:
-        candidate_sl = current_price + trailing_atr_multiplier * atr_value
+        candidate_sl = current_price + multiplier * atr_value
         if candidate_sl >= position.stop_loss:
             return None
 
