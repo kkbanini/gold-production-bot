@@ -88,6 +88,24 @@ def _compute_indicator_arrays(
     return ma, rsi_values, macd_histogram, upper, lower
 
 
+def build_forward_labels(closes: FloatArray, *, horizon_bars: int) -> FloatArray:
+    """`1.0` at index `i` iff `closes[i + horizon_bars] > closes[i]`, else
+    `0.0`, for every `i` in `[0, len(closes) - horizon_bars)`. The single
+    forward-looking binary label definition shared by `validate_signal()`
+    (naive-heuristic accuracy) and `backtester/ml_signal_model.py` (the ML
+    training target) — identical semantics, so accuracy figures from both
+    are directly comparable on the same horizon.
+    """
+    if horizon_bars <= 0:
+        raise ValueError(f"horizon_bars must be > 0, got {horizon_bars}")
+    n = len(closes)
+    if n <= horizon_bars:
+        return np.array([], dtype=np.float64)
+    future = closes[horizon_bars:n]
+    current = closes[0 : n - horizon_bars]
+    return (future > current).astype(np.float64)
+
+
 def validate_signal(
     h1_bars: BarSeries,
     *,
@@ -117,6 +135,7 @@ def validate_signal(
     except ValueError:
         return SignalValidationResult(predictions=())
 
+    labels = build_forward_labels(closes, horizon_bars=horizon_bars)
     n = len(closes)
     stop = n - horizon_bars if end_index is None else min(end_index, n - horizon_bars)
 
@@ -141,7 +160,7 @@ def validate_signal(
         )
         if label == "HOLD":
             continue
-        actual_up = float(closes[i + horizon_bars]) > float(closes[i])
+        actual_up = bool(labels[i])
         correct = (label == "BUY") == actual_up
         predictions.append(SignalPrediction(bar_index=i, label=label, score=score, correct=correct))
 

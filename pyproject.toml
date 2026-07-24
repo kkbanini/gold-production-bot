@@ -20,6 +20,14 @@ dev = [
     "pytest==8.3.3",
     "pytest-cov==5.0.0",
     "types-requests==2.33.0.20260518",
+    # Research-only: trains backtester/ml_signal_model.py's models offline.
+    # Never imported by the live bot — its logistic-regression candidate
+    # did not clear evaluate_promotion_bar() on real data (CHANGELOG.md),
+    # so nothing in monitoring/telegram_bot.py depends on sklearn. If a
+    # future run does clear the bar, the plan is to hardcode the fitted
+    # coefficients as plain constants there instead of importing sklearn
+    # at runtime (see that module's docstring).
+    "scikit-learn==1.9.0",
 ]
 
 [build-system]
@@ -60,6 +68,14 @@ ignore_missing_imports = true
 # create_weekend_optimizer_scheduler(), which returns the scheduler object
 # as-is rather than threading its internals through other typed code.
 module = "apscheduler.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# scikit-learn ships no py.typed marker / official stub package as of the
+# pinned 1.9.0. Its only importer is backtester/ml_signal_model.py (an
+# offline research module, dev-dependency only — never imported by the
+# live bot; see that module's docstring).
+module = "sklearn.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

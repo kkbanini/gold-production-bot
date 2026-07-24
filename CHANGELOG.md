@@ -33,6 +33,46 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Added — ML Follow-Up to the `/condition` Signal (`backtester/ml_signal_model.py`) — Result: NOT PROMOTED
+
+- Follow-up to the naive-heuristic finding just below: does *learning* how
+  to weight the same 4 indicators (rather than a hand-picked -1/0/+1 vote)
+  find a real edge? Built `backtester/ml_signal_model.py`: continuous
+  feature transforms of the same MA/RSI/MACD/Bollinger Bands (normalized
+  MA distance, RSI as-is, normalized MACD histogram, Bollinger %B — no new
+  indicators), the same forward-return label and chronological 70%/30%
+  IS/OOS split as `backtester/signal_validation.py` (factored its label
+  logic out into a shared `build_forward_labels()` for a fair comparison),
+  `TimeSeriesSplit`-selected logistic regression as the primary candidate
+  (deployable live without a runtime `scikit-learn` dependency — see
+  below) plus a `HistGradientBoostingClassifier` as a nonlinear comparison
+  point. `scikit-learn==1.9.0` added to `pyproject.toml`'s `dev` extras
+  (research-only; a new `sklearn.*` mypy override follows the existing
+  `MetaTrader5`/`apscheduler.*` template).
+- Ran against the real ~3.3-year XAUUSD H1 history (19,806 bars; 13,838
+  train / 5,931 OOS). First pass looked promising — logistic regression's
+  OOS accuracy (52.00%) beat both the majority-class baseline (51.98%,
+  i.e. gold's own directional drift over this window) and the naive
+  heuristic (49.74%) — **but its OOS ROC-AUC sat at 0.5007: zero real
+  discrimination.** `TimeSeriesSplit` had selected maximum regularization
+  (`C=0.001`) because no learnable in-sample signal made "mostly predict
+  the majority class" the safest cross-validated choice — recall came out
+  ~99.97%, confirming the model had collapsed to near-constant
+  prediction. Accuracy alone couldn't tell "found a real edge" apart from
+  "learned to mostly guess the more common direction" here; **this
+  exposed a real gap in the original 3-gate promotion bar** (CI lower
+  bound, beats majority baseline, beats naive heuristic — all technically
+  passed), so a 4th gate (`OOS ROC-AUC > 0.53`) was added specifically to
+  catch this failure mode before any live wiring decision, per
+  `backtester/ml_signal_model.py`'s `evaluate_promotion_bar()`. Gradient
+  boosting (nonlinear, not limited to a linear combination) fared no
+  better (ROC-AUC 0.5122).
+- Honest conclusion: **no real edge found**, same as the naive heuristic.
+  `/condition`'s displayed signal (`summarize_indicator_signal()`) is
+  unchanged; its disclaimer now also reports this ML attempt and result
+  directly (`monitoring/telegram_bot.py`'s `ML_SIGNAL_OOS_ROC_AUC`
+  constant), rather than silently trying and discarding it.
+
 ### Changed — `/condition`'s BUY/SELL Signal Now Shows Its Own Measured (Real) Accuracy Instead of an Unqualified Recommendation
 
 - Empirically validated `summarize_indicator_signal()`'s equal-weight

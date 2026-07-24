@@ -101,6 +101,23 @@ RSI_OVERSOLD_THRESHOLD = 30.0
 # re-validation as more history accrues, not treated as permanently fixed.
 MEASURED_SIGNAL_OOS_ACCURACY = 0.497
 
+# `backtester/ml_signal_model.py`'s follow-up experiment: trained logistic
+# regression + gradient boosting on the same 4 indicators as continuous
+# features (not the heuristic's -1/0/+1 vote), `TimeSeriesSplit`-selected
+# regularization, identical IS/OOS split. Also found no real edge — the
+# honest reason `summarize_indicator_signal()` below is unchanged. Logistic
+# regression's OOS accuracy (52.0%) technically nudged past both the
+# heuristic and the majority-class baseline (51.98%, i.e. gold's own
+# directional drift over this period), but its OOS ROC-AUC sat at 0.50 —
+# zero real discrimination: regularization had pushed it toward "mostly
+# guess the more common direction," not toward learning the indicators.
+# Gradient boosting (nonlinear, so not limited to a linear combination)
+# fared no better (ROC-AUC 0.51). See `backtester/ml_signal_model.py`'s
+# `evaluate_promotion_bar()` for the exact bar this failed, and its module
+# docstring/`run_ml_signal_research.py` to re-run this as more history
+# accrues.
+ML_SIGNAL_OOS_ROC_AUC = 0.5007
+
 # Timeout for the OS-level subprocess calls /killbot shells out to
 # (querying then terminating a process) — generous for a purely local
 # operation, just bounding it against an unexpected hang.
@@ -453,6 +470,10 @@ def format_indicator_message(
             f"⚠️ ทดสอบย้อนหลังจริงแล้ว (out-of-sample กับข้อมูลจริง ~1 ปี): "
             f"ความแม่นยำวัดได้ ~{MEASURED_SIGNAL_OOS_ACCURACY:.0%} "
             "ใกล้เคียงการเดาสุ่ม ไม่ใช่คำแนะนำการลงทุน และไม่ใช่เงื่อนไขที่บอทใช้เปิดออเดอร์จริง",
+            f"🤖 ลองเทรน ML model (logistic regression + gradient boosting) แทน heuristic "
+            f"ด้วยแล้ว ก็ยังไม่พบ edge จริงเหมือนกัน (ROC-AUC วัดได้ ~{ML_SIGNAL_OOS_ROC_AUC:.2f} "
+            "คือแยกแยะทิศทางไม่ได้เลย แม้ accuracy ดิบจะดูสูงกว่าเดิมนิดหน่อย) "
+            "จึงไม่เปลี่ยนสัญญาณข้างบน",
         ]
     )
 

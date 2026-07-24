@@ -27,6 +27,11 @@ import main as orchestrator
 import monitoring.telegram_bot as telegram_bot
 import optimizer.self_learning as sl
 import strategy.trend_filter as trend_filter
+from backtester.ml_signal_model import (
+    MLValidationReport,
+    evaluate_promotion_bar,
+    train_and_validate_models,
+)
 from backtester.simulator import BacktestResult, run_backtest
 from backtester.walk_forward import WalkForwardResult, run_walk_forward_validation
 from broker.clock_provider import MT5ClockProvider
@@ -1772,6 +1777,80 @@ class TestBacktestSimulatorEndToEnd:
         result_b = run_backtest(d1_b, h4_b, h1_b, starting_equity=10_000.0)
         assert len(result_a.trades) == len(result_b.trades)
         assert result_a.equity_curve[-1][1] == pytest.approx(result_b.equity_curve[-1][1])
+
+
+class TestMLSignalModelEndToEnd:
+    """`backtester/ml_signal_model.py`'s `train_and_validate_models()`
+    driven over a small, fully synthetic H1 fixture — no live MT5 call.
+    Proves the training/validation pipeline (TimeSeriesSplit hyperparameter
+    selection, chronological IS/OOS split, both candidate models, the
+    scaler-folding math) runs end-to-end and returns a well-formed report;
+    it does not assert any particular accuracy, since synthetic random-walk
+    prices have no real indicator-based edge by construction.
+    """
+
+    def _synthetic_h1_bars(self, n: int, *, seed: int = 3) -> gw.BarSeries:
+        rng = np.random.default_rng(seed)
+        start = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        times = tuple(start + timedelta(hours=i) for i in range(n))
+        close = 2000.0 + np.cumsum(rng.normal(0, 1.0, size=n))
+        high = close + rng.uniform(0.1, 1.0, size=n)
+        low = close - rng.uniform(0.1, 1.0, size=n)
+        open_ = close + rng.normal(0, 0.5, size=n)
+        return gw.BarSeries(
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            tick_volume=rng.uniform(100.0, 1000.0, size=n),
+            time_utc=times,
+        )
+
+    @pytest.fixture(scope="class")
+    def report(self) -> MLValidationReport:
+        h1_bars = self._synthetic_h1_bars(n=1500)
+        return train_and_validate_models(h1_bars)
+
+    def test_sample_sizes_are_positive_and_roughly_70_30(self, report: MLValidationReport) -> None:
+        assert report.n_train > 0
+        assert report.n_oos > 0
+        total = report.n_train + report.n_oos
+        assert report.n_train / total == pytest.approx(0.7, abs=0.02)
+
+    def test_every_reported_rate_is_a_valid_probability(self, report: MLValidationReport) -> None:
+        for value in (
+            report.majority_class_baseline,
+            report.naive_heuristic_oos_accuracy,
+            report.logistic_regression.evaluation.oos_accuracy,
+            report.logistic_regression.evaluation.oos_precision,
+            report.logistic_regression.evaluation.oos_recall,
+            report.logistic_regression.evaluation.oos_roc_auc,
+            report.gradient_boosting.oos_accuracy,
+            report.gradient_boosting.oos_precision,
+            report.gradient_boosting.oos_recall,
+            report.gradient_boosting.oos_roc_auc,
+        ):
+            assert 0.0 <= value <= 1.0
+
+    def test_logistic_regression_coefficient_vector_matches_feature_count(
+        self, report: MLValidationReport
+    ) -> None:
+        assert len(report.logistic_regression.raw_space_coefficients) == len(report.feature_names)
+
+    def test_promotion_bar_evaluates_without_error(self, report: MLValidationReport) -> None:
+        # No accuracy assertion here by design (see class docstring) — this
+        # only proves evaluate_promotion_bar() runs cleanly against a real
+        # report shape.
+        assert evaluate_promotion_bar(report) in (True, False)
+
+    def test_deterministic_given_same_seed(self) -> None:
+        bars_a = self._synthetic_h1_bars(n=1500, seed=11)
+        bars_b = self._synthetic_h1_bars(n=1500, seed=11)
+        report_a = train_and_validate_models(bars_a)
+        report_b = train_and_validate_models(bars_b)
+        assert report_a.logistic_regression.evaluation.oos_accuracy == pytest.approx(
+            report_b.logistic_regression.evaluation.oos_accuracy
+        )
 
 
 class TestWalkForwardValidationEndToEnd:

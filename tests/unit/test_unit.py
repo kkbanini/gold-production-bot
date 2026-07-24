@@ -45,8 +45,22 @@ from analytics.performance import (
     win_rate,
 )
 from backtester.historical_data import audit_bar_series
+from backtester.ml_signal_model import (
+    LogisticRegressionEvaluation,
+    MLValidationReport,
+    ModelEvaluation,
+    binomial_ci_lower_bound,
+    build_feature_matrix,
+    evaluate_promotion_bar,
+    prepare_training_data,
+)
 from backtester.replay_gateway import HistoricalReplayGateway
-from backtester.signal_validation import SignalPrediction, SignalValidationResult, validate_signal
+from backtester.signal_validation import (
+    SignalPrediction,
+    SignalValidationResult,
+    build_forward_labels,
+    validate_signal,
+)
 from backtester.walk_forward import generate_folds, generate_parameter_grid
 from config.calendar_config import CalendarConfig
 from config.config_manager import ConfigManager, ConfigurationError, ConfigValidator
@@ -4644,6 +4658,235 @@ class TestValidateSignal:
         loose = validate_signal(bars, horizon_bars=4, min_abs_score=1)
         strict = validate_signal(bars, horizon_bars=4, min_abs_score=2)
         assert strict.total <= loose.total
+
+
+class TestBuildForwardLabels:
+    """`backtester/signal_validation.py`'s `build_forward_labels()` — the
+    forward-looking binary label shared by `validate_signal()` and
+    `backtester/ml_signal_model.py`'s ML training target."""
+
+    def test_matches_hand_calc(self) -> None:
+        closes = np.array([1.0, 2.0, 1.5, 3.0, 0.5], dtype=np.float64)
+        labels = build_forward_labels(closes, horizon_bars=2)
+        # index i compares closes[i] vs closes[i+2], for i in [0, 3):
+        # 1.0 vs 1.5 -> up, 2.0 vs 3.0 -> up, 1.5 vs 0.5 -> down
+        np.testing.assert_array_equal(labels, [1.0, 1.0, 0.0])
+
+    def test_raises_on_non_positive_horizon(self) -> None:
+        closes = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        with pytest.raises(ValueError, match="horizon_bars"):
+            build_forward_labels(closes, horizon_bars=0)
+
+    def test_returns_empty_when_series_not_longer_than_horizon(self) -> None:
+        closes = np.array([1.0, 2.0], dtype=np.float64)
+        labels = build_forward_labels(closes, horizon_bars=4)
+        assert labels.shape == (0,)
+
+
+class TestBuildFeatureMatrix:
+    """`backtester/ml_signal_model.py`'s continuous-feature transform of
+    the same 4 indicators `signal_validation._compute_indicator_arrays()`
+    computes (already covered by `indicators/math_engine.py`'s own
+    correctness tests elsewhere) — these tests check the *transform* on
+    top of that output, not the underlying indicator math."""
+
+    def _bars(self, closes: list[float]) -> gw.BarSeries:
+        n = len(closes)
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        times = tuple(start + timedelta(hours=i) for i in range(n))
+        close = np.array(closes, dtype=np.float64)
+        return gw.BarSeries(
+            open=close.copy(),
+            high=close + 0.5,
+            low=close - 0.5,
+            close=close,
+            tick_volume=np.full(n, 100.0),
+            time_utc=times,
+        )
+
+    def test_transform_matches_hand_applied_formulas(self) -> None:
+        from backtester.signal_validation import _compute_indicator_arrays
+
+        rng = np.random.default_rng(7)
+        closes = list(2000.0 + np.cumsum(rng.normal(0, 1.0, size=200)))
+        bars = self._bars(closes)
+        features, valid_mask = build_feature_matrix(bars)
+
+        ma, rsi_values, macd_histogram, upper, lower = _compute_indicator_arrays(bars.close)
+        expected_ma_distance = (bars.close - ma) / ma
+        expected_macd_pct = macd_histogram / bars.close
+        band_width = upper - lower
+        expected_percent_b = np.where(
+            band_width > 0, (bars.close - lower) / np.where(band_width > 0, band_width, 1.0), 0.5
+        )
+        valid = (
+            ~np.isnan(ma)
+            & ~np.isnan(rsi_values)
+            & ~np.isnan(macd_histogram)
+            & ~np.isnan(upper)
+            & ~np.isnan(lower)
+        )
+
+        assert np.array_equal(valid_mask, valid)
+        np.testing.assert_allclose(features[valid, 0], expected_ma_distance[valid])
+        np.testing.assert_allclose(features[valid, 1], rsi_values[valid])
+        np.testing.assert_allclose(features[valid, 2], expected_macd_pct[valid])
+        np.testing.assert_allclose(features[valid, 3], expected_percent_b[valid])
+
+    def test_valid_mask_false_only_during_warmup(self) -> None:
+        rng = np.random.default_rng(9)
+        closes = list(2000.0 + np.cumsum(rng.normal(0, 1.0, size=200)))
+        _, valid_mask = build_feature_matrix(self._bars(closes))
+        first_true = int(np.argmax(valid_mask))
+        assert not valid_mask[:first_true].any()
+        assert valid_mask[first_true:].all()
+
+    def test_degenerate_zero_width_band_resolves_to_half(self) -> None:
+        # A perfectly constant price makes Bollinger Bands' rolling stddev
+        # (and thus band width) exactly zero for every window.
+        closes = [2000.0] * 60
+        features, valid_mask = build_feature_matrix(self._bars(closes))
+        assert valid_mask.any()
+        np.testing.assert_allclose(features[valid_mask, 3], 0.5)
+
+
+class TestPrepareTrainingData:
+    """`backtester/ml_signal_model.py`'s `prepare_training_data()` —
+    trims indicator warm-up and the trailing unlabeled tail, and reports
+    where the usable rows start in the original bar series."""
+
+    def _bars(self, n: int, *, seed: int = 5) -> gw.BarSeries:
+        rng = np.random.default_rng(seed)
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        times = tuple(start + timedelta(hours=i) for i in range(n))
+        close = 2000.0 + np.cumsum(rng.normal(0, 1.0, size=n))
+        return gw.BarSeries(
+            open=close.copy(),
+            high=close + 0.5,
+            low=close - 0.5,
+            close=close,
+            tick_volume=np.full(n, 100.0),
+            time_utc=times,
+        )
+
+    def test_x_and_y_have_matching_lengths(self) -> None:
+        X, y, _ = prepare_training_data(self._bars(300), horizon_bars=4)
+        assert X.shape[0] == y.shape[0]
+        assert X.shape[1] == 4
+
+    def test_first_valid_bar_index_matches_feature_matrix_warmup(self) -> None:
+        bars = self._bars(300)
+        _, valid_mask = build_feature_matrix(bars)
+        X, y, first_valid_bar_index = prepare_training_data(bars, horizon_bars=4)
+        expected_first_valid = int(np.argmax(valid_mask))
+        assert first_valid_bar_index == expected_first_valid
+        # Usable rows are contiguous from first_valid_bar_index through
+        # (n - horizon_bars): row count must match exactly.
+        assert len(y) == (300 - 4) - expected_first_valid
+
+    def test_labels_are_binary(self) -> None:
+        _, y, _ = prepare_training_data(self._bars(300), horizon_bars=4)
+        assert set(np.unique(y).tolist()) <= {0.0, 1.0}
+
+
+class TestBinomialCiLowerBound:
+    """`backtester/ml_signal_model.py`'s `binomial_ci_lower_bound()` —
+    normal-approximation 95% CI lower bound, used by the ML promotion
+    bar's "not just a lucky OOS slice" check."""
+
+    def test_matches_hand_calc(self) -> None:
+        # accuracy=0.6, n=100: margin = 1.96 * sqrt(0.6*0.4/100) ~= 0.09601
+        result = binomial_ci_lower_bound(0.6, 100)
+        assert result == pytest.approx(0.6 - 1.96 * ((0.6 * 0.4 / 100) ** 0.5), abs=1e-9)
+
+    def test_zero_or_negative_n_returns_zero(self) -> None:
+        assert binomial_ci_lower_bound(0.9, 0) == 0.0
+        assert binomial_ci_lower_bound(0.9, -5) == 0.0
+
+    def test_wider_n_gives_a_tighter_bound(self) -> None:
+        narrow = binomial_ci_lower_bound(0.6, 50)
+        wide = binomial_ci_lower_bound(0.6, 5000)
+        assert wide > narrow
+
+
+class TestEvaluatePromotionBar:
+    """`backtester/ml_signal_model.py`'s `evaluate_promotion_bar()` — all
+    4 gates (CI lower bound > 50%, beats majority-class baseline, beats
+    the naive heuristic, real ROC-AUC discrimination) must pass for a live
+    wiring recommendation. Gate 4 exists specifically because gates 1-3
+    alone let a genuinely degenerate model (regularized down to ~always
+    predicting the majority class) through on real data — see
+    `evaluate_promotion_bar()`'s docstring."""
+
+    def _report(
+        self,
+        *,
+        lr_accuracy: float,
+        n_oos: int,
+        majority_baseline: float,
+        naive_heuristic_accuracy: float,
+        lr_roc_auc: float = 0.60,
+    ) -> MLValidationReport:
+        lr_evaluation = ModelEvaluation(
+            oos_accuracy=lr_accuracy, oos_precision=0.5, oos_recall=0.5, oos_roc_auc=lr_roc_auc
+        )
+        return MLValidationReport(
+            feature_names=("a", "b", "c", "d"),
+            horizon_bars=4,
+            n_train=1000,
+            n_oos=n_oos,
+            majority_class_baseline=majority_baseline,
+            naive_heuristic_oos_accuracy=naive_heuristic_accuracy,
+            logistic_regression=LogisticRegressionEvaluation(
+                evaluation=lr_evaluation,
+                raw_space_coefficients=(0.1, 0.2, 0.3, 0.4),
+                raw_space_intercept=0.0,
+                selected_c=1.0,
+            ),
+            gradient_boosting=ModelEvaluation(
+                oos_accuracy=0.5, oos_precision=0.5, oos_recall=0.5, oos_roc_auc=0.5
+            ),
+        )
+
+    def test_passes_when_all_four_gates_clear(self) -> None:
+        report = self._report(
+            lr_accuracy=0.60, n_oos=5000, majority_baseline=0.51, naive_heuristic_accuracy=0.497
+        )
+        assert evaluate_promotion_bar(report) is True
+
+    def test_fails_when_ci_lower_bound_at_or_below_half(self) -> None:
+        # High accuracy but tiny sample: CI lower bound collapses toward 0.
+        report = self._report(
+            lr_accuracy=0.60, n_oos=5, majority_baseline=0.51, naive_heuristic_accuracy=0.497
+        )
+        assert evaluate_promotion_bar(report) is False
+
+    def test_fails_when_not_beating_majority_class_baseline(self) -> None:
+        report = self._report(
+            lr_accuracy=0.55, n_oos=5000, majority_baseline=0.58, naive_heuristic_accuracy=0.497
+        )
+        assert evaluate_promotion_bar(report) is False
+
+    def test_fails_when_not_beating_naive_heuristic(self) -> None:
+        report = self._report(
+            lr_accuracy=0.50, n_oos=5000, majority_baseline=0.49, naive_heuristic_accuracy=0.55
+        )
+        assert evaluate_promotion_bar(report) is False
+
+    def test_fails_when_roc_auc_shows_no_real_discrimination(self) -> None:
+        # The exact real-data scenario that motivated gate 4: accuracy
+        # edges out the majority-class baseline and the naive heuristic,
+        # the OOS sample is large enough for a tight CI, but ROC-AUC sits
+        # at ~0.50 — a model that discriminates nothing, just nudged past
+        # the base rate by heavy regularization.
+        report = self._report(
+            lr_accuracy=0.5200,
+            n_oos=5931,
+            majority_baseline=0.5198,
+            naive_heuristic_accuracy=0.4974,
+            lr_roc_auc=0.5007,
+        )
+        assert evaluate_promotion_bar(report) is False
 
 
 class TestBuildNotifierFromEnv:

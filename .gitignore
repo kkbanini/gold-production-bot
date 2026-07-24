@@ -41,6 +41,7 @@ env/
 # the live account's real history.
 backtester/backtest_trade_log.json
 backtester/walk_forward_results.json
+backtester/ml_signal_research_results.json
 
 # --- OS files ---
 .DS_Store
