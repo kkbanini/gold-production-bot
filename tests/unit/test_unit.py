@@ -3534,6 +3534,63 @@ class TestBarCloseCycleShortTermMode(_BarCloseCycleHelpers):
         assert result.short_term_entry_take_profit == pytest.approx(2010.0 + 5.0)  # 1x ATR
         assert result.short_term_entry_volume == constraints.volume_min
 
+    def test_small_equity_caps_stop_loss_tighter_than_atr(
+        self,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        # equity=20.0, SHORT_TERM_RISK_FRACTION_OF_EQUITY=0.10 -> equity-based
+        # distance = 20.0 * 0.10 = 2.0 (tick_value=1.0/tick_size=0.01/
+        # volume_min=0.01 from the `constraints` fixture), tighter than the
+        # snapshot's fixed atr_value=5.0 -> 1x ATR = 5.0: the equity cap
+        # must win, not the ATR distance. Baselines are set to match this
+        # small equity (not the class's shared 10_000.0 fixture) so the
+        # drawdown FSM doesn't itself HARD_LOCK on an apparent ~99.8% drop.
+        position = self._position()
+        context = self._in_position_context(position)
+        snapshot = self._snapshot(
+            equity=20.0, trend_direction="BEARISH", short_term_trend_direction="BULLISH"
+        )
+        small_baselines = EquityBaselines(20.0, 20.0, 20.0)
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            small_baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="SHORT_TERM",
+        )
+        assert result.short_term_entry_decision is not None
+        assert result.short_term_entry_decision.direction == "BUY"
+        assert result.short_term_entry_stop_loss == pytest.approx(2010.0 - 2.0)
+        assert result.short_term_entry_take_profit == pytest.approx(2010.0 + 2.0)
+
+    def test_large_equity_leaves_atr_distance_unaffected(
+        self,
+        baselines: EquityBaselines,
+        constraints: orchestrator.SymbolConstraints,
+        feature_flags: FeatureFlagManager,
+    ) -> None:
+        # equity=10_000.0 (the _snapshot() default) -> equity-based distance
+        # = 1_000.0, far looser than atr_value=5.0 -> 1x ATR = 5.0: ATR must
+        # keep governing, same behavior as before this cap was added.
+        position = self._position()
+        context = self._in_position_context(position)
+        snapshot = self._snapshot(trend_direction="BEARISH", short_term_trend_direction="BULLISH")
+        result = orchestrator.run_bar_close_cycle(
+            context,
+            snapshot,
+            baselines,
+            constraints,
+            feature_flags,
+            cycle_duration_seconds=0.05,
+            trading_mode="SHORT_TERM",
+        )
+        assert result.short_term_entry_decision is not None
+        assert result.short_term_entry_stop_loss == pytest.approx(2010.0 - 5.0)
+        assert result.short_term_entry_take_profit == pytest.approx(2010.0 + 5.0)
+
     def test_both_mode_regular_in_position_short_term_flat_no_collision(
         self,
         baselines: EquityBaselines,

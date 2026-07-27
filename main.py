@@ -56,9 +56,10 @@ unwired (see docs/ARCHITECTURE_SUMMARY.md §5).
 between the original D1+H4+H1-aligned strategy above and a second,
 independent short-term (scalp) mode (`decide_short_term_entry_signal()`,
 `strategy.trend_filter.evaluate_short_term_trend()`): relaxed to H1
-direction + a lower ADX bar, fixed minimum lot, and fixed 1x-ATR SL/TP
-distances (`SHORT_TERM_SL_ATR_MULTIPLIER`/`SHORT_TERM_TP_ATR_MULTIPLIER`,
-risk:reward 1:1) that MT5 closes automatically, or the profit-peak lock
+direction + a lower ADX bar, fixed minimum lot, and 1x-ATR SL/TP distances
+(`SHORT_TERM_SL_ATR_MULTIPLIER`/`SHORT_TERM_TP_ATR_MULTIPLIER`, risk:reward
+1:1) capped at `SHORT_TERM_RISK_FRACTION_OF_EQUITY` of current equity
+(whichever distance is tighter wins) that MT5 closes automatically, or the profit-peak lock
 (`decide_short_term_profit_lock()`) closes early if price retraces from
 its best-favorable point while still in profit — so, unlike the regular
 position, it is never tracked in `FSMContext` (stateless; `main()`
@@ -140,7 +141,10 @@ from risk.drawdown_fsm import (
     seed_equity_baselines,
     transition_drawdown_state,
 )
-from risk.risk_manager import calculate_compounded_lot_size
+from risk.risk_manager import (
+    calculate_compounded_lot_size,
+    calculate_price_distance_for_target_profit,
+)
 from storage.db_engine import MAIN_PID_PATH
 from storage.state_manager import OrderLifecycleState, StateManager, TradeLedgerEntry
 from strategy.execution_triggers import (
@@ -195,6 +199,16 @@ TRADING_MODE_BOTH = "BOTH"
 # original ATR-based design is the one the user chose to keep.)
 SHORT_TERM_TP_ATR_MULTIPLIER = 1.0
 SHORT_TERM_SL_ATR_MULTIPLIER = 1.0
+
+# Caps short-term SL/TP distance at whatever price move represents this
+# fraction of CURRENT equity (min() against the ATR-based distance above,
+# in _evaluate_short_term_entry()) — self-adjusting as equity changes,
+# unlike a fixed ATR multiple or fixed dollar amount. Added when a ~$7-9
+# live balance made 1x-ATR risk (~$13-14) exceed the entire account; at
+# larger equity this cap naturally stops binding and ATR alone governs
+# again once 10%-of-equity's price distance exceeds the ATR-based one.
+# User-chosen value (10% risk per trade), not a spec default.
+SHORT_TERM_RISK_FRACTION_OF_EQUITY = 0.10
 
 # The profit-peak lock's retracement trigger: once a short-term position
 # has been in profit and price retraces from its best-favorable point by
@@ -561,6 +575,14 @@ def _evaluate_short_term_entry(
     short-term mode is disabled, a short-term position is already open,
     new entries are currently blocked, or required snapshot data is
     missing.
+
+    SL/TP distance is `min(ATR-based distance, SHORT_TERM_RISK_FRACTION_OF_EQUITY`
+    `of current equity converted to a price distance)` — on a small
+    account the equity fraction is the binding (tighter) constraint, so
+    risk-per-trade tracks the account's actual size instead of a fixed
+    ATR multiple that can exceed the whole balance; on a large account
+    the ATR distance naturally binds instead once it's tighter than the
+    equity fraction, restoring ordinary ATR-based sizing.
     """
     if trading_mode not in (TRADING_MODE_SHORT_TERM, TRADING_MODE_BOTH):
         return None, None, None, None
@@ -582,8 +604,14 @@ def _evaluate_short_term_entry(
         return decision, None, None, None
 
     volume = constraints.volume_min
-    stop_distance = SHORT_TERM_SL_ATR_MULTIPLIER * snapshot.atr_value
-    tp_distance = SHORT_TERM_TP_ATR_MULTIPLIER * snapshot.atr_value
+    equity_based_distance = calculate_price_distance_for_target_profit(
+        snapshot.account_state.equity * SHORT_TERM_RISK_FRACTION_OF_EQUITY,
+        volume,
+        constraints.tick_value,
+        constraints.tick_size,
+    )
+    stop_distance = min(SHORT_TERM_SL_ATR_MULTIPLIER * snapshot.atr_value, equity_based_distance)
+    tp_distance = min(SHORT_TERM_TP_ATR_MULTIPLIER * snapshot.atr_value, equity_based_distance)
     if decision.direction == "BUY":
         stop_loss = snapshot.current_price - stop_distance
         take_profit = snapshot.current_price + tp_distance

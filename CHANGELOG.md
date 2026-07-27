@@ -33,6 +33,44 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Changed — Short-Term (Scalp) Mode's SL/TP Now Capped at a Fraction of Current Equity
+
+- Found live: the account is currently ~$7-9. Short-term mode's SL/TP
+  (`SHORT_TERM_SL_ATR_MULTIPLIER`/`SHORT_TERM_TP_ATR_MULTIPLIER`, both
+  `1.0` — i.e. 1x the H1 ATR(14)) risked **~$13-14 per 0.01-lot trade**
+  at the real ATR observed live — 0.01 is the broker's own `volume_min`,
+  already the smallest lot the bot can place, so there was no
+  smaller-lot lever to fall back on. That risk already exceeds the
+  entire account. A fixed ATR-multiplier tweak wouldn't have durably
+  fixed this either: whatever multiple fit today's equity becomes wrong
+  again the next time equity moves (it moved twice — $8.64 -> $7.39 ->
+  $7.39-ish — just while investigating this).
+- Fixed: `_evaluate_short_term_entry()` now caps both SL and TP distance
+  at `min(ATR-based distance, SHORT_TERM_RISK_FRACTION_OF_EQUITY of
+  current equity converted to a price distance)`, reusing the existing
+  `risk.risk_manager.calculate_price_distance_for_target_profit()`
+  (originally built for the currently-unwired fixed-$5-TP feature — same
+  USD-to-price-distance conversion via the broker's real
+  `tick_value`/`tick_size`, just applied to a *risk* cap now instead of a
+  profit target). `SHORT_TERM_RISK_FRACTION_OF_EQUITY = 0.10` — a
+  user-chosen risk-per-trade figure (offered 10/20/30%+; 10% chosen),
+  not a spec default.
+- Self-adjusting by design: on a small account the equity fraction is
+  the binding (tighter) constraint, so risk-per-trade tracks the
+  account's actual size instead of a fixed ATR multiple that can exceed
+  the whole balance; once equity grows enough that the ATR-based
+  distance becomes tighter than 10% of equity, the `min()` naturally
+  hands control back to ATR alone — no separate regime-detection logic.
+- Live-verified: at the real account equity/ATR observed while making
+  this change, the new formula's risked-per-trade figure was confirmed
+  by hand-computing the same formula against the live snapshot (see
+  verification notes; not committed to a script since it's a one-off
+  sanity check, not a repeatable research artifact like this session's
+  other backtester work).
+- Only affects `TRADING_MODE=SHORT_TERM`/`BOTH` — the account's actual
+  running config is `WAIT_FOR_CONDITIONS`, so no live behavior changes
+  until/unless that's switched.
+
 ### Added — ML Follow-Up to the `/condition` Signal (`backtester/ml_signal_model.py`) — Result: NOT PROMOTED
 
 - Follow-up to the naive-heuristic finding just below: does *learning* how
