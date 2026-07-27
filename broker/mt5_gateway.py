@@ -90,6 +90,21 @@ class BrokerOrderRejectedError(Exception):
     to build the request from)."""
 
 
+class BrokerTradingDisabledError(BrokerOrderRejectedError):
+    """A `BrokerOrderRejectedError` specifically for retcode `10026`
+    (`TRADE_RETCODE_SERVER_DISABLES_AT`) or `10027`
+    (`TRADE_RETCODE_CLIENT_DISABLES_AT`) — AutoTrading disabled server-side
+    or in the local terminal's "Algo Trading" toggle. Unlike an ordinary
+    rejection (bad price/stops/volume — specific to the one request),
+    this is an unambiguous, purely external condition affecting every
+    order attempt until a human re-enables AutoTrading; it resolves
+    itself with no retry logic needed once that happens. Kept as a
+    `BrokerOrderRejectedError` subclass so any existing catch site still
+    catches it, but callers that want to treat it as non-fatal (skip this
+    cycle rather than halting the whole process — `main.py`'s bar-close
+    loop) can catch this narrower type first."""
+
+
 @dataclass(frozen=True, slots=True)
 class SymbolSpec:
     """Resolved broker-specific contract spec for the traded Gold instrument."""
@@ -614,6 +629,12 @@ class MT5Gateway:
         §5's idempotency-gap note), there is nothing here that a retry —
         or halting the whole process — would ever fix, since the desired
         state is already in effect.
+
+        Raises the narrower `BrokerTradingDisabledError` instead (still a
+        `BrokerOrderRejectedError`) for retcode `10026`/`10027`
+        (AutoTrading disabled server-side or in the local terminal) — see
+        that exception's docstring; `main.py`'s bar-close loop catches it
+        specifically to skip the cycle rather than halt the whole process.
         """
         if payload.action == "TRADE_ACTION_DEAL":
             request = self._build_partial_close_request(payload)
@@ -633,6 +654,13 @@ class MT5Gateway:
                 payload.position_ticket,
             )
             return
+        if retcode in (mt5.TRADE_RETCODE_SERVER_DISABLES_AT, mt5.TRADE_RETCODE_CLIENT_DISABLES_AT):
+            raise BrokerTradingDisabledError(
+                f"order_send failed for ticket {payload.position_ticket}: AutoTrading "
+                f"is disabled (retcode={retcode!r}) — enable the 'Algo Trading' button "
+                f"in the MT5 terminal (or check the account/server's AutoTrading "
+                f"permission), last_error={mt5.last_error()!r}"
+            )
         if result is None or retcode != mt5.TRADE_RETCODE_DONE:
             raise BrokerOrderRejectedError(
                 f"order_send failed for ticket {payload.position_ticket}: "
@@ -816,6 +844,12 @@ class MT5Gateway:
         an override (e.g. the short-term mode's distinct magic number,
         `docs/ARCHITECTURE_SUMMARY.md`) submits under that value instead,
         without needing a second `MT5Gateway` instance/connection.
+
+        Raises the narrower `BrokerTradingDisabledError` instead of a
+        plain `BrokerOrderRejectedError` for retcode `10026`/`10027`
+        (AutoTrading disabled server-side or in the local terminal) — see
+        that exception's docstring; `main.py`'s bar-close loop catches it
+        specifically to skip the cycle rather than halt the whole process.
         """
         tick = mt5.symbol_info_tick(self.symbol_spec.name)
         if tick is None:
@@ -844,6 +878,13 @@ class MT5Gateway:
 
         result: Any = mt5.order_send(request)
         retcode = getattr(result, "retcode", None)
+        if retcode in (mt5.TRADE_RETCODE_SERVER_DISABLES_AT, mt5.TRADE_RETCODE_CLIENT_DISABLES_AT):
+            raise BrokerTradingDisabledError(
+                f"order_send failed opening a new {side} position: AutoTrading is "
+                f"disabled (retcode={retcode!r}) — enable the 'Algo Trading' button "
+                f"in the MT5 terminal (or check the account/server's AutoTrading "
+                f"permission), last_error={mt5.last_error()!r}"
+            )
         if result is None or retcode != mt5.TRADE_RETCODE_DONE:
             raise BrokerOrderRejectedError(
                 f"order_send failed opening a new {side} position: "

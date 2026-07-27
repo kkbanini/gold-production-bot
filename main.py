@@ -97,6 +97,7 @@ from broker.mt5_gateway import (
     BrokerConnectionError,
     BrokerOrderRejectedError,
     BrokerPosition,
+    BrokerTradingDisabledError,
     SymbolSpec,
     is_weekend_market_closed,
 )
@@ -1509,19 +1510,60 @@ def main() -> None:
         raise
 
 
+def _run_cycle_with_resilience(
+    container: ApplicationContainer, run_one_cycle: Callable[[], None]
+) -> None:
+    """Runs one bar-close cycle inside the resilience guards
+    `_run_trading_loop()` needs — factored into its own function to keep
+    that function's cyclomatic complexity under this project's
+    `ruff`-enforced limit (`pyproject.toml` `max-complexity = 10`), same
+    reason as `_evaluate_drawdown_transition()`.
+
+    Two exception types are absorbed (logged + notified, loop continues
+    on the next bar close) rather than propagating to `main()`'s
+    crash-alert boundary:
+
+    - `BrokerConnectionError`: a transient MT5 connection loss
+      (terminal restart, network blip) — reconnects via
+      `gateway.connect()`'s own exponential backoff (6 attempts, 1s-60s);
+      if that's exhausted it re-raises and escapes to the crash-alert
+      boundary, halting loudly rather than silently.
+    - `BrokerTradingDisabledError`: AutoTrading disabled server-side or in
+      the terminal's "Algo Trading" toggle — unambiguous and purely
+      external, unrelated to this cycle's specific decision, with no
+      local state left dangling (`submit_with_pre_flight_ledger()`
+      already recorded `REJECTED`). The very next cycle just works again
+      on its own once a human re-enables AutoTrading; no reconnect or
+      special recovery step needed, unlike the connection-error case.
+
+    Every other `BrokerOrderRejectedError` still propagates and halts
+    (the documented safe default — an ambiguous or genuinely-rejected
+    order must never be blindly retried, see
+    docs/ARCHITECTURE_SUMMARY.md §5's idempotency-gap entry).
+    """
+    try:
+        run_one_cycle()
+    except BrokerConnectionError:
+        logger.exception("MT5 connection lost mid-cycle; attempting to reconnect.")
+        _notify(container, "⚠️ การเชื่อมต่อ MT5 หลุดระหว่างรอบ — กำลังเชื่อมต่อใหม่...")
+        container.gateway.disconnect()
+        container.gateway.connect()
+        _notify(container, "✅ เชื่อมต่อ MT5 กลับมาแล้ว — ทำงานต่อตามปกติ")
+    except BrokerTradingDisabledError as exc:
+        logger.error("AutoTrading is disabled; skipping this cycle. %s", exc)
+        _notify(
+            container,
+            f"⚠️ AutoTrading ปิดอยู่ที่ terminal/broker — ข้ามรอบนี้ไปก่อน "
+            f"กรุณาเปิดปุ่ม 'Algo Trading' ใน MT5 terminal: {exc}",
+        )
+
+
 def _run_trading_loop(container: ApplicationContainer) -> None:
     """The bar-close loop itself, split from `main()` so its caller can
-    wrap it in a single crash-alert boundary.
-
-    Each cycle's broker work runs inside a `BrokerConnectionError` guard:
-    a transient MT5 connection loss mid-cycle (terminal restart, network
-    blip) reconnects via `gateway.connect()`'s own exponential backoff and
-    resumes on the next bar close, instead of killing the process — the
-    single biggest practical availability gap this loop had. Only
-    *connection* errors are absorbed: `BrokerOrderRejectedError` still
-    propagates and halts (the documented safe default — an ambiguous or
-    rejected order must never be blindly retried, see
-    docs/ARCHITECTURE_SUMMARY.md §5's idempotency-gap entry).
+    wrap it in a single crash-alert boundary. Each cycle runs inside
+    `_run_cycle_with_resilience()`'s guards — see that function's
+    docstring for exactly which errors are absorbed (loop continues) vs.
+    propagated (process halts, `main()`'s crash-alert boundary fires).
     """
     context = _seed_initial_fsm_context(container)
     baselines: EquityBaselines | None = None
@@ -1756,18 +1798,7 @@ def _run_trading_loop(container: ApplicationContainer) -> None:
         logger.info("Waiting %.1fs for next M5 bar close.", wait_seconds)
         time.sleep(wait_seconds)
 
-        try:
-            run_one_cycle()
-        except BrokerConnectionError:
-            logger.exception("MT5 connection lost mid-cycle; attempting to reconnect.")
-            _notify(container, "⚠️ การเชื่อมต่อ MT5 หลุดระหว่างรอบ — กำลังเชื่อมต่อใหม่...")
-            # connect() has its own exponential backoff (6 attempts,
-            # 1s-60s); if it exhausts them this re-raises
-            # BrokerConnectionError, which escapes to main()'s crash-alert
-            # boundary — halting loudly rather than silently.
-            container.gateway.disconnect()
-            container.gateway.connect()
-            _notify(container, "✅ เชื่อมต่อ MT5 กลับมาแล้ว — ทำงานต่อตามปกติ")
+        _run_cycle_with_resilience(container, run_one_cycle)
 
 
 if __name__ == "__main__":

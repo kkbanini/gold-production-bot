@@ -33,6 +33,36 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Fixed — `AutoTrading Disabled` Crashed the Whole Process on Every New-Order/Modify Attempt
+
+- Live crash: `BrokerOrderRejectedError("order_send failed opening a new
+  SELL position: retcode=10027, last_error=(1, 'Success')")`. Retcode
+  `10027` is MT5's `TRADE_RETCODE_CLIENT_DISABLES_AT` (the terminal's
+  "Algo Trading" toggle switched off); `10026`
+  (`TRADE_RETCODE_SERVER_DISABLES_AT`, a server-side disable) is the same
+  class of condition. Both are unambiguous, purely external — nothing
+  about the specific order was wrong, and no local state was left
+  dangling (`submit_with_pre_flight_ledger()` already records `REJECTED`
+  before the exception propagates) — but `submit_market_order()`/
+  `submit_position_action()` treated every non-`DONE` retcode as an
+  equally fatal rejection, so it propagated all the way to `main()`'s
+  crash-alert boundary and halted the whole process, requiring a manual
+  restart even though the fix (re-enabling AutoTrading) needs no restart
+  at all once applied.
+- Fixed: both methods now raise a new, narrower
+  `BrokerTradingDisabledError` (`broker/mt5_gateway.py`, a
+  `BrokerOrderRejectedError` subclass — existing catch sites unaffected)
+  for retcodes `10026`/`10027` specifically. `main.py`'s bar-close loop
+  (`_run_cycle_with_resilience()`, factored out of `_run_trading_loop()`
+  to keep it under this project's `ruff` complexity limit) catches this
+  narrower type, logs + sends an actionable Telegram alert ("enable the
+  'Algo Trading' button"), and continues to the next bar close instead of
+  halting — the very next cycle just works again on its own once a human
+  flips the switch, no reconnect step needed (unlike the existing
+  `BrokerConnectionError` guard, which does need to reconnect). Every
+  other non-`DONE` retcode still raises the plain
+  `BrokerOrderRejectedError` and still halts the process, unchanged.
+
 ### Changed — Short-Term (Scalp) Mode's SL/TP Now Capped at a Fraction of Current Equity
 
 - Found live: the account is currently ~$7-9. Short-term mode's SL/TP

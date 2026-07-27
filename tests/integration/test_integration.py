@@ -198,6 +198,54 @@ class TestOrderActionSubmission:
         with pytest.raises(gw.BrokerOrderRejectedError, match="no open position"):
             gateway.submit_position_action(payload)
 
+    def test_autotrading_disabled_raises_narrower_trading_disabled_error(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # retcode 10027 (TRADE_RETCODE_CLIENT_DISABLES_AT, the "Algo
+        # Trading" terminal toggle) must raise the narrower subclass, not
+        # a plain BrokerOrderRejectedError, so main.py's bar-close loop can
+        # catch it specifically and skip the cycle instead of halting.
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.positions[1001] = FakePosition(1001, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555)
+        fake_mt5.next_retcode = fake_mt5.TRADE_RETCODE_CLIENT_DISABLES_AT
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        payload = OrderActionPayload(
+            action="TRADE_ACTION_SLTP",
+            position_ticket=1001,
+            symbol="XAUUSD",
+            magic=555,
+            comment="atr_trailing_stop",
+            stop_loss=2012.5,
+        )
+        with pytest.raises(gw.BrokerTradingDisabledError):
+            gateway.submit_position_action(payload)
+        # Still an ordinary rejection to any caller that only knows about
+        # the parent type.
+        with pytest.raises(gw.BrokerOrderRejectedError):
+            gateway.submit_position_action(payload)
+
+    def test_server_disables_at_also_raises_trading_disabled_error(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # retcode 10026 (server-side AutoTrading disable) is the same
+        # class of condition as the client-side toggle above.
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.positions[1001] = FakePosition(1001, "XAUUSD", fake_mt5.POSITION_TYPE_BUY, 555)
+        fake_mt5.next_retcode = fake_mt5.TRADE_RETCODE_SERVER_DISABLES_AT
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        payload = OrderActionPayload(
+            action="TRADE_ACTION_SLTP",
+            position_ticket=1001,
+            symbol="XAUUSD",
+            magic=555,
+            comment="atr_trailing_stop",
+            stop_loss=2012.5,
+        )
+        with pytest.raises(gw.BrokerTradingDisabledError):
+            gateway.submit_position_action(payload)
+
 
 # ---------------------------------------------------------------------------
 # broker/mt5_gateway.py's Phase 10 additions: account state, bar fetching,
@@ -624,6 +672,25 @@ class TestBrokerAccountAndBars:
         with pytest.raises(gw.BrokerOrderRejectedError):
             gateway.submit_market_order(
                 side="BUY", volume=0.05, stop_loss=2000.0, take_profit=None, comment="co-3"
+            )
+
+    def test_submit_market_order_autotrading_disabled_raises_narrower_error(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same AutoTrading-disabled condition as TestOrderActionSubmission's
+        # equivalent case, but for opening a brand-new position rather than
+        # managing an existing one — the exact path the live "opening a new
+        # SELL position" crash came through.
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1, bid=2009.5, ask=2010.0)
+        fake_mt5.next_retcode = fake_mt5.TRADE_RETCODE_CLIENT_DISABLES_AT
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        gateway.connect()
+        with pytest.raises(gw.BrokerTradingDisabledError):
+            gateway.submit_market_order(
+                side="SELL", volume=0.01, stop_loss=2020.0, take_profit=None, comment="co-4"
             )
 
 
