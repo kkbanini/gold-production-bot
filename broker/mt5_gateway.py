@@ -36,6 +36,7 @@ GOLD_SYMBOL_CANDIDATES: tuple[str, ...] = (
     "XAUUSD.m",
     "XAUUSD.a",
     "XAUUSDm",
+    "XAUUSDc",  # Exness Cent accounts (confirmed live: Exness-MT5Real37)
     "XAUUSD_i",
     "GOLD",
     "GOLD.m",
@@ -256,6 +257,19 @@ class AccountState:
     fixtures built before these two fields existed) keeps working
     unchanged — only `monitoring/telegram_bot.py`'s `/check` account
     summary needs them today.
+
+    `currency` (the account's deposit currency code, e.g. `"USD"` or a
+    Cent-account variant like `"USC"`) defaults to `""` for the same
+    backward-compatibility reason. `risk.risk_manager.normalize_cent_denominated_equity()`
+    reads it to keep `main.py`'s `$1000`-per-lot-tier compounding formula
+    meaningful regardless of whether `equity` is actually denominated in
+    USD or in cents (a Cent account reports `equity`/`balance` ~100x
+    larger for the same real capital) — everything else in this codebase
+    that uses `equity` is either a ratio (drawdown percentages) or already
+    self-normalizing via `SymbolSpec.tick_value`/`tick_size` (which MT5
+    reports in the same deposit currency as `equity`, so those cancel out
+    on their own); the compounding tiers are the one place a raw
+    currency-unit assumption was hardcoded.
     """
 
     balance: float
@@ -265,6 +279,7 @@ class AccountState:
     as_of_utc: datetime
     leverage: int = 0
     floating_profit: float = 0.0
+    currency: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -729,6 +744,7 @@ class MT5Gateway:
             as_of_utc=datetime.now(timezone.utc),
             leverage=info.leverage,
             floating_profit=info.profit,
+            currency=info.currency,
         )
 
     def get_account_trade_mode(self) -> Literal["DEMO", "CONTEST", "REAL"]:

@@ -111,6 +111,7 @@ class FakeAccountInfo:
         trade_mode: int = 0,  # ACCOUNT_TRADE_MODE_DEMO
         leverage: int = 100,
         profit: float = 0.0,
+        currency: str = "USD",
     ) -> None:
         self.balance = balance
         self.equity = equity
@@ -119,6 +120,7 @@ class FakeAccountInfo:
         self.trade_mode = trade_mode
         self.leverage = leverage
         self.profit = profit
+        self.currency = currency
 
 
 class FakeMT5:

@@ -120,6 +120,7 @@ from risk.risk_manager import (
     calculate_compounded_lot_size,
     calculate_price_distance_for_target_profit,
     clamp_lot_size,
+    normalize_cent_denominated_equity,
 )
 from storage.db_engine import DEFAULT_BUSY_TIMEOUT_MS, checkpoint_wal, connect, initialize_schema
 from storage.migrations import MIGRATIONS, apply_pending_migrations, get_applied_migrations
@@ -1372,6 +1373,32 @@ class TestRiskManager:
     def test_compounding_non_positive_equity_raises(self) -> None:
         with pytest.raises(ValueError, match="equity must be"):
             calculate_compounded_lot_size(0.0, 0.01, 100.0, 0.01)
+
+    def test_normalize_cent_denominated_equity_divides_by_100_for_usc(self) -> None:
+        # Exness Cent account: 1 USD = 100 USC, so 1000 USC of "equity"
+        # is only $10 of real capital.
+        assert normalize_cent_denominated_equity(1000.0, "USC") == pytest.approx(10.0)
+
+    def test_normalize_cent_denominated_equity_is_case_insensitive(self) -> None:
+        assert normalize_cent_denominated_equity(1000.0, "usc") == pytest.approx(10.0)
+
+    def test_normalize_cent_denominated_equity_leaves_usd_unchanged(self) -> None:
+        assert normalize_cent_denominated_equity(1000.0, "USD") == pytest.approx(1000.0)
+
+    def test_normalize_cent_denominated_equity_leaves_unknown_currency_unchanged(self) -> None:
+        # Safe failure mode: an unrecognized code falls back to the
+        # pre-existing USD-assuming behavior rather than guessing.
+        assert normalize_cent_denominated_equity(1000.0, "EUR") == pytest.approx(1000.0)
+
+    def test_normalize_then_compound_matches_real_capital_tier(self) -> None:
+        # The end-to-end point of this fix: 1000 USC (really $10) must
+        # NOT reach the first $1000 compounding tier the way raw 1000.0
+        # equity would.
+        cent_equity = 1000.0
+        real_usd_equivalent = normalize_cent_denominated_equity(cent_equity, "USC")
+        assert calculate_compounded_lot_size(real_usd_equivalent, 0.01, 100.0, 0.01) == 0.01
+        # Sanity: the un-normalized value WOULD have reached tier 1.
+        assert calculate_compounded_lot_size(cent_equity, 0.01, 100.0, 0.01) == 0.02
 
     def test_price_distance_for_target_profit_basic(self) -> None:
         # tick_value=$1.00 per 0.01 tick per 1.0 lot, 0.01 lots, $5 target

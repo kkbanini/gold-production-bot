@@ -14,6 +14,40 @@ BASE_LOT_SIZE = 0.01
 EQUITY_PER_LOT_INCREMENT = 1000.0
 LOT_INCREMENT = 0.01
 
+# Deposit-currency codes known to be "Cent" account variants (1 real USD =
+# 100 units of account currency) rather than a standard 1:1 currency —
+# Exness's Cent accounts report "USC" specifically (confirmed against the
+# live account this was built for; broker.mt5_gateway.AccountState.currency
+# is read straight from mt5.account_info().currency, so re-verify this
+# set against that live value if a different broker/account type is ever
+# connected and reports something not listed here — silently NOT
+# recognizing a cent account is the safe failure mode, since it just
+# falls back to today's pre-existing USD-assuming behavior rather than
+# guessing wrong in either direction).
+CENT_ACCOUNT_CURRENCY_CODES = frozenset({"USC"})
+CENT_ACCOUNT_SCALE_FACTOR = 100.0
+
+
+def normalize_cent_denominated_equity(equity: float, account_currency: str) -> float:
+    """Converts `equity` to its real-USD-equivalent value if
+    `account_currency` is a known Cent-account code (divides by
+    `CENT_ACCOUNT_SCALE_FACTOR`), otherwise returns it unchanged.
+
+    `calculate_compounded_lot_size()`'s `equity_per_lot_increment` is a
+    hardcoded absolute amount (`$1000`) compared directly against raw
+    `equity` — correct only if `equity` is actually denominated in USD.
+    A Cent account (e.g. Exness Cent: 1 USD = 100 USC) reports `equity`
+    ~100x larger for the same real capital, which would otherwise trigger
+    lot-size tiers 100x too early relative to real money at stake. Ratio-
+    based uses of equity (drawdown percentages) and tick_value-normalized
+    price-distance formulas (`calculate_price_distance_for_target_profit()`)
+    don't need this — only this one hardcoded-absolute-amount comparison
+    does.
+    """
+    if account_currency.upper() in CENT_ACCOUNT_CURRENCY_CODES:
+        return equity / CENT_ACCOUNT_SCALE_FACTOR
+    return equity
+
 
 def _decimals_from_step(step: float) -> int:
     """Number of decimal places implied by a broker volume_step (e.g. 0.01 -> 2)."""

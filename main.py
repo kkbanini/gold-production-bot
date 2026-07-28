@@ -145,6 +145,7 @@ from risk.drawdown_fsm import (
 from risk.risk_manager import (
     calculate_compounded_lot_size,
     calculate_price_distance_for_target_profit,
+    normalize_cent_denominated_equity,
 )
 from storage.db_engine import MAIN_PID_PATH
 from storage.state_manager import OrderLifecycleState, StateManager, TradeLedgerEntry
@@ -883,7 +884,9 @@ def run_bar_close_cycle(
             else snapshot.current_price + stop_distance
         )
         entry_volume = calculate_compounded_lot_size(
-            snapshot.account_state.equity,
+            normalize_cent_denominated_equity(
+                snapshot.account_state.equity, snapshot.account_state.currency
+            ),
             constraints.volume_min,
             constraints.volume_max,
             constraints.volume_step,

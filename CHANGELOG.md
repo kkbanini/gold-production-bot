@@ -33,6 +33,60 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Fixed — Exness Cent Account's Gold Symbol (`XAUUSDc`) Wasn't in the Candidate List
+
+- Found live connecting the new Exness Cent account (`Exness-MT5Real37`):
+  `resolve_gold_symbol()` raised `BrokerSymbolUnavailableError` — none of
+  `GOLD_SYMBOL_CANDIDATES` matched. Confirmed via a direct `mt5.symbols_get()`
+  query against the live connection that this broker's actual gold symbol
+  is `XAUUSDc` (a `c` suffix for Cent accounts — distinct from the
+  already-covered `m` micro-account suffix). Since `ApplicationContainer.build()`
+  calls `gateway.connect()` (which raises this) *before* `main()`'s
+  try/except crash-alert boundary is even entered, this failure crashed
+  `main.py` **silently** — no Telegram notification, just a dead process
+  (confirmed: no heartbeat update for ~57 minutes, no running process).
+- Fixed: added `"XAUUSDc"` to `GOLD_SYMBOL_CANDIDATES`
+  (`broker/mt5_gateway.py`). Confirmed live: reconnects, resolves
+  `XAUUSDc`, reads `balance=9997.6`, `currency="USC"` (matching the
+  Cent-account normalization fix above), `leverage=1000`,
+  `trade_mode="REAL"`.
+- Still an open gap, not fixed here: a `resolve_gold_symbol()` failure (or
+  any other exception during `ApplicationContainer.build()`) crashes with
+  no Telegram alert at all, unlike every in-loop failure once the
+  container exists. Worth a follow-up if broker/account misconfiguration
+  at boot becomes a recurring failure mode.
+
+### Fixed — Regular Mode's Lot-Size Compounding Assumed a USD-Denominated Account
+
+- Found before connecting a new Exness Cent account (deposit currency
+  `USC`, where 1 real USD = 100 USC — `equity`/`balance` report ~100x
+  larger for the same real capital than on a standard USD account).
+  `risk.risk_manager.calculate_compounded_lot_size()`'s tier formula
+  ("+0.01 lot per `$1000` of equity") compares raw `equity` directly
+  against a hardcoded absolute `1000.0` — correct only if `equity` is
+  actually USD. On a Cent account, `equity=1000` (really just $10) would
+  have reached the *same* compounding tier as a real $1000 balance,
+  sizing the regular (`WAIT_FOR_CONDITIONS`/`BOTH`) mode's entries ~100x
+  too large relative to real capital at stake. Percentage-based uses of
+  equity (drawdown thresholds) and tick_value-normalized price-distance
+  formulas (`calculate_price_distance_for_target_profit()`, and the
+  short-term mode's equity-fraction SL/TP cap added earlier this session)
+  were already unaffected — both sides of those ratios scale together
+  automatically; only this one hardcoded-absolute-amount comparison
+  wasn't.
+- Fixed: `broker.mt5_gateway.AccountState` gained a `currency` field (read
+  from `mt5.account_info().currency`, defaults to `""` for backward
+  compatibility). New `risk.risk_manager.normalize_cent_denominated_equity(equity,
+  account_currency)` divides by 100 when `account_currency` is a known
+  Cent-account code (`CENT_ACCOUNT_CURRENCY_CODES = {"USC"}` today —
+  confirmed against Exness specifically; an unrecognized code safely
+  falls back to unchanged/pre-existing behavior rather than guessing) —
+  wired into `main.py`'s `calculate_compounded_lot_size()` call site only.
+- Flagged for re-verification once actually connected to the new
+  account: `mt5.account_info().currency`'s exact reported string should
+  be confirmed live (read-only check) against `CENT_ACCOUNT_CURRENCY_CODES`
+  before trading the regular/`BOTH` mode on it.
+
 ### Fixed — `AutoTrading Disabled` Crashed the Whole Process on Every New-Order/Modify Attempt
 
 - Live crash: `BrokerOrderRejectedError("order_send failed opening a new

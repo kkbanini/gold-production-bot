@@ -268,6 +268,16 @@ class TestBrokerAccountAndBars:
         assert state.margin_used == 100.0
         assert state.margin_free == 9_700.0
 
+    def test_get_account_state_reads_deposit_currency(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        fake_mt5.account.currency = "USC"
+
+        gateway = gw.MT5Gateway(login=1, password="x", server="y", magic_number=555)
+        state = gateway.get_account_state()
+        assert state.currency == "USC"
+
     def test_get_account_state_raises_when_unavailable(
         self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch
     ) -> None:
