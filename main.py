@@ -115,6 +115,7 @@ from execution.position_manager import (
     evaluate_partial_close_and_breakeven,
 )
 from indicators.math_engine import atr, ema
+from monitoring.notifier import build_notifier_from_env
 from news.news_engine import (
     MACRO_BLACKOUT_WINDOW,
     EconomicEvent,
@@ -1485,13 +1486,38 @@ def _submit_short_term_entry_if_any(
     )
 
 
+def _notify_boot_failure(exc: Exception) -> None:
+    """Sends a crash alert for a failure inside `ApplicationContainer.build()`
+    itself — e.g. `resolve_gold_symbol()` finding no matching Gold symbol
+    on a newly-connected broker (found live: this crashed the process
+    with zero Telegram notification, since `_notify()` needs a built
+    `container` and none exists yet at this point).
+
+    Builds a `TelegramNotifier` directly from `os.environ` instead of via
+    the container. This works even though `build()` never finished: its
+    very first line is `ConfigManager.load()`, which calls `load_dotenv()`
+    before anything that could fail this way — `.env` is already loaded
+    into `os.environ` by the time any later step in `build()` raises, so
+    `build_notifier_from_env()` reads real values regardless of where in
+    `build()` the failure happened. Silently does nothing (like every
+    other `_notify` call) if Telegram isn't configured at all.
+    """
+    notifier = build_notifier_from_env()
+    if notifier is not None:
+        notifier.send(
+            f"💥 บอทไม่สามารถเริ่มทำงานได้ (boot ล้มเหลว): {exc!r} — "
+            "ต้องรัน python main.py ใหม่เองที่เครื่อง"
+        )
+
+
 def main() -> None:
     """Entry point: bootstrap, then loop forever (via `_run_trading_loop()`),
     acting once per new M5 bar close. Any exception that escapes the loop
     (i.e. one `_run_trading_loop()`'s own transient-reconnect handling
     could not absorb) triggers a final Telegram crash alert before
     re-raising unchanged — the process still halts fail-closed, it just
-    no longer halts *silently*.
+    no longer halts *silently*. A failure during `ApplicationContainer.build()`
+    itself gets the same treatment via `_notify_boot_failure()`.
     """
     logging.basicConfig(level=logging.INFO)
 
@@ -1501,7 +1527,12 @@ def main() -> None:
     # so a stale PID from a previous run is never observed for long.
     MAIN_PID_PATH.write_text(str(os.getpid()))
 
-    container = ApplicationContainer.build()
+    try:
+        container = ApplicationContainer.build()
+    except Exception as exc:
+        _notify_boot_failure(exc)
+        raise
+
     _notify(container, f"🚀 บอทเริ่มทำงานแล้ว (โหมด {container.config.trading_mode})")
     try:
         _run_trading_loop(container)

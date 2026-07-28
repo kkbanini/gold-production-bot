@@ -33,6 +33,30 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Fixed — A Boot-Time Failure in `ApplicationContainer.build()` Crashed Silently, With No Telegram Alert
+
+- Follow-up to the `XAUUSDc` fix just below: that failure
+  (`resolve_gold_symbol()` finding no matching Gold symbol) crashed
+  `main.py` with **zero** Telegram notification, unlike every other
+  crash this session has fixed. Root cause: `main()`'s crash-alert
+  `try/except` only wraps `_run_trading_loop(container)` — `container =
+  ApplicationContainer.build()` itself runs *before* that block, and
+  `_notify()` requires an already-built `container` to get a notifier
+  from. A `build()` failure (bad broker config, symbol resolution,
+  `ENVIRONMENT_MODE` mismatch, DB issues, etc.) had no `container` to
+  notify with, so it died silently — confirmed live: no heartbeat update
+  for ~57 minutes, no alert, no running process, nothing until manually
+  checked.
+- Fixed: new `main._notify_boot_failure(exc)` builds a `TelegramNotifier`
+  directly from `os.environ` via `monitoring.notifier.build_notifier_from_env()`
+  instead of through the container. This works even though `build()`
+  never finished, because its first line is `ConfigManager.load()`,
+  which calls `load_dotenv()` before anything that could fail this way —
+  `.env` is already loaded into `os.environ` by the time any later step
+  raises. `main()` now wraps `container = ApplicationContainer.build()`
+  in its own `try/except`, calling this on any exception before
+  re-raising (fail-closed, unchanged — this only adds the missing alert).
+
 ### Fixed — Exness Cent Account's Gold Symbol (`XAUUSDc`) Wasn't in the Candidate List
 
 - Found live connecting the new Exness Cent account (`Exness-MT5Real37`):

@@ -5004,6 +5004,48 @@ class TestBuildNotifierFromEnv:
         assert notifier._chat_ids == (111, 222)
 
 
+class TestNotifyBootFailure:
+    """`main._notify_boot_failure()` — the crash alert for a failure
+    inside `ApplicationContainer.build()` itself, where no `container`
+    exists yet to get a notifier from (unlike every other `_notify()`
+    call site, which already has one)."""
+
+    def _clear_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_ID", raising=False)
+
+    def test_sends_alert_when_telegram_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+        monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_ID", "111")
+        posted: list[dict[str, object]] = []
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+        def fake_post(url: str, *, json: dict[str, object], timeout: float) -> FakeResponse:
+            posted.append(json)
+            return FakeResponse()
+
+        monkeypatch.setattr(notifier_module.requests, "post", fake_post)
+        orchestrator._notify_boot_failure(RuntimeError("no Gold symbol found"))
+
+        assert len(posted) == 1
+        assert posted[0]["chat_id"] == 111
+        assert "no Gold symbol found" in str(posted[0]["text"])
+        assert "boot" in str(posted[0]["text"]).lower()
+
+    def test_no_op_when_telegram_not_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_env(monkeypatch)
+
+        def boom(*args: object, **kwargs: object) -> object:
+            raise AssertionError("must never call requests.post when Telegram isn't configured")
+
+        monkeypatch.setattr(notifier_module.requests, "post", boom)
+        orchestrator._notify_boot_failure(RuntimeError("boom"))  # must not raise
+
+
 class TestTelegramNotifierSend:
     """`TelegramNotifier.send()`'s never-raises contract — a notification
     failure must never take down the bar-close loop it reports on."""
