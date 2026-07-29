@@ -33,6 +33,36 @@ Phase 11a.
 
 ## [Unreleased]
 
+### Fixed — The Regular Position Never Noticed Being Closed by a Broker-Side Stop-Loss Hit
+
+- Found live: a real position's trailing stop was hit and closed at the
+  broker, but the bot's `FSMContext` kept believing `state=IN_POSITION`
+  indefinitely — confirmed via `MT5Gateway.get_all_open_positions()`
+  (0 open) vs. the persisted FSM state (still tracking the closed
+  ticket). No crash, no error: every cycle's `context.position is None`
+  branch in `run_bar_close_cycle()` stayed `False`, silently blocking
+  every new regular entry, while position-management actions that cycle
+  simply found nothing to act on and did nothing.
+- Root cause: unlike the short-term position (stateless, re-queried from
+  the broker every cycle via `_fetch_short_term_position()`, which
+  already detects and reconciles a broker-side close), the regular
+  position lives in `FSMContext` and nothing ever re-verified its
+  tracked ticket was still actually open at the broker — only a bot-
+  submitted emergency liquidation or the Base_TP partial-close path ever
+  reset it back to flat, never a plain SL hit MT5 executes on its own.
+- Fixed: new `main._reconcile_regular_position_close()`, called at the
+  very start of every cycle (before `run_bar_close_cycle()`, which
+  assumes `context.position`, if set, really is open). Uses the already-
+  existing `MT5Gateway.is_ticket_still_open()`; if closed, reconciles the
+  real outcome into `trade_ledger` and resets to a flat `FSMContext` —
+  reusing the exact same reconciliation logic the short-term position
+  already had, generalized from `_record_short_term_close()` into
+  `_record_position_close(container, ticket, *, label)` so both paths
+  share one implementation.
+- The specific stuck position found live was reconciled by hand (a
+  one-off `StateManager`/ledger fix, not a code change) so the bot
+  didn't have to wait for a restart to recover.
+
 ### Fixed — A Boot-Time Failure in `ApplicationContainer.build()` Crashed Silently, With No Telegram Alert
 
 - Follow-up to the `XAUUSDc` fix just below: that failure

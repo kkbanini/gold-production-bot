@@ -1753,6 +1753,124 @@ class TestApplicationContainer:
             )
 
 
+class TestReconcileRegularPositionClose:
+    """`main._reconcile_regular_position_close()` — detects when the
+    regular (`FSMContext`-tracked) position was closed at the broker
+    since last cycle (e.g. a stop-loss hit, executed by MT5 directly with
+    no submission on this process's part to observe) and reconciles it —
+    the same class of gap `_fetch_short_term_position()` already closed
+    for the short-term position, found live: without this, the bot stays
+    stuck believing `state=IN_POSITION` forever after a real SL hit,
+    silently blocking every new regular entry."""
+
+    REQUIRED_ENV = TestApplicationContainer.REQUIRED_ENV
+
+    def _build_app(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, db_name: str
+    ) -> ApplicationContainer:
+        for key, value in self.REQUIRED_ENV.items():
+            monkeypatch.setenv(key, value)
+        fake_mt5.symbols["XAUUSD"] = FakeSymbolInfo("XAUUSD", visible=True)
+        fake_mt5.ticks["XAUUSD"] = FakeTick(time_=1)
+        monkeypatch.setattr(gw, "mt5", fake_mt5)
+        return ApplicationContainer.build(env_file="nonexistent.env", db_path=tmp_path / db_name)
+
+    def _position_state(self, ticket: int = 900) -> orchestrator.PositionState:
+        return orchestrator.PositionState(
+            ticket=ticket,
+            symbol="XAUUSD",
+            side="SELL",
+            volume=0.01,
+            entry_price=2000.0,
+            stop_loss=2010.0,
+            magic_number=555,
+            partial_closed=False,
+            breakeven_set=False,
+        )
+
+    def test_returns_context_unchanged_when_position_still_open(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        fake_mt5.positions[900] = FakePosition(900, "XAUUSD", fake_mt5.POSITION_TYPE_SELL, 555)
+        app = self._build_app(fake_mt5, monkeypatch, tmp_path, db_name="reconcile_still_open.db")
+        try:
+            context = orchestrator.FSMContext(
+                state=orchestrator.TradingState.IN_POSITION,
+                position=self._position_state(900),
+                drawdown_state=DrawdownState.ACTIVE,
+                drawdown_reason=None,
+            )
+            result = orchestrator._reconcile_regular_position_close(app, context)
+            assert result is context
+        finally:
+            app.state_manager.close()
+
+    def test_returns_context_unchanged_when_no_position_tracked(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        app = self._build_app(fake_mt5, monkeypatch, tmp_path, db_name="reconcile_no_position.db")
+        try:
+            context = orchestrator.FSMContext(
+                state=orchestrator.TradingState.IDLE,
+                position=None,
+                drawdown_state=DrawdownState.ACTIVE,
+                drawdown_reason=None,
+            )
+            result = orchestrator._reconcile_regular_position_close(app, context)
+            assert result is context
+        finally:
+            app.state_manager.close()
+
+    def test_resets_to_flat_and_reconciles_ledger_when_closed_at_broker(
+        self, fake_mt5: FakeMT5, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # No FakePosition for ticket 900: it's closed at the broker
+        # (e.g. a stop-loss hit), unlike the "still open" test above.
+        fake_mt5.deals = [
+            FakeDeal(
+                1,
+                position_id=900,
+                entry=fake_mt5.DEAL_ENTRY_OUT,
+                price=1990.0,
+                profit=9.5,
+                time_=2000,
+            ),
+        ]
+        app = self._build_app(fake_mt5, monkeypatch, tmp_path, db_name="reconcile_closed.db")
+        try:
+            app.state_manager.record_trade(
+                TradeLedgerEntry(
+                    client_order_id="regular-entry-900",
+                    symbol="XAUUSD",
+                    side="SELL",
+                    volume_lots=0.01,
+                    status="OPEN",
+                    opened_at_utc="2026-07-28T15:05:00Z",
+                    magic_number=555,
+                    broker_ticket=900,
+                )
+            )
+            context = orchestrator.FSMContext(
+                state=orchestrator.TradingState.IN_POSITION,
+                position=self._position_state(900),
+                drawdown_state=DrawdownState.ACTIVE,
+                drawdown_reason=None,
+            )
+            result = orchestrator._reconcile_regular_position_close(app, context)
+
+            assert result.state == orchestrator.TradingState.IDLE
+            assert result.position is None
+            assert result.drawdown_state == DrawdownState.ACTIVE
+
+            closed = app.state_manager.get_closed_trades()
+            assert len(closed) == 1
+            assert closed[0].client_order_id == "regular-entry-900"
+            assert closed[0].profit == 9.5
+            assert closed[0].close_price == 1990.0
+        finally:
+            app.state_manager.close()
+
+
 class TestBacktestSimulatorEndToEnd:
     """`backtester/simulator.py`'s `run_backtest()` driven over a small,
     fully synthetic multi-month OHLC fixture — no live MT5 call, matching

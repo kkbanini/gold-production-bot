@@ -1310,9 +1310,15 @@ def _notify_on_drawdown_lock_transition(
     )
 
 
-def _record_short_term_close(container: ApplicationContainer, closed_ticket: int) -> None:
-    """Reconcile a short-term position's real outcome into `trade_ledger`
-    once `_fetch_short_term_position()` detects it's no longer open.
+def _record_position_close(
+    container: ApplicationContainer, closed_ticket: int, *, label: str
+) -> None:
+    """Reconcile a position's real outcome into `trade_ledger` once it's
+    detected as no longer open at the broker — shared by
+    `_fetch_short_term_position()` (the short-term position) and
+    `_reconcile_regular_position_close()` (the regular, `FSMContext`-tracked
+    position). `label` (e.g. `"short-term"`/`"regular"`) only affects the
+    Telegram notification text.
 
     Looks up the closing deal (`MT5Gateway.get_closing_deal()`) and the
     still-`OPEN` ledger row this ticket was recorded under
@@ -1350,7 +1356,7 @@ def _record_short_term_close(container: ApplicationContainer, closed_ticket: int
     profit_sign = "+" if closed_deal.profit >= 0 else ""
     _notify(
         container,
-        f"⚪ ปิดออเดอร์ short-term: {ledger_entry.side} {ledger_entry.volume_lots} "
+        f"⚪ ปิดออเดอร์ {label}: {ledger_entry.side} {ledger_entry.volume_lots} "
         f"{ledger_entry.symbol} — กำไร/ขาดทุน {profit_sign}{closed_deal.profit:.2f} "
         f"(ticket {closed_ticket})",
     )
@@ -1393,7 +1399,7 @@ def _fetch_short_term_position(
     previously-open short-term position has disappeared (closed by MT5's
     own SL/TP, never by `main()` itself — see this module's docstring),
     logs it and reconciles the real outcome into `trade_ledger` via
-    `_record_short_term_close()`.
+    `_record_position_close()`.
     """
     if container.config.trading_mode not in (TRADING_MODE_SHORT_TERM, TRADING_MODE_BOTH):
         return None
@@ -1406,8 +1412,52 @@ def _fetch_short_term_position(
             "Short-term position closed (SL/TP hit, broker-managed): ticket=%s",
             previous_short_term_position.ticket,
         )
-        _record_short_term_close(container, previous_short_term_position.ticket)
+        _record_position_close(container, previous_short_term_position.ticket, label="short-term")
     return short_term_position
+
+
+def _reconcile_regular_position_close(
+    container: ApplicationContainer, context: FSMContext
+) -> FSMContext:
+    """The regular position's counterpart to `_fetch_short_term_position()`'s
+    broker-side-close detection — the same class of gap, closed there but
+    not here until now. A stop-loss hit is executed by MT5 directly, with
+    no submission on this process's part to observe: unlike the short-term
+    position (stateless, re-queried from the broker every cycle by
+    design), the regular position lives in `FSMContext` and nothing
+    previously re-verified that `context.position`'s ticket was still
+    actually open at the broker.
+
+    Found live: after a trailing-stop hit closed the tracked position,
+    the bot stayed stuck believing `state=IN_POSITION` indefinitely —
+    every cycle's `context.position is None` branch in
+    `run_bar_close_cycle()` stayed false, silently blocking every new
+    regular entry, with no crash and no error (the position-management
+    actions this cycle would have submitted, if any, simply found
+    nothing to act on and did nothing).
+
+    Called once at the very start of every cycle, before
+    `run_bar_close_cycle()` — that function's decision logic assumes
+    `context.position`, if set, really is still open. Returns `context`
+    unchanged if no position is tracked, or the tracked one is still
+    open; otherwise reconciles the real outcome into `trade_ledger` via
+    `_record_position_close()` and returns a fresh flat `FSMContext`.
+    """
+    if context.position is None:
+        return context
+    if container.gateway.is_ticket_still_open(context.position.ticket):
+        return context
+    logger.info(
+        "Regular position closed (SL hit, broker-managed): ticket=%s",
+        context.position.ticket,
+    )
+    _record_position_close(container, context.position.ticket, label="regular")
+    return FSMContext(
+        state=TradingState.IDLE,
+        position=None,
+        drawdown_state=context.drawdown_state,
+        drawdown_reason=context.drawdown_reason,
+    )
 
 
 def _submit_short_term_entry_if_any(
@@ -1416,7 +1466,7 @@ def _submit_short_term_entry_if_any(
     """Submit `result`'s short-term entry (if any) via the same pre-flight
     idempotency wrapper the regular entry path uses, then record the fill
     as an `OPEN` `trade_ledger` row (`broker_ticket` set, so
-    `_record_short_term_close()` can find and close it later) — the same
+    `_record_position_close()` can find and close it later) — the same
     OPEN-then-CLOSED lifecycle the regular entry path already has, closing
     the previously-flagged gap where short-term fills were invisible to
     `optimizer/self_learning.py`'s analytics. Deliberately does NOT touch
@@ -1632,6 +1682,7 @@ def _run_trading_loop(container: ApplicationContainer) -> None:
         account_state = container.gateway.get_account_state()
         short_term_position = _fetch_short_term_position(container, previous_short_term_position)
         previous_short_term_position = short_term_position
+        context = _reconcile_regular_position_close(container, context)
         server_now = container.clock_provider.get_server_time(container.gateway.symbol_spec.name)
         baselines, baseline_epoch = _advance_equity_baselines(
             baselines, baseline_epoch, account_state.equity, server_now
